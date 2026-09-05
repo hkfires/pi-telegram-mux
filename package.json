@@ -1,0 +1,52 @@
+{
+  "name": "pi-telegram-mux",
+  "version": "1.0.0",
+  "description": "Telegram Forum Supergroup multiplexer extension for pi-coding-agent",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "telegram",
+    "multiplexer"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "author": "hkfires",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hkfires/pi-telegram-mux.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hkfires/pi-telegram-mux/issues"
+  },
+  "homepage": "https://github.com/hkfires/pi-telegram-mux#readme",
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.0",
+    "@types/node": "^22.13.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
