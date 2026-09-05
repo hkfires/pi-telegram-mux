@@ -96,7 +96,7 @@ describe("cross-instance recovery and dependent-send isolation", () => {
       await peer.runtime.outbox.whenIdle();
       expect(network.sent).toEqual(["🧑‍💻 [Prompt]\nold prompt"]);
       expect(peer.runtime.outbox.error).toBeNull();
-      expect(peer.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("同步已暂停"), "error");
+      expect(peer.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("sync paused"), "error");
 
       await peer.runtime.onBeforeAgentStart(peer.ctx);
       peer.runtime.onMessageStart({ role: "user", content: "new prompt" }, peer.ctx);
@@ -176,8 +176,8 @@ describe("cross-instance recovery and dependent-send isolation", () => {
         await peer.runtime.onAgentSettled(peer.ctx);
         await peer.runtime.outbox.whenIdle();
         expect(network.sent).toEqual([]);
-        expect(initiator.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Telegram 连接失败"), "error");
-        expect(peer.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("同步已暂停"), "error");
+        expect(initiator.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Telegram connection failed"), "error");
+        expect(peer.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("sync paused"), "error");
 
         await peer.runtime.onBeforeAgentStart({ prompt: "fresh prompt" }, peer.ctx);
         peer.runtime.onMessageStart({ role: "user", content: "fresh prompt" }, peer.ctx);

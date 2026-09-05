@@ -11,6 +11,9 @@ beforeEach(() => {
     if (url.hostname === "api.telegram.org" && url.pathname.endsWith("/getMe")) {
       return Promise.resolve(new Response(JSON.stringify({ ok: true, result: { id: 1, is_bot: true, first_name: "Fixture", username: "fixture_bot" } })));
     }
+    if (url.hostname === "api.telegram.org" && (url.pathname.endsWith("/closeForumTopic") || url.pathname.endsWith("/reopenForumTopic"))) {
+      return Promise.resolve(new Response(JSON.stringify({ ok: true, result: true })));
+    }
     if (url.hostname === "api.telegram.org" && url.pathname.endsWith("/getUpdates")) {
       return new Promise<Response>((_resolve, reject) => {
         const signal = init?.signal;

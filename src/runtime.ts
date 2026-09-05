@@ -78,6 +78,8 @@ export class MuxRuntime {
   private active = false;
   private bindingState: BindingState = "unbound";
   private currentThreadId: number | null = null;
+  private registeredTarget: OutputTarget | null = null;
+  private topicNeedsReopen = false;
   private lastValidThreadId: number | null = null;
   private isLeader = false;
   private isReconnecting = false;
@@ -102,7 +104,7 @@ export class MuxRuntime {
 
   constructor(private readonly pi: ExtensionAPI, private readonly agentDir: string) {
     this.outbox = new BoundedOutbox(error => {
-      this.activeCtx?.ui?.notify(`Telegram 同步已暂停：${error.message}`, "error");
+      this.activeCtx?.ui?.notify(`Telegram sync paused: ${error.message}`, "error");
       this.updateStatusBar();
     });
   }
@@ -221,13 +223,17 @@ export class MuxRuntime {
               continue;
             }
           }
-          await this.registerRoute(ctx);
+          const registered = await this.registerRoute(ctx);
           if (!this.active || version !== this.transportVersion) return;
           // ACK and reset may share one frame batch; an ACK is not proof that
           // the transport still exists when this continuation resumes.
           if (!this.hasActiveTransport()) throw new IpcError("IPC_CLOSED", "IPC reset during registration");
-          this.isReconnecting = false;
           this.connectionError = null;
+          // Reconnection must finish a restored session's pending topic reopen before accepting input.
+          if (registered && this.topicNeedsReopen) await this.reopenTopic(ctx);
+          if (!this.active || version !== this.transportVersion) return;
+          if (!this.hasActiveTransport()) throw new IpcError("IPC_CLOSED", "IPC reset during topic reopening");
+          this.isReconnecting = false;
           this.updateStatusBar(ctx);
           return;
         } catch (err) {
@@ -251,7 +257,7 @@ export class MuxRuntime {
     // Invalid configuration/JSON, protocol violations and unknown errors are fatal.
     if (!this.active) return;
     this.connectionError = error instanceof Error ? error : new Error("Telegram connection failed", { cause: error });
-    ctx.ui?.notify(`Telegram 连接失败：${this.connectionError.message}`, "error");
+    ctx.ui?.notify(`Telegram connection failed: ${this.connectionError.message}`, "error");
     const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
     if (typeof code === "string" && ["ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "IPC_CLOSED", "IPC_TIMEOUT", "IPC_ELECTION_BUSY", "IPC_CONFIG_BUSY"].includes(code)) this.scheduleReconnect(ctx);
     else { this.isReconnecting = false; this.updateStatusBar(ctx); }
@@ -283,6 +289,7 @@ export class MuxRuntime {
       this.followerClient = null;
       if (this.coordinator) await this.coordinator.stop();
       this.coordinator = null;
+      this.registeredTarget = null;
       this.isLeader = false;
       this.isReconnecting = false;
     }
@@ -301,14 +308,21 @@ export class MuxRuntime {
         dispatchInbound: text => this.isTargetCurrent(target, ctx) ? this.handleInboundText(text, ctx) : Promise.resolve({ accepted: false, busy: true }),
         abortRun: () => { if (!this.isTargetCurrent(target, ctx) || !ctx.abort) return false; ctx.abort(); return true; },
       });
-      if (!ok) ctx.ui?.notify("该话题已由其他 Pi 实例占用，请关闭重复会话后重连。", "warning");
+      if (!ok) ctx.ui?.notify("This topic is already occupied by another Pi instance. Please close duplicate sessions before reconnecting.", "warning");
+      if (ok) this.registeredTarget = target;
       return ok;
     }
-    if (this.followerClient?.isConnected()) await this.followerClient.register(reg, signal);
+    if (this.followerClient?.isConnected()) {
+      await this.followerClient.register(reg, signal);
+      if (this.active && reg.generation === this.generation) {
+        this.registeredTarget = threadId === null ? null : { sessionId, threadId, generation: reg.generation };
+      }
+    }
     return this.hasActiveTransport();
   }
 
   public unregisterRoute(ctx: ExtensionContext): void {
+    this.registeredTarget = null;
     if (this.currentThreadId === null) return;
     this.coordinator?.unregisterLocalRoute(this.currentThreadId, this.runtimeId);
     if (this.followerClient?.isConnected()) {
@@ -331,14 +345,14 @@ export class MuxRuntime {
 
   public handleInboundText(text: string, ctx: ExtensionContext): Promise<InboundResult> {
     if (!this.active || this.configuring || this.getIsReconnecting() || this.bindingState !== "bound" || !this.getIsIdle() || !ctx.isIdle()) return Promise.resolve({ accepted: false, busy: true });
-    if (this.outbox.error) return Promise.resolve({ accepted: false, busy: false, statusReply: "Telegram 同步已暂停，请在电脑检查错误并运行 /tg-connect 后重试。" });
+    if (this.outbox.error) return Promise.resolve({ accepted: false, busy: false, statusReply: "Telegram sync is paused. Please check errors on your computer and run /tg-connect to retry." });
     if (!text.trim() || text.length > 4096) return Promise.resolve({ accepted: false, busy: true });
     // Reserve admission synchronously. Pi's void return is not an execution ACK.
     return new Promise(resolve => {
       const timer = setTimeout(() => {
         // An ACK deadline cannot cancel Pi's asynchronous input hooks. Keep the
         // reservation until a real admission event, even after reporting uncertainty.
-        this.finishInput({ accepted: false, busy: false, statusReply: "任务接收结果未知，已暂停后续手机输入；请检查本地会话，勿自动重发。若始终没有确认，请重启此 Pi 实例。" }, false);
+        this.finishInput({ accepted: false, busy: false, statusReply: "Task admission result unknown. Mobile input has been paused; please check local session and do not resend automatically. If unconfirmed, restart this Pi instance." }, false);
       }, 2000);
       const admission: Admission = { sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, consumed: false, resolve, timer };
       this.pendingInput = admission;
@@ -348,8 +362,8 @@ export class MuxRuntime {
       catch (error) {
         // The public void API can reject synchronously (e.g. stale session API).
         // Translate that rejection at the inbound boundary, never claim acceptance.
-        this.finishInput({ accepted: false, busy: false, statusReply: "Pi 拒绝接收任务，请检查本地错误。" });
-        ctx.ui?.notify(`Telegram 输入失败：${error instanceof Error ? error.message : String(error)}`, "error");
+        this.finishInput({ accepted: false, busy: false, statusReply: "Pi rejected the task. Please check local errors." });
+        ctx.ui?.notify(`Telegram input failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     });
   }
@@ -382,12 +396,14 @@ export class MuxRuntime {
     if (text.trim() && this.isRunCurrent(run)) {
       // Actual user-message admission also covers steering/follow-up messages,
       // which Pi delivers without another before_agent_start event.
-      const prompt = `🧑‍💻 [Prompt]\n${text.length <= MAX_MIRRORED_TEXT_LENGTH ? text : "提示词过长，请在 Pi 本地查看。任务结果仍会同步。"}`;
+      const prompt = `🧑‍💻 [Prompt]\n${text.length <= MAX_MIRRORED_TEXT_LENGTH ? text : "Prompt is too long. Please view it locally in Pi; task results will still be synced."}`;
       this.outbox.enqueue(signal => this.sendRunText(prompt, run, signal), Buffer.byteLength(prompt, "utf-8"));
     }
   }
 
-  public async onSessionStart(ctx: ExtensionContext): Promise<void> {
+  public async onSessionStart(eventOrCtx: { reason?: string } | ExtensionContext, maybeCtx?: ExtensionContext): Promise<void> {
+    const ctx = maybeCtx ?? eventOrCtx as ExtensionContext;
+    const event = maybeCtx ? eventOrCtx as { reason?: string } : undefined;
     if (ctx.mode !== "tui") return;
     this.active = true;
     this.activeCtx = ctx;
@@ -400,7 +416,42 @@ export class MuxRuntime {
       try { await this.setupTransport(ctx); }
       catch (error) { this.connectionFailed(error, ctx); }
     }
-    if (this.active && version === this.transportVersion) this.updateStatusBar(ctx);
+    if (this.active && version === this.transportVersion) {
+      this.updateStatusBar(ctx);
+      if (this.bindingState === "bound" && (event?.reason === "startup" || event?.reason === "resume" || event?.reason === "reload")) {
+        this.topicNeedsReopen = true;
+        await this.reopenTopic(ctx);
+      }
+    }
+  }
+
+  /** Reopening has a bounded deadline and reports non-idempotent failures without failing Pi startup. */
+  private async reopenTopic(ctx: ExtensionContext): Promise<boolean> {
+    const target = this.registeredTarget;
+    const config = this.config;
+    const version = this.transportVersion;
+    if (!target || !config || !this.isTargetCurrent(target, ctx) || !this.hasActiveTransport()) return false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      await this.callTelegram("reopenForumTopic", { chat_id: config.chatId, message_thread_id: target.threadId }, target, controller.signal);
+    } catch (error) {
+      if (!this.isTargetCurrent(target, ctx) || version !== this.transportVersion) return false;
+      // Telegram returns this error when the topic is already open, including through IPC.
+      if (!(error instanceof Error && /^(?:Bad Request: )?TOPIC_NOT_MODIFIED$/i.test(error.message))) {
+        this.connectionError = error instanceof Error ? error : new Error("Telegram topic reopen failed", { cause: error });
+        ctx.ui?.notify(`Telegram topic reopen failed: ${this.connectionError.message}; please check and run /tg-connect to retry.`, "error");
+        this.updateStatusBar(ctx);
+        return false;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!this.isTargetCurrent(target, ctx) || version !== this.transportVersion) return false;
+    this.topicNeedsReopen = false;
+    this.connectionError = null;
+    this.updateStatusBar(ctx);
+    return true;
   }
 
   public async onBeforeAgentStart(eventOrCtx: { prompt?: string } | ExtensionContext, maybeCtx?: ExtensionContext): Promise<void> {
@@ -454,7 +505,7 @@ export class MuxRuntime {
     // Always replace capture, including empty error/abort messages. Tool commentary
     // and streaming partials are never substituted for a failed terminal answer.
     const text = extractAssistantText(message);
-    run.text = text.length <= MAX_MIRRORED_TEXT_LENGTH ? text : "⚠️ 回复超过后台同步大小限制，请在 Pi 本地查看。";
+    run.text = text.length <= MAX_MIRRORED_TEXT_LENGTH ? text : "⚠️ Response exceeds background sync size limit. Please view it locally in Pi.";
     run.stopReason = "stopReason" in message && typeof message.stopReason === "string" ? message.stopReason : undefined;
   }
 
@@ -466,10 +517,10 @@ export class MuxRuntime {
     if (!run) return;
     run.settle();
     if (!this.isRunCurrent(run)) return;
-    const text = run.stopReason === "error" ? "⚠️ 任务失败，请检查 Pi 本地错误。"
-      : run.stopReason === "aborted" ? "⏹ 任务已中止。"
-      : run.stopReason === "toolUse" || run.stopReason === "pending" ? "⚠️ 任务未产生最终回复，请检查 Pi 本地状态。"
-      : run.stopReason === "length" ? `⚠️ 回复达到长度限制。\n${run.text}` : run.text;
+    const text = run.stopReason === "error" ? "⚠️ Task failed. Please check local Pi errors."
+      : run.stopReason === "aborted" ? "⏹ Task aborted."
+      : run.stopReason === "toolUse" || run.stopReason === "pending" ? "⚠️ Task did not produce a final response. Please check local Pi status."
+      : run.stopReason === "length" ? `⚠️ Response reached length limit.\n${run.text}` : run.text;
     if (text.trim()) this.outbox.enqueue(signal => this.sendRunText(text, run, signal), Buffer.byteLength(text, "utf-8"));
   }
 
@@ -509,8 +560,8 @@ export class MuxRuntime {
     try {
       const topic = await this.callTelegram<TelegramForumTopic>("createForumTopic", { chat_id: config.chatId, name }, undefined, signal);
       if (signal?.aborted || !this.active || generation !== this.generation || this.config !== config || sessionId !== ctx.sessionManager.getSessionId()) return null;
-      if (!Number.isSafeInteger(topic?.message_thread_id) || topic.message_thread_id <= 0) throw new Error("创建结果未知，未返回有效话题 ID");
-      if (!appendBindingEntry(this.pi, ctx, config.chatId, topic.message_thread_id)) throw new Error("话题可能已创建，但会话绑定写入失败");
+      if (!Number.isSafeInteger(topic?.message_thread_id) || topic.message_thread_id <= 0) throw new Error("Topic creation result unknown; no valid message_thread_id returned");
+      if (!appendBindingEntry(this.pi, ctx, config.chatId, topic.message_thread_id)) throw new Error("Topic may have been created, but writing session binding failed");
       this.unknownCreates.delete(`${sessionId}:${config.chatId}`);
       this.bindingState = "bound";
       this.currentThreadId = topic.message_thread_id;
@@ -540,7 +591,7 @@ export class MuxRuntime {
     this.currentRun?.settle();
     this.currentRun = null;
     this.outbox.reset();
-    this.finishInput({ accepted: false, busy: false, statusReply: "会话已变化，执行结果未知，请检查本地状态。" }, false);
+    this.finishInput({ accepted: false, busy: false, statusReply: "Session changed; execution result unknown. Please check local status." }, false);
   }
 
   public onSessionBeforeSwitch(ctx: ExtensionContext): void {
@@ -548,7 +599,7 @@ export class MuxRuntime {
     // before_* can be cancelled by another extension; release ownership at shutdown.
     // Only enabled integration needs registration; configured transport failures remain errors.
     if (this.active && this.config) this.outbox.enqueue(async signal => {
-      if (!signal.aborted && !await this.registerRoute(ctx, signal)) throw new Error("Telegram 导航路由更新失败。");
+      if (!signal.aborted && !await this.registerRoute(ctx, signal)) throw new Error("Failed to update Telegram navigation route.");
     });
     this.clearStatusBar(ctx);
   }
@@ -558,13 +609,38 @@ export class MuxRuntime {
     this.invalidateRun();
     const ctx = this.activeCtx;
     if (ctx && this.active && this.config) this.outbox.enqueue(async signal => {
-      if (!signal.aborted && !await this.registerRoute(ctx, signal)) throw new Error("Telegram 导航路由更新失败。");
+      if (!signal.aborted && !await this.registerRoute(ctx, signal)) throw new Error("Failed to update Telegram navigation route.");
     });
   }
 
-  public async onSessionShutdown(ctx: ExtensionContext): Promise<void> {
+  public async onSessionShutdown(eventOrCtx: { reason?: string } | ExtensionContext, maybeCtx?: ExtensionContext): Promise<void> {
+    const ctx = maybeCtx ?? eventOrCtx as ExtensionContext;
+    const event = maybeCtx ? eventOrCtx as { reason?: string } : undefined;
+    const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
+    const hasError = Boolean(this.outbox.error || status?.error || status?.feedbackError || this.connectionError);
+    const target = this.registeredTarget;
+    const config = this.config;
+    const coordinator = this.coordinator;
+    const follower = this.followerClient;
+    const shouldClose = event?.reason !== "reload" && this.active && !this.configuring && !this.getIsReconnecting() && !hasError &&
+      config && target && this.bindingState === "bound" && target.threadId === this.currentThreadId &&
+      target.sessionId === ctx.sessionManager.getSessionId() && this.hasActiveTransport();
+    // Fence inputs and cancel queued output synchronously, retaining the last acknowledged route only for closure.
     this.active = false;
     this.invalidateRun();
+    if (shouldClose) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3000);
+        try {
+          const params = { chat_id: config.chatId, message_thread_id: target.threadId };
+          if (coordinator) await coordinator.callTelegram("closeForumTopic", params, this.runtimeId, target, undefined, controller.signal);
+          else if (follower) await follower.callTelegram("closeForumTopic", params, target, undefined, controller.signal);
+        } finally { clearTimeout(timer); }
+      } catch {
+        // Topic closure is best-effort on shutdown; do not block shutdown if Telegram is unreachable
+      }
+    }
     this.unregisterRoute(ctx);
     try { await this.stopTransport(); }
     finally { this.clearStatusBar(ctx); this.activeCtx = null; }
@@ -581,8 +657,8 @@ export class MuxRuntime {
   public async handleTgConnect(ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== "tui" || !this.active) return;
     this.activeCtx = ctx;
-    if (!this.config) { ctx.ui?.notify("请先运行 /tg-setup。", "warning"); return; }
-    if (this.configuring || this.recovering || this.createInFlight) { ctx.ui?.notify("Telegram 配置、连接或话题创建正在进行，请稍后重试。", "warning"); return; }
+    if (!this.config) { ctx.ui?.notify("Please run /tg-setup first.", "warning"); return; }
+    if (this.configuring || this.recovering || this.createInFlight) { ctx.ui?.notify("Telegram configuration, connection, or topic creation is in progress. Please try again later.", "warning"); return; }
     try {
       const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
       // Keep new runs out of the old transport for the entire recovery command,
@@ -606,32 +682,32 @@ export class MuxRuntime {
       }
       await this.setupTransport(ctx);
       if (this.bindingState === "bound") {
-        if (await this.registerRoute(ctx) && this.active) {
+        if (await this.registerRoute(ctx) && this.active && (!this.topicNeedsReopen || (!this.connectionError && await this.reopenTopic(ctx)))) {
           this.updateStatusBar(ctx);
-          ctx.ui?.notify(`已连接话题 ${this.currentThreadId}，不会重复创建。`, "info");
+          ctx.ui?.notify(`Connected to topic ${this.currentThreadId}; will not duplicate.`, "info");
         }
         return;
       }
       if (this.bindingState === "disconnected" && this.lastValidThreadId !== null) {
-        if (!appendBindingEntry(this.pi, ctx, this.config.chatId, this.lastValidThreadId)) throw new Error("会话绑定写入失败");
+        if (!appendBindingEntry(this.pi, ctx, this.config.chatId, this.lastValidThreadId)) throw new Error("Failed to write session binding");
         this.invalidateRun();
         this.bindingState = "bound";
         this.currentThreadId = this.lastValidThreadId;
-        await this.registerRoute(ctx);
+        if (await this.registerRoute(ctx) && this.topicNeedsReopen) await this.reopenTopic(ctx);
         this.updateStatusBar(ctx);
         return;
       }
       const generation = this.generation;
       const sessionId = ctx.sessionManager.getSessionId();
-      if (!await ctx.ui.confirm("连接 Telegram", "为当前会话创建新话题？若上次结果未知，可能已有一个未绑定的话题。")) return;
+      if (!await ctx.ui.confirm("Connect Telegram", "Create a new topic for current session? If the previous result was unknown, an unbound topic may already exist.")) return;
       if (!this.active || generation !== this.generation || sessionId !== ctx.sessionManager.getSessionId() || this.createInFlight) return;
       this.invalidateRun();
       const target = await this.createTopic(ctx, this.generation);
-      if (target) ctx.ui.notify(`已连接新话题 ${target.threadId}。`, "info");
+      if (target) ctx.ui.notify(`Connected to new topic ${target.threadId}.`, "info");
     } catch (err) {
       // Command boundary: creation/registration may fail with an unknown remote
       // outcome. Report the failure without claiming success or retrying the request.
-      if (this.active) ctx.ui?.notify(`Telegram 连接失败：${err instanceof Error ? err.message : "未知错误"}`, "error");
+      if (this.active) ctx.ui?.notify(`Telegram connection failed: ${err instanceof Error ? err.message : "Unknown error"}`, "error");
     } finally {
       if (this.recovering) {
         this.recovering = false;
@@ -642,13 +718,13 @@ export class MuxRuntime {
 
   public handleTgDisconnect(ctx: ExtensionContext): void {
     if (!this.active || ctx.mode !== "tui" || !this.config || this.configuring || this.recovering) return;
-    if (!appendBindingEntry(this.pi, ctx, this.config.chatId, null)) { ctx.ui?.notify("断开记录写入失败。", "error"); return; }
+    if (!appendBindingEntry(this.pi, ctx, this.config.chatId, null)) { ctx.ui?.notify("Failed to write disconnect record.", "error"); return; }
     this.invalidateRun();
     this.unregisterRoute(ctx);
     this.bindingState = "disconnected";
     this.currentThreadId = null;
     this.updateStatusBar(ctx);
-    ctx.ui?.notify("已断开 Telegram 话题。", "info");
+    ctx.ui?.notify("Disconnected from Telegram topic.", "info");
   }
 
   public async handleTgSetup(args: string, ctx: ExtensionContext): Promise<void> {
@@ -660,11 +736,11 @@ export class MuxRuntime {
     let saved = false;
     try {
       const parts = args.trim().split(/\s+/).filter(Boolean);
-      const botToken = parts.length >= 3 ? parts[0] : await ctx.ui.input("Bot Token：");
+      const botToken = parts.length >= 3 ? parts[0] : await ctx.ui.input("Bot Token:");
       if (!botToken) return;
-      const chatInput = parts.length >= 3 ? parts[1] : await ctx.ui.input("Forum Supergroup Chat ID：");
+      const chatInput = parts.length >= 3 ? parts[1] : await ctx.ui.input("Forum Supergroup Chat ID:");
       if (!chatInput) return;
-      const userInput = parts.length >= 3 ? parts[2] : await ctx.ui.input("Allowed User ID：");
+      const userInput = parts.length >= 3 ? parts[2] : await ctx.ui.input("Allowed User ID:");
       if (!userInput) return;
       const config = validateConfig({ version: 1, botToken, chatId: Number(chatInput), allowedUserId: Number(userInput) });
       const client = new TelegramClient({ botToken: config.botToken });
@@ -687,12 +763,12 @@ export class MuxRuntime {
       this.configuring = false;
       await this.setupTransport(ctx);
       this.updateStatusBar(ctx);
-      ctx.ui.notify("Telegram 配置已验证、保存并应用。", "info");
+      ctx.ui.notify("Telegram configuration verified, saved, and applied.", "info");
     } catch (err) {
       if (saved) {
         await this.stopTransport();
-        ctx.ui?.notify("配置已保存，但未能确认所有进程完成更新；请重启所有 Pi 实例。", "error");
-      } else ctx.ui?.notify(`Telegram 配置验证失败：${err instanceof Error ? err.message : "未知错误"}`, "error");
+        ctx.ui?.notify("Configuration saved, but could not confirm updates on all processes. Please restart all Pi instances.", "error");
+      } else ctx.ui?.notify(`Telegram configuration validation failed: ${err instanceof Error ? err.message : "Unknown error"}`, "error");
     } finally {
       this.configuring = false;
       this.configurationTask = null;

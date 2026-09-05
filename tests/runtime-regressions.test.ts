@@ -116,9 +116,13 @@ describe("Runtime lifecycle and safety regressions", () => {
     f.runtime.onMessageEnd({ role: "assistant", content: "x".repeat(9000) });
     let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
-    const call = vi.spyOn(f.runtime, "callTelegram").mockImplementation(async () => { await barrier; return {} as any; });
+    const call = vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (method) => {
+      if (method === "sendMessage") await barrier;
+      return {} as any;
+    });
     const sending = f.runtime.onAgentSettled(f.ctx);
-    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1));
+    const api = vi.spyOn(coordinatorOf(f).getTelegramClient(), "callApi");
+    await vi.waitFor(() => expect(call.mock.calls.filter(c => c[0] === "sendMessage")).toHaveLength(1));
     expect(call.mock.calls[0][2]).toMatchObject({ sessionId: "chunk", threadId: 50 });
     if (action === "disconnect") f.runtime.handleTgDisconnect(f.ctx);
     if (action === "tree") f.runtime.onSessionBeforeTree();
@@ -127,7 +131,10 @@ describe("Runtime lifecycle and safety regressions", () => {
     release();
     await sending;
     await f.runtime.outbox.whenIdle();
-    expect(call).toHaveBeenCalledTimes(1);
+    expect(call.mock.calls.filter(c => c[0] === "sendMessage")).toHaveLength(1);
+    if (action === "shutdown") {
+      expect(api.mock.calls.filter(c => c[0] === "closeForumTopic")).toHaveLength(1);
+    }
   });
 
   it("never retries an uncertain first-turn create without explicit confirmation", async () => {
@@ -179,7 +186,7 @@ describe("Runtime lifecycle and safety regressions", () => {
     vi.useFakeTimers();
     const admission = f.runtime.handleInboundText("not accepted by Pi", f.ctx);
     await vi.advanceTimersByTimeAsync(2001);
-    expect(await admission).toMatchObject({ accepted: false, busy: false, statusReply: expect.stringContaining("未知") });
+    expect(await admission).toMatchObject({ accepted: false, busy: false, statusReply: expect.stringContaining("unknown") });
     expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
@@ -188,7 +195,7 @@ describe("Runtime lifecycle and safety regressions", () => {
     vi.useFakeTimers();
     const admission = f.runtime.handleInboundText("first", f.ctx);
     await vi.advanceTimersByTimeAsync(2001);
-    expect(await admission).toMatchObject({ accepted: false, statusReply: expect.stringContaining("未知") });
+    expect(await admission).toMatchObject({ accepted: false, statusReply: expect.stringContaining("unknown") });
     expect(await f.runtime.handleInboundText("second", f.ctx)).toEqual({ accepted: false, busy: true });
     expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1);
     await f.inInput(() => f.runtime.onBeforeAgentStart({ prompt: "first" }, f.ctx));
@@ -206,7 +213,7 @@ describe("Runtime lifecycle and safety regressions", () => {
     const processing = coordinator.processUpdate(telegramUpdate(50, "first"));
     await vi.advanceTimersByTimeAsync(2001);
     await processing;
-    expect(send).toHaveBeenCalledWith(testConfig.chatId, expect.stringContaining("未知"), { message_thread_id: 50 }, expect.any(AbortSignal));
+    expect(send).toHaveBeenCalledWith(testConfig.chatId, expect.stringContaining("unknown"), { message_thread_id: 50 }, expect.any(AbortSignal));
     f.runtime.onMessageStart({ role: "user", content: "first" }, f.ctx);
     await f.runtime.onAgentSettled(f.ctx);
     expect(f.runtime.getIsIdle()).toBe(true);
@@ -283,7 +290,7 @@ describe("Runtime lifecycle and safety regressions", () => {
     validateSetup();
     await follower.runtime.handleTgSetup(`${testConfig.botToken} ${testConfig.chatId} 999`, follower.ctx);
     expect(follower.runtime.hasActiveTransport()).toBe(true);
-    expect(follower.ui.notify.mock.calls.some(call => String(call[0]).includes("保存并应用"))).toBe(true);
+    expect(follower.ui.notify.mock.calls.some(call => String(call[0]).includes("saved, and applied"))).toBe(true);
     const c = coordinatorOf(leader);
     await c.processUpdate(telegramUpdate(50, "old authorization"));
     await c.processUpdate(telegramUpdate(51, "old authorization"));

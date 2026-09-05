@@ -308,7 +308,7 @@ export class LeaderCoordinator {
   }
 
   private requestFollower(socket: net.Socket, msg: Extract<IpcMessage, { type: "inbound" | "abort" }>): Promise<InboundResult | boolean> {
-    const unavailable = msg.type === "abort" ? false : { accepted: false, busy: false, statusReply: "执行结果未知，请先检查本地会话，勿自动重发。" };
+    const unavailable = msg.type === "abort" ? false : { accepted: false, busy: false, statusReply: "Execution result unknown. Please check local session; do not resend automatically." };
     if (socket.destroyed || socket.writableEnded || this.pending.size >= 128) return Promise.resolve(unavailable);
     const requestId = crypto.randomUUID();
     return new Promise(resolve => {
@@ -323,7 +323,7 @@ export class LeaderCoordinator {
       if (!socket || pending.socket === socket) {
         clearTimeout(pending.timer);
         this.pending.delete(id);
-        pending.resolve(pending.kind === "abort" ? false : { accepted: false, busy: false, statusReply: "执行结果未知，请先检查本地会话，勿自动重发。" });
+        pending.resolve(pending.kind === "abort" ? false : { accepted: false, busy: false, statusReply: "Execution result unknown. Please check local session; do not resend automatically." });
       }
     }
   }
@@ -338,6 +338,15 @@ export class LeaderCoordinator {
       if (!target || !route || route.runtimeId !== runtimeId || route.sessionId !== target.sessionId || route.generation !== target.generation ||
           this.routeOwners.get(target.threadId) !== socket || params.message_thread_id !== target.threadId ||
           typeof params.text !== "string" || !params.text.trim() || params.text.length > 4096) throw new Error("Output target fenced or invalid message");
+    } else if (method === "closeForumTopic" || method === "reopenForumTopic") {
+      if (!Number.isSafeInteger(params.message_thread_id) || (params.message_thread_id as number) <= 0) {
+        throw new Error("Invalid message_thread_id for forum topic");
+      }
+      const route = target ? this.routes.get(target.threadId) : undefined;
+      if (!target || !route || route.runtimeId !== runtimeId || route.sessionId !== target.sessionId || route.generation !== target.generation ||
+          this.routeOwners.get(target.threadId) !== socket || params.message_thread_id !== target.threadId) {
+        throw new Error("Forum topic target fenced");
+      }
     } else if (method !== "createForumTopic" || typeof params.name !== "string" || !params.name.trim() || params.name.length > 128) {
       throw new Error("Unsupported Telegram request");
     }
@@ -402,16 +411,16 @@ export class LeaderCoordinator {
       if (name === "status") reply = `Topic: Online\nSession: ${route.sessionId.slice(-6)}\nRoute: Active`;
       else if (name === "stop") {
         const stopped = route.abortRun ? (await route.abortRun()) !== false : false;
-        reply = stopped ? "已发送中止信号" : "未能确认中止，请检查本地会话。";
+        reply = stopped ? "Abort signal sent." : "Could not confirm abort; please check local session.";
       } else {
         const result = await route.dispatchInbound(text, update.update_id);
-        reply = result.busy ? "当前 session 忙，请稍后重试" : result.statusReply;
+        reply = result.busy ? "Current session is busy. Please try again later." : result.statusReply;
       }
     } catch (error) {
       // Inbound dispatch boundary: execution may already have started. Return an
       // explicit unknown result, expose the failure, and never resubmit the input.
       this.publishStatus({ ...this.status, feedbackError: this.describeError(error) });
-      reply = "执行结果未知，请检查 Pi 本地错误，勿自动重发。";
+      reply = "Execution result unknown. Please check local Pi errors; do not resend automatically.";
     }
     if (reply) {
       const feedback = reply;

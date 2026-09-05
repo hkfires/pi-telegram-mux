@@ -68,7 +68,27 @@ describe("IPC protocol regressions", () => {
     await expect(registered.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: 50, text: "x" })).rejects.toThrow("fenced");
     await expect(registered.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: 51, text: "x" }, target)).rejects.toThrow("fenced");
     await expect(registered.callTelegram("getUpdates", { chat_id: testConfig.chatId })).rejects.toThrow("Unsupported");
+    await expect(registered.callTelegram("closeForumTopic", { chat_id: testConfig.chatId, message_thread_id: -1 })).rejects.toThrow("Invalid message_thread_id");
+    await registered.callTelegram("closeForumTopic", { chat_id: testConfig.chatId, message_thread_id: 50 }, target);
+    expect(api).toHaveBeenCalledWith("closeForumTopic", { chat_id: testConfig.chatId, message_thread_id: 50 }, undefined, expect.any(AbortSignal));
+    api.mockClear();
+  });
+
+  it.each(["closeForumTopic", "reopenForumTopic"])("fences ownership, session and generation for %s", async method => {
+    const owner = await connect("owner");
+    await owner.register({ runtimeId: "owner", ...target });
+    const other = await connect("other");
+    await other.register({ runtimeId: "other", sessionId: "other", threadId: null, generation: 1 });
+    const api = vi.spyOn(coordinator.getTelegramClient(), "callApi").mockResolvedValue(true);
+    const params = { chat_id: testConfig.chatId, message_thread_id: 50 };
+    await expect(other.callTelegram(method, params, target)).rejects.toThrow("fenced");
+    await expect(owner.callTelegram(method, params)).rejects.toThrow("fenced");
+    await expect(owner.callTelegram(method, params, { ...target, sessionId: "stale" })).rejects.toThrow("fenced");
+    await expect(owner.callTelegram(method, params, { ...target, generation: 2 })).rejects.toThrow("fenced");
+    await expect(owner.callTelegram(method, { ...params, message_thread_id: 51 }, { ...target, threadId: 51 })).rejects.toThrow("fenced");
+    await expect(coordinator.callTelegram(method, params, "owner", target)).rejects.toThrow("fenced");
     expect(api).not.toHaveBeenCalled();
+    await expect(owner.callTelegram(method, params, target)).resolves.toBe(true);
   });
 
   it("parses a fragmented ACK exactly once and continues to the next update", async () => {
@@ -100,7 +120,7 @@ describe("IPC protocol regressions", () => {
     const send = vi.spyOn(coordinator.getTelegramClient(), "sendMessage").mockResolvedValue({} as any);
     await coordinator.processUpdate(telegramUpdate(50, "/stop"));
     expect(abort).toHaveBeenCalledWith(target);
-    expect(send).toHaveBeenCalledWith(testConfig.chatId, "已发送中止信号", { message_thread_id: 50 }, expect.any(AbortSignal));
+    expect(send).toHaveBeenCalledWith(testConfig.chatId, "Abort signal sent.", { message_thread_id: 50 }, expect.any(AbortSignal));
   });
 
   it("does not report a successful stop when the follower cannot abort", async () => {
@@ -108,7 +128,7 @@ describe("IPC protocol regressions", () => {
     await f.register({ runtimeId: "follower", ...target });
     const send = vi.spyOn(coordinator.getTelegramClient(), "sendMessage").mockResolvedValue({} as any);
     await coordinator.processUpdate(telegramUpdate(50, "/stop"));
-    expect(send.mock.calls[0][1]).toContain("未能确认");
+    expect(send.mock.calls[0][1]).toContain("Could not confirm abort");
   });
 
   it("rejects duplicate claims without letting the rejected socket remove the owner", async () => {

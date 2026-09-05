@@ -85,7 +85,7 @@ describe("polling recovery ownership and unconfigured synchronization", () => {
     expect(follower.runtime.getIsLeader()).toBe(false);
     expect(follower.runtime.getIsReconnecting()).toBe(false);
     expect(follower.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: connected (llower)");
-    expect(follower.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("同步已暂停"), "error");
+    expect(follower.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("sync paused"), "error");
     await follower.runtime.onBeforeAgentStart(follower.ctx);
     follower.runtime.onMessageStart({ role: "user", content: "new prompt" }, follower.ctx);
     follower.runtime.onMessageEnd({ role: "assistant", content: "new answer", stopReason: "stop" });

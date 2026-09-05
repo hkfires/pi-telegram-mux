@@ -294,7 +294,7 @@ export class IpcFollowerClient {
       // Pi request boundary: a thrown handler has an unknown outcome, not a busy
       // rejection. Send an explicit safe failure without exposing private details.
       reply = msg.type === "inbound"
-        ? { type: "inbound_ack", requestId: msg.requestId, accepted: false, busy: false, statusReply: "执行结果未知，请检查 Pi 本地错误，勿自动重发。" }
+        ? { type: "inbound_ack", requestId: msg.requestId, accepted: false, busy: false, statusReply: "Execution result unknown. Please check local Pi errors; do not resend automatically." }
         : { type: "abort_ack", requestId: msg.requestId, ok: false };
     }
     if (!this.closed && !socket.destroyed) socket.write(encodeFrame(reply));

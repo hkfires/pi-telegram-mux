@@ -57,7 +57,7 @@ describe("review regressions: polling, commands and feedback backpressure", () =
     expect(coordinator.feedback.size).toBe(2);
     barrier.resolve();
     await coordinator.feedback.whenIdle();
-    expect(send).toHaveBeenLastCalledWith(testConfig.chatId, "已发送中止信号", { message_thread_id: 51 }, expect.any(AbortSignal));
+    expect(send).toHaveBeenLastCalledWith(testConfig.chatId, "Abort signal sent.", { message_thread_id: 51 }, expect.any(AbortSignal));
   });
 
   it("bounds feedback, exposes overflow and still executes control commands", async () => {

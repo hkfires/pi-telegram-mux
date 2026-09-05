@@ -64,7 +64,7 @@ it.each(["transformed", "config", "follow-up", "reconnect"])("uses real Pi 0.85 
       expect(result.received).toEqual(["ready task"]);
       expect(result.texts).toEqual(["answer 1"]);
       expect(result.admitted).toEqual({ accepted: true, busy: false });
-      expect(result.feedback).toEqual(["当前 session 忙，请稍后重试"]);
+      expect(result.feedback).toEqual(["Current session is busy. Please try again later."]);
     } else {
       expect(result.received).toEqual(["completely transformed"]);
       expect(result.admitted.accepted).toBe(scenario !== "config");

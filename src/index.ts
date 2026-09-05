@@ -67,8 +67,8 @@ export default function (pi: ExtensionAPI): void {
   });
 
   // Lifecycle Events
-  pi.on("session_start", async (_event, ctx) => {
-    await runtime.onSessionStart(ctx);
+  pi.on("session_start", async (event, ctx) => {
+    await runtime.onSessionStart(event, ctx);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -99,7 +99,7 @@ export default function (pi: ExtensionAPI): void {
     runtime.onSessionBeforeTree();
   });
 
-  pi.on("session_shutdown", async (_event, ctx) => {
-    await runtime.onSessionShutdown(ctx);
+  pi.on("session_shutdown", async (event, ctx) => {
+    await runtime.onSessionShutdown(event, ctx);
   });
 }

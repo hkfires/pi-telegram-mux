@@ -81,7 +81,7 @@ describe("navigation registration and outbox recovery status", () => {
       expect(register).toHaveBeenCalledTimes(1);
       expect(f.runtime.outbox.error).toBeInstanceOf(Error);
       if (failureMode === "rejected") expect(f.runtime.outbox.error).toBe(failure);
-      expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("同步已暂停"), "error");
+      expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("sync paused"), "error");
       expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: error");
     });
   });

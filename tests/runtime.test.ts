@@ -26,9 +26,10 @@ describe("runtime module", () => {
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-tg-mux-runtime-test-"));
     await saveConfig(tempDir, mockConfig);
-    vi.spyOn(MuxRuntime.prototype, "onSessionStart").mockImplementation(function (ctx) {
+    vi.spyOn(MuxRuntime.prototype, "onSessionStart").mockImplementation(function (eventOrCtx: any, maybeCtx?: any) {
+      const ctx = maybeCtx ?? eventOrCtx;
       runtimes.push({ runtime: this, ctx });
-      return originalStart.call(this, ctx);
+      return (originalStart as any).call(this, eventOrCtx, maybeCtx);
     });
   });
 
@@ -456,6 +457,230 @@ describe("runtime module", () => {
 
       expect(sentMessages.length).toBe(2);
       expect(sentMessages[1]).toBe("Reply to fresh");
+    });
+
+    it("automatically closes forum topic on session shutdown when bound", async () => {
+      const mockPi = { appendEntry: vi.fn() } as any;
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: {
+            version: 1,
+            sessionId: "sess-close-1",
+            chatId: mockConfig.chatId,
+            threadId: 888,
+          },
+        },
+      ];
+      const mockCtx = {
+        mode: "tui",
+        sessionManager: {
+          getSessionId: () => "sess-close-1",
+          getEntries: () => entries,
+          getSessionFile: () => "/tmp/sess-close-1.jsonl",
+        },
+      } as any;
+
+      await runtime.onSessionStart(mockCtx);
+      expect(runtime.getBindingState()).toBe("bound");
+
+      const spyCall = vi.spyOn((runtime as any).coordinator.getTelegramClient(), "callApi").mockResolvedValue({} as any);
+      await runtime.onSessionShutdown(mockCtx);
+
+      expect(spyCall).toHaveBeenCalledWith(
+        "closeForumTopic",
+        {
+          chat_id: mockConfig.chatId,
+          message_thread_id: 888,
+        },
+        undefined,
+        expect.any(AbortSignal)
+      );
+    });
+
+    it("does not close forum topic on session shutdown when unbound", async () => {
+      const mockPi = { appendEntry: vi.fn() } as any;
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const mockCtx = {
+        mode: "tui",
+        sessionManager: {
+          getSessionId: () => "sess-unbound-1",
+          getEntries: () => [],
+          getSessionFile: () => "/tmp/sess-unbound-1.jsonl",
+        },
+      } as any;
+
+      await runtime.onSessionStart(mockCtx);
+      expect(runtime.getBindingState()).toBe("unbound");
+
+      const spyCall = vi.spyOn((runtime as any).coordinator.getTelegramClient(), "callApi");
+      await runtime.onSessionShutdown(mockCtx);
+
+      expect(spyCall.mock.calls.filter(([method]) => method === "closeForumTopic")).toHaveLength(0);
+    });
+
+    it("tolerates closeForumTopic failure during session shutdown", async () => {
+      const mockPi = { appendEntry: vi.fn() } as any;
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: {
+            version: 1,
+            sessionId: "sess-close-err",
+            chatId: mockConfig.chatId,
+            threadId: 999,
+          },
+        },
+      ];
+      const mockCtx = {
+        mode: "tui",
+        sessionManager: {
+          getSessionId: () => "sess-close-err",
+          getEntries: () => entries,
+          getSessionFile: () => "/tmp/sess-close-err.jsonl",
+        },
+      } as any;
+
+      await runtime.onSessionStart(mockCtx);
+      vi.spyOn((runtime as any).coordinator.getTelegramClient(), "callApi").mockRejectedValue(new Error("Network error"));
+
+      // Must not throw
+      await expect(runtime.onSessionShutdown(mockCtx)).resolves.not.toThrow();
+    });
+
+    it("automatically reopens forum topic on session resume when bound", async () => {
+      const mockPi = { appendEntry: vi.fn() } as any;
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: {
+            version: 1,
+            sessionId: "sess-resume-1",
+            chatId: mockConfig.chatId,
+            threadId: 777,
+          },
+        },
+      ];
+      const mockCtx = {
+        mode: "tui",
+        sessionManager: {
+          getSessionId: () => "sess-resume-1",
+          getEntries: () => entries,
+          getSessionFile: () => "/tmp/sess-resume-1.jsonl",
+        },
+      } as any;
+
+      const spyCall = vi.spyOn(runtime, "callTelegram").mockResolvedValue({} as any);
+      await runtime.onSessionStart({ reason: "resume" }, mockCtx);
+
+      expect(spyCall).toHaveBeenCalledWith(
+        "reopenForumTopic",
+        {
+          chat_id: mockConfig.chatId,
+          message_thread_id: 777,
+        },
+        expect.objectContaining({ sessionId: "sess-resume-1", threadId: 777 }),
+        expect.any(AbortSignal)
+      );
+    });
+
+    it("reopens the existing forum topic on CLI startup", async () => {
+      const mockPi = { appendEntry: vi.fn() } as any;
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: {
+            version: 1,
+            sessionId: "sess-startup-1",
+            chatId: mockConfig.chatId,
+            threadId: 777,
+          },
+        },
+      ];
+      const mockCtx = {
+        mode: "tui",
+        sessionManager: {
+          getSessionId: () => "sess-startup-1",
+          getEntries: () => entries,
+          getSessionFile: () => "/tmp/sess-startup-1.jsonl",
+        },
+      } as any;
+
+      const spyCall = vi.spyOn(runtime, "callTelegram").mockResolvedValue({} as any);
+      await runtime.onSessionStart({ reason: "startup" }, mockCtx);
+
+      expect(spyCall).toHaveBeenCalledWith("reopenForumTopic", expect.objectContaining({ message_thread_id: 777 }), expect.objectContaining({ sessionId: "sess-startup-1", threadId: 777 }), expect.any(AbortSignal));
+    });
+
+    it("closes old topic on /new lifecycle and readies new unbound session", async () => {
+      const mockPi = { appendEntry: vi.fn() } as any;
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const oldEntries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: {
+            version: 1,
+            sessionId: "sess-old-1",
+            chatId: mockConfig.chatId,
+            threadId: 666,
+          },
+        },
+      ];
+      const oldCtx = {
+        mode: "tui",
+        sessionManager: {
+          getSessionId: () => "sess-old-1",
+          getEntries: () => oldEntries,
+          getSessionFile: () => "/tmp/sess-old-1.jsonl",
+        },
+      } as any;
+
+      await runtime.onSessionStart(oldCtx);
+      expect(runtime.getBindingState()).toBe("bound");
+
+      const spyCall = vi.spyOn((runtime as any).coordinator.getTelegramClient(), "callApi").mockResolvedValue({} as any);
+
+      // 1. Pi emits session_before_switch then session_shutdown for the old session
+      runtime.onSessionBeforeSwitch(oldCtx);
+      await runtime.onSessionShutdown(oldCtx);
+
+      // Verifies the old topic was closed
+      expect(spyCall).toHaveBeenCalledWith(
+        "closeForumTopic",
+        {
+          chat_id: mockConfig.chatId,
+          message_thread_id: 666,
+        },
+        undefined,
+        expect.any(AbortSignal)
+      );
+
+      // 2. Pi emits session_start with reason: "new" for the replacement session
+      const newCtx = {
+        mode: "tui",
+        sessionManager: {
+          getSessionId: () => "sess-new-1",
+          getEntries: () => [],
+          getSessionFile: () => "/tmp/sess-new-1.jsonl",
+        },
+      } as any;
+
+      spyCall.mockClear();
+      await runtime.onSessionStart({ reason: "new" }, newCtx);
+
+      // Verifies the replacement session is ready and unbound, does not reopen old topic
+      expect(runtime.getBindingState()).toBe("unbound");
+      expect(runtime.getCurrentThreadId()).toBeNull();
+      expect(spyCall).not.toHaveBeenCalled();
     });
   });
 });

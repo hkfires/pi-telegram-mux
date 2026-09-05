@@ -14,7 +14,7 @@ export class BoundedOutbox {
   public enqueue(work: (signal: AbortSignal) => Promise<void>, bytes = 0): boolean {
     if (this.error) return false;
     if (this.size >= this.maxJobs || bytes > this.maxBytes - this.bytes) {
-      this.fail(Object.assign(new Error("Telegram 后台队列已满，同步已暂停；请检查后运行 /tg-connect。"), { code: "OUTBOX_FULL" }));
+      this.fail(Object.assign(new Error("Telegram background queue is full; sync is paused. Check errors and run /tg-connect to retry."), { code: "OUTBOX_FULL" }));
       return false;
     }
     this.bytes += bytes;
@@ -42,7 +42,7 @@ export class BoundedOutbox {
     this.active = Promise.resolve().then(() => job.work(controller.signal)).catch(error => {
       // Delivery boundary: explicit cancellation discards obsolete work. Any other
       // failure stops all dependent jobs and is exposed to the owner's status/UI.
-      if (!controller.signal.aborted) this.fail(error instanceof Error ? error : new Error("Telegram 后台任务失败", { cause: error }));
+      if (!controller.signal.aborted) this.fail(error instanceof Error ? error : new Error("Telegram background task failed", { cause: error }));
     }).finally(() => {
       this.bytes -= this.activeBytes;
       this.activeBytes = 0;

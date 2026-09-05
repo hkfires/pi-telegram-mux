@@ -45,7 +45,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
       await coordinator.processUpdate(telegramUpdate(f.runtime.getCurrentThreadId()!, "must not execute"));
       await coordinator.feedback.whenIdle();
       expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
-      expect(feedback).toHaveBeenCalledWith(testConfig.chatId, expect.stringContaining("同步已暂停"), { message_thread_id: f.runtime.getCurrentThreadId() }, expect.any(AbortSignal));
+      expect(feedback).toHaveBeenCalledWith(testConfig.chatId, expect.stringContaining("sync is paused"), { message_thread_id: f.runtime.getCurrentThreadId() }, expect.any(AbortSignal));
       const send = vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({} as any);
       await f.runtime.handleTgConnect(f.ctx);
       let processing!: Promise<void>;
@@ -105,8 +105,8 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
       { name: "ASCII prompt at the limit", prompt: "x".repeat(65_536), oversized: false },
       { name: "ASCII prompt above the limit", prompt: "x".repeat(65_537), oversized: true },
       { name: "prompt larger than the entire outbox", prompt: "x".repeat(256 * 1024 + 1), oversized: true },
-      { name: "multibyte prompt at the limit", prompt: "汉".repeat(65_536), oversized: false },
-      { name: "multibyte prompt above the limit", prompt: "汉".repeat(65_537), oversized: true },
+      { name: "multibyte prompt at the limit", prompt: "€".repeat(65_536), oversized: false },
+      { name: "multibyte prompt above the limit", prompt: "€".repeat(65_537), oversized: true },
     ])("bounds $name while preserving answers and later runs", async ({ prompt, oversized }) => {
       for (const [text, reply] of [[prompt, "first answer"], ["next prompt", "next answer"]]) {
         await f.runtime.onBeforeAgentStart({ prompt: text }, f.ctx);
@@ -117,7 +117,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
         expect(f.runtime.outbox.error).toBeNull();
       }
       const mirroredPrompt = sent.slice(0, -3).join("");
-      const expectedPrompt = prefix + (oversized ? "提示词过长，请在 Pi 本地查看。任务结果仍会同步。" : prompt);
+      const expectedPrompt = prefix + (oversized ? "Prompt is too long. Please view it locally in Pi; task results will still be synced." : prompt);
       expect(mirroredPrompt.length).toBe(expectedPrompt.length);
       expect(mirroredPrompt).toBe(expectedPrompt);
       expect(sent.slice(-3)).toEqual(["first answer", prefix + "next prompt", "next answer"]);
@@ -152,7 +152,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     await processing;
     await coordinator.feedback.whenIdle();
     expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
-    expect(feedback).toHaveBeenCalledWith(testConfig.chatId, expect.stringContaining("忙"), { message_thread_id: 51 }, expect.any(AbortSignal));
+    expect(feedback).toHaveBeenCalledWith(testConfig.chatId, expect.stringContaining("busy"), { message_thread_id: 51 }, expect.any(AbortSignal));
     await vi.waitFor(() => expect(f.runtime.getIsReconnecting()).toBe(false));
     const admission = f.runtime.handleInboundText("ready task", f.ctx);
     await f.inInput(() => f.runtime.onBeforeAgentStart({ prompt: "ready task" }, f.ctx));
@@ -277,7 +277,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     f.runtime.onMessageEnd({ role: "assistant", content: [], stopReason });
     await f.runtime.onAgentSettled(f.ctx);
     await f.runtime.outbox.whenIdle();
-    expect(call.mock.calls.map(args => args[1].text)).toEqual([stopReason === "error" ? "⚠️ 任务失败，请检查 Pi 本地错误。" : "⏹ 任务已中止。"]);
+    expect(call.mock.calls.map(args => args[1].text)).toEqual([stopReason === "error" ? "⚠️ Task failed. Please check local Pi errors." : "⏹ Task aborted."]);
   });
 
   it("halts dependent delivery and exposes background errors instead of sending an answer after a failed prompt", async () => {
@@ -291,7 +291,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     expect(call).toHaveBeenCalledTimes(1);
     expect(f.runtime.outbox.error?.message).toContain("Simulated");
     expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: error");
-    expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("暂停"), "error");
+    expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("paused"), "error");
   });
 
   it("preserves a healthy pending FIFO when /tg-connect is repeated", async () => {
@@ -558,7 +558,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     await fs.writeFile(path.join(dir, "pi-telegram-mux", "config.json"), "not JSON");
     const setup = vi.spyOn(f.runtime, "setupTransport");
     (f.runtime as any).scheduleReconnect(f.ctx);
-    await vi.waitFor(() => expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("连接失败"), "error"), { timeout: 1200 });
+    await vi.waitFor(() => expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("connection failed"), "error"), { timeout: 1200 });
     expect(f.runtime.getIsReconnecting()).toBe(false);
     expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: error");
     await new Promise(resolve => setTimeout(resolve, 600));

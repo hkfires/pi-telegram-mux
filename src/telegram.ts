@@ -237,6 +237,32 @@ export class TelegramClient {
     });
   }
 
+  public async closeForumTopic(
+    chatId: number,
+    messageThreadId: number,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    return this.callApi<boolean>(
+      "closeForumTopic",
+      { chat_id: chatId, message_thread_id: messageThreadId },
+      undefined,
+      signal
+    );
+  }
+
+  public async reopenForumTopic(
+    chatId: number,
+    messageThreadId: number,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    return this.callApi<boolean>(
+      "reopenForumTopic",
+      { chat_id: chatId, message_thread_id: messageThreadId },
+      undefined,
+      signal
+    );
+  }
+
   public async sendMessage(
     chatId: number,
     text: string,

@@ -266,4 +266,26 @@ describe("telegram client module", () => {
 
     await expect(validateBotAndChat(client, -100, 20)).rejects.toThrow("topic management permissions");
   });
+
+  it("calls closeForumTopic successfully", async () => {
+    const client = new TelegramClient({
+      botToken: mockToken,
+      apiBase: mockApiBase,
+    });
+
+    let receivedBody = "";
+    nextHandler = (req, res) => {
+      let body = "";
+      req.on("data", chunk => { body += chunk; });
+      req.on("end", () => {
+        receivedBody = body;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result: true }));
+      });
+    };
+
+    const result = await client.closeForumTopic(-100123, 42);
+    expect(result).toBe(true);
+    expect(JSON.parse(receivedBody)).toEqual({ chat_id: -100123, message_thread_id: 42 });
+  });
 });

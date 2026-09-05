@@ -9,7 +9,7 @@ import type { MuxConfig, TelegramUpdate } from "../src/types.js";
 export const testConfig: MuxConfig = { version: 1, botToken: "fake-regression-token", chatId: -100123, allowedUserId: 123 };
 
 /** A Pi fixture with mutable history, real lifecycle hooks and explicit cleanup. */
-export async function runtimeFixture(agentDir: string, id: string, threadId: number | null = 50) {
+export async function runtimeFixture(agentDir: string, id: string, threadId: number | null = 50, reason?: "startup" | "resume" | "reload" | "new" | "fork") {
   try { await fs.access(getConfigPath(agentDir)); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; await saveConfig(agentDir, testConfig); }
   const entries: any[] = threadId === null ? [] : [{ type: "custom", customType: "pi-telegram-mux.binding", data: { version: 1, sessionId: id, chatId: testConfig.chatId, threadId } }];
@@ -24,7 +24,8 @@ export async function runtimeFixture(agentDir: string, id: string, threadId: num
     appendEntry: vi.fn((customType, data) => entries.push({ type: "custom", customType, data })),
   };
   const runtime = new MuxRuntime(pi as unknown as ExtensionAPI, agentDir);
-  await runtime.onSessionStart(ctx);
+  if (reason) await runtime.onSessionStart({ reason }, ctx);
+  else await runtime.onSessionStart(ctx);
   return { runtime, ctx, pi, ui, entries, inInput: <T>(work: () => T): T => {
     if (!inputContext) throw new Error("No simulated Pi input has been submitted");
     return inputContext(work);

@@ -10,7 +10,7 @@ A Telegram Forum Supergroup multiplexer extension for [Pi](https://github.com/ea
 
 - **Bi-directional Interaction**: Send prompts on your computer and sync prompts along with final responses to Telegram. Reply directly inside a topic on Telegram to dispatch new tasks to Pi on your computer.
 - **Multi-session Multiplexing**: Multiple running Pi instances share a single Telegram Bot. Each Pi session maps to its own dedicated Forum Topic without requiring external servers or background daemons.
-- **Automatic Binding**: Automatically creates a new topic upon the first prompt in a blank session; reconnects to the existing topic when resuming a session via `/resume`.
+- **Automatic Binding & Lifecycle**: Automatically creates a topic on the first prompt in a blank session; attempts to close it when leaving the bound session (`/reload` keeps it open); reopens the existing topic when restoring a session via `/resume`, `-c`, `-r`, or `--session`.
 - **Remote Control**: Query session status or abort currently running tasks directly from Telegram.
 - **Restricted Access**: Accepts tasks only from the configured Telegram User ID for security.
 
