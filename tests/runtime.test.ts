@@ -9,7 +9,7 @@ import {
   findLastUserPrompt,
   splitTelegramMessage,
 } from "../src/render.js";
-import { MuxRuntime } from "../src/runtime.js";
+import { MuxRuntime, formatTransportNotice } from "../src/runtime.js";
 import type { MuxConfig } from "../src/types.js";
 
 describe("runtime module", () => {
@@ -37,6 +37,56 @@ describe("runtime module", () => {
     for (const { runtime, ctx } of runtimes.splice(0)) await runtime.onSessionShutdown(ctx);
     vi.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  describe("formatTransportNotice", () => {
+    it("formats request timeout without redundant prefixes", () => {
+      const notice = formatTransportNotice({
+        code: "TELEGRAM_TIMEOUT",
+        message: "Telegram request timed out (getUpdates)",
+      });
+      expect(notice).toBe("Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]");
+    });
+
+    it("normalizes aborted message into timed out and appends code", () => {
+      const notice = formatTransportNotice({
+        code: "TELEGRAM_TIMEOUT",
+        message: "Telegram request failed (getUpdates): This operation was aborted",
+      });
+      expect(notice).toBe("Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]");
+    });
+
+    it("formats connection reset cleanly", () => {
+      const notice = formatTransportNotice({
+        code: "ECONNRESET",
+        message: "Telegram connection reset (getUpdates)",
+      });
+      expect(notice).toBe("Telegram connection reset (getUpdates) [ECONNRESET]");
+    });
+
+    it("formats network unreachable cleanly", () => {
+      const notice = formatTransportNotice({
+        code: "ENOTFOUND",
+        message: "Telegram network unreachable (getUpdates)",
+      });
+      expect(notice).toBe("Telegram network unreachable (getUpdates) [ENOTFOUND]");
+    });
+
+    it("formats general errors with Telegram prefix and code tag", () => {
+      const notice = formatTransportNotice({
+        code: "IPC_PROTOCOL_ERROR",
+        message: "Invalid IPC response; restart all mux processes",
+      });
+      expect(notice).toBe("Telegram: Invalid IPC response; restart all mux processes [IPC_PROTOCOL_ERROR]");
+    });
+
+    it("does not duplicate error code if already present", () => {
+      const notice = formatTransportNotice({
+        code: "TELEGRAM_TIMEOUT",
+        message: "Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]",
+      });
+      expect(notice).toBe("Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]");
+    });
   });
 
   describe("render helpers", () => {

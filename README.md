@@ -2,7 +2,7 @@
 
 A Telegram Forum Supergroup multiplexer extension for [Pi](https://github.com/earendil-works/pi). View execution results, send new tasks, and stop ongoing runs in your local Pi coding agent right from Telegram.
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+English | [简体中文](README.zh-CN.md)
 
 ---
 

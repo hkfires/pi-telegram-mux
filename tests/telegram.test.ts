@@ -5,6 +5,7 @@ import {
   RateLimitError,
   TelegramClient,
   TelegramDecodeError,
+  TelegramRequestError,
   isRecoverableTelegramError,
   validateBotAndChat,
 } from "../src/telegram.js";
@@ -38,6 +39,7 @@ describe("telegram client module", () => {
   });
 
   afterAll(async () => {
+    mockServer.closeAllConnections?.();
     await new Promise<void>((resolve) => {
       mockServer.close(() => resolve());
     });
@@ -287,5 +289,23 @@ describe("telegram client module", () => {
     const result = await client.closeForumTopic(-100123, 42);
     expect(result).toBe(true);
     expect(JSON.parse(receivedBody)).toEqual({ chat_id: -100123, message_thread_id: 42 });
+  });
+
+  it("formats timeout failures cleanly without 'This operation was aborted'", async () => {
+    const client = new TelegramClient({
+      botToken: mockToken,
+      apiBase: mockApiBase,
+      defaultTimeoutMs: 50,
+    });
+
+    nextHandler = (_req, _res) => {
+      // Intentionally do not respond to trigger timeout
+    };
+
+    const error = await client.callApi("getUpdates", undefined, 50).catch(err => err);
+    expect(error).toBeInstanceOf(TelegramRequestError);
+    expect(error.code).toBe("TELEGRAM_TIMEOUT");
+    expect(error.message).toBe("Telegram request timed out (getUpdates)");
+    expect(error.message).not.toContain("This operation was aborted");
   });
 });

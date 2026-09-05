@@ -199,12 +199,32 @@ export class TelegramClient {
       if (err instanceof TelegramApiError || err instanceof TelegramDecodeError) throw err;
       // HTTP boundary: normalize fetch/timeout failures using identifiers, not
       // message text. Unclassified errors remain fatal to the polling supervisor.
-      const failure = err as { code?: unknown; cause?: { code?: unknown } } | null;
+      const failure = err as { code?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
       const identifier = failure?.cause?.code ?? failure?.code;
       const code = timedOut ? "TELEGRAM_TIMEOUT" : controller.signal.aborted || signal?.aborted ? "TELEGRAM_ABORTED"
         : typeof identifier === "string" ? identifier : "TELEGRAM_REQUEST_FAILED";
-      const safeMessage = this.redact(err instanceof Error ? err.message : String(err));
-      throw new TelegramRequestError(code, `Telegram request failed (${method}): ${safeMessage}`, err);
+      let detail: string;
+      if (timedOut) {
+        detail = "request timed out";
+      } else if (code === "ECONNRESET") {
+        detail = "connection reset";
+      } else if (code === "ECONNREFUSED") {
+        detail = "connection refused";
+      } else if (code === "ETIMEDOUT") {
+        detail = "connection timed out";
+      } else if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
+        detail = "network unreachable";
+      } else if (code === "TELEGRAM_ABORTED") {
+        detail = "request aborted";
+      } else {
+        const raw = typeof failure?.cause?.message === "string" ? failure.cause.message
+          : err instanceof Error ? err.message : String(err);
+        detail = this.redact(raw);
+      }
+      const message = timedOut || code === "ECONNRESET" || code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "TELEGRAM_ABORTED"
+        ? `Telegram ${detail} (${method})`
+        : `Telegram request failed (${method}): ${detail}`;
+      throw new TelegramRequestError(code, message, err);
     } finally {
       clearTimeout(timer);
       this.requests.delete(controller);

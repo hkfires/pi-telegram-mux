@@ -2,7 +2,7 @@
 
 Pi 编码助手的 Telegram 论坛超级群多路复用插件。让你通过 Telegram 查看电脑上 Pi 助手的任务结果、发送新任务和中止执行。
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | 简体中文
 
 ---
 

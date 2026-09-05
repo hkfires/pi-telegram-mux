@@ -17,6 +17,26 @@ export const TG_STATUS_KEY = "tg";
 export type TgStatusColor = "muted" | "dim";
 export interface TgStatusInfo { text: string; color: TgStatusColor; }
 
+export function formatTransportNotice(failure: { code: string; message: string }): string {
+  let text = failure.message.trim();
+  text = text.replace(/This operation was aborted/gi, "request timed out");
+  text = text.replace(/^Telegram request failed \(([^)]+)\): request timed out/i, "Telegram request timed out ($1)");
+  text = text.replace(/^Telegram request failed \(([^)]+)\): connection reset/i, "Telegram connection reset ($1)");
+  text = text.replace(/^Telegram request failed \(([^)]+)\): connection refused/i, "Telegram connection refused ($1)");
+  text = text.replace(/^Telegram request failed \(([^)]+)\): connection timed out/i, "Telegram connection timed out ($1)");
+  text = text.replace(/^Telegram request failed \(([^)]+)\): network unreachable/i, "Telegram network unreachable ($1)");
+  text = text.replace(/^Telegram request failed \(([^)]+)\): request aborted/i, "Telegram request aborted ($1)");
+
+  if (!text.toLowerCase().startsWith("telegram")) {
+    text = text.startsWith(":") ? `Telegram${text}` : `Telegram: ${text}`;
+  }
+
+  if (failure.code && !text.includes(`[${failure.code}]`) && !text.endsWith(` ${failure.code}`)) {
+    text = `${text} [${failure.code}]`;
+  }
+  return text;
+}
+
 export function getTgStatusText(options: {
   config: MuxConfig | null;
   isReconnecting: boolean;
@@ -123,8 +143,8 @@ export class MuxRuntime {
     const sessionId = ctx.sessionManager?.getSessionId?.();
     const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
     const failure = status?.error ?? status?.feedbackError;
-    const notice = failure ? `${failure.code}: ${failure.message}` : "";
-    if (notice && notice !== this.lastTransportError) ctx.ui.notify(`Telegram ${notice}`, status?.polling === "retrying" ? "warning" : "error");
+    const notice = failure ? formatTransportNotice(failure) : "";
+    if (notice && notice !== this.lastTransportError) ctx.ui.notify(notice, status?.polling === "retrying" ? "warning" : "error");
     this.lastTransportError = notice;
     const { text, color } = getTgStatusText({
       config: this.config, isReconnecting: this.getIsReconnecting(),
