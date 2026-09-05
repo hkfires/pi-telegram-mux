@@ -51,7 +51,7 @@ pi install /path/to/pi-telegram-mux
 仅安装到当前项目时添加 `-l`；临时加载可使用：
 
 ```bash
-pi -e /path/to/pi-telegram-mux/src/index.ts
+pi -e /path/to/pi-telegram-mux/extensions/index.ts
 ```
 
 ## 首次配置

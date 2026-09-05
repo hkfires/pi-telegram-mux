@@ -21,12 +21,13 @@
   ],
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./extensions/index.ts"
     ]
   },
   "files": [
     "src",
     "dist",
+    "extensions",
     "README.md",
     "README.zh-CN.md"
   ],

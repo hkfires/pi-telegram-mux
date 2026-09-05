@@ -14,6 +14,7 @@ it("loads a source-only package through the real Pi CLI without dist or devDepen
     await fs.mkdir(agentDir);
     await fs.copyFile(path.resolve("package.json"), path.join(packageDir, "package.json"));
     await fs.cp(path.resolve("src"), path.join(packageDir, "src"), { recursive: true });
+    await fs.cp(path.resolve("extensions"), path.join(packageDir, "extensions"), { recursive: true });
     await fs.writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [packageDir] }));
     await expect(fs.access(path.join(packageDir, "dist"))).rejects.toThrow();
     await expect(fs.access(path.join(packageDir, "node_modules"))).rejects.toThrow();

@@ -51,7 +51,7 @@ pi install /path/to/pi-telegram-mux
 To test or load temporarily for the current run:
 
 ```bash
-pi -e /path/to/pi-telegram-mux/src/index.ts
+pi -e /path/to/pi-telegram-mux/extensions/index.ts
 ```
 
 ## First-time Configuration
