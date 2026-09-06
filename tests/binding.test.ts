@@ -29,6 +29,13 @@ describe("binding module", () => {
       expect(validateBindingData(tombstone)).toEqual(tombstone);
     });
 
+    it.each(["topic-missing", "create-unknown"])("preserves a %s record only without a thread", state => {
+      const entry = { version: 1, sessionId: "sess-123", chatId: -100123, threadId: null, state };
+      expect(validateBindingData(entry)).toEqual(entry);
+      expect(validateBindingData({ ...entry, threadId: 456 })).toBeNull();
+      expect(validateBindingData({ ...entry, state: "invalid" })).toBeNull();
+    });
+
     it("rejects invalid versions", () => {
       expect(
         validateBindingData({
@@ -181,6 +188,23 @@ describe("binding module", () => {
       });
     });
 
+    it.each([
+      { records: [{ threadId: null, state: "topic-missing" }], state: "topic-missing", threadId: null },
+      { records: [{ threadId: null, state: "topic-missing" }, { threadId: null }], state: "disconnected", threadId: null },
+      { records: [{ threadId: null, state: "create-unknown" }], state: "create-unknown", threadId: null },
+      { records: [{ threadId: null, state: "create-unknown" }, { threadId: null }], state: "disconnected", threadId: null },
+      { records: [{ threadId: null, state: "topic-missing" }, { threadId: 99 }], state: "bound", threadId: 99 },
+      { records: [{ threadId: null, state: "create-unknown" }, { threadId: 99 }, { threadId: null }], state: "disconnected", threadId: null, lastValidThreadId: 99 },
+    ])("resolves $state without resurrecting a deleted topic ($records)", ({ records, state, threadId, lastValidThreadId }) => {
+      const entries = [{ threadId: 42 }, ...records].map(record => ({
+        type: "custom", customType: BINDING_CUSTOM_TYPE,
+        data: { version: 1, sessionId: currentSession, chatId: currentChat, ...record },
+      }));
+      expect(resolveBindingState(entries, currentSession, currentChat)).toEqual({
+        state, threadId, lastValidThreadId: lastValidThreadId ?? threadId,
+      });
+    });
+
     it("resolves reconnected state correctly in order of append", () => {
       const entries = [
         {
@@ -225,6 +249,17 @@ describe("binding module", () => {
   });
 
   describe("appendBindingEntry", () => {
+    it.each(["topic-missing", "create-unknown"] as const)("verifies that the %s state was retained", state => {
+      const entries: unknown[] = [];
+      const ctx = { sessionManager: { getSessionId: () => "sess-1", getEntries: () => entries } } as any;
+      const pi = { appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }) } as any;
+      expect(appendBindingEntry(pi, ctx, 12345, null, state)).toBe(true);
+      expect(resolveBindingState(entries, "sess-1", 12345).state).toBe(state);
+      expect(appendBindingEntry(pi, ctx, 12345, 456, state)).toBe(false);
+      const strippingPi = { appendEntry: (customType: string, { state: _state, ...data }: any) => entries.push({ type: "custom", customType, data }) } as any;
+      expect(appendBindingEntry(strippingPi, ctx, 12345, null, state)).toBe(false);
+    });
+
     it("appends and verifies successfully", () => {
       const sessionEntries: unknown[] = [];
       const mockPi = {

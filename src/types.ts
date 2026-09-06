@@ -23,12 +23,13 @@ export interface TelegramBindingEntryData {
   sessionId: string;
   chatId: number;
   threadId: number | null;
+  state?: "topic-missing" | "create-unknown"; // Null-thread records that must not restore an older topic.
 }
 
 /**
  * Session binding state of the current Runtime.
  */
-export type BindingState = "unbound" | "disconnected" | "bound" | "create-unknown";
+export type BindingState = "unbound" | "disconnected" | "bound" | "topic-missing" | "create-unknown";
 
 /**
  * Binding-generation-fenced output target. Normal runs retain FIFO ordering;

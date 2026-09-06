@@ -87,6 +87,8 @@ pi -e /path/to/pi-telegram-mux/extensions/index.ts
 
 已有历史但未绑定话题的会话，使用 `/tg-connect` 手动连接。
 
+如果原话题已被删除，恢复会话时会收到提醒。插件会等到你在 Pi 中发送下一条提示词后再创建新话题，并同步这次提示词和回复；仅恢复、查看会话或运行 `/tg-connect` 不会立即重建。等待重建的状态会保存在会话中，退出后再次恢复也不会重新使用已删除的话题。
+
 ### 手机端命令
 
 | 操作 | 用途 |
@@ -112,6 +114,7 @@ pi -e /path/to/pi-telegram-mux/extensions/index.ts
 | --- | --- |
 | `tg: unconfigured` | 尚未配置，运行 `/tg-setup` |
 | `tg: ready` | 已就绪，空白会话首次提问时可创建话题 |
+| `tg: topic deleted` | 原话题已被删除，发送下一条提示词后自动创建新话题 |
 | `tg: connected (…)` | 当前会话已连接话题 |
 | `tg: disconnected` | 已手动断开同步 |
 | `tg: offline` / `tg: reconnecting` | 离线或正在重连 |

@@ -87,6 +87,8 @@ Configuration is stored in `~/.pi/agent/pi-telegram-mux/config.json` by default 
 
 For an existing session with history that is not yet bound to a topic, run `/tg-connect` to bind manually.
 
+If the original topic has been deleted, restoring the session displays a warning. The extension waits for your next prompt in Pi before creating a replacement and syncing that prompt and its response. Restoring or viewing the session, or running `/tg-connect`, does not immediately recreate the topic. This pending replacement is saved with the session, so reopening Pi does not restore the deleted topic's binding.
+
 ### Telegram Commands
 
 | Action / Command | Purpose |
@@ -112,6 +114,7 @@ For an existing session with history that is not yet bound to a topic, run `/tg-
 | --- | --- |
 | `tg: unconfigured` | Not configured yet. Run `/tg-setup` |
 | `tg: ready` | Ready. A topic will be created on the first prompt of a new session |
+| `tg: topic deleted` | The original topic was deleted; the next prompt will create a replacement |
 | `tg: connected (…)` | Current session is bound to a Telegram topic |
 | `tg: disconnected` | Synchronization manually disconnected |
 | `tg: offline` / `tg: reconnecting` | Offline or attempting reconnection |

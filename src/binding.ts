@@ -33,12 +33,16 @@ export function validateBindingData(data: unknown): TelegramBindingEntryData | n
       return null;
     }
   }
+  if (obj.state !== undefined && (obj.threadId !== null || (obj.state !== "topic-missing" && obj.state !== "create-unknown"))) {
+    return null;
+  }
 
   return {
     version: 1,
     sessionId: obj.sessionId,
     chatId: obj.chatId,
     threadId: obj.threadId,
+    ...(obj.state !== undefined ? { state: obj.state as TelegramBindingEntryData["state"] } : {}),
   };
 }
 
@@ -95,6 +99,7 @@ export function resolveBindingState(
 
   let lastPositiveThreadId: number | null = null;
   for (const entry of matching) {
+    if (entry.state !== undefined) lastPositiveThreadId = null;
     if (entry.threadId !== null) {
       lastPositiveThreadId = entry.threadId;
     }
@@ -109,7 +114,7 @@ export function resolveBindingState(
     };
   } else {
     return {
-      state: "disconnected",
+      state: latest.state ?? "disconnected",
       threadId: null,
       lastValidThreadId: lastPositiveThreadId,
     };
@@ -124,11 +129,13 @@ export function appendBindingEntry(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   chatId: number,
-  threadId: number | null
+  threadId: number | null,
+  state?: TelegramBindingEntryData["state"]
 ): boolean {
   if (threadId !== null && (!Number.isSafeInteger(threadId) || threadId <= 0)) {
     return false;
   }
+  if (state !== undefined && threadId !== null) return false;
 
   const sessionId = ctx.sessionManager.getSessionId();
   if (!sessionId) {
@@ -140,6 +147,7 @@ export function appendBindingEntry(
     sessionId,
     chatId,
     threadId,
+    ...(state !== undefined ? { state } : {}),
   };
 
   try {
@@ -160,7 +168,8 @@ export function appendBindingEntry(
       latest.version === 1 &&
       latest.sessionId === sessionId &&
       latest.chatId === chatId &&
-      latest.threadId === threadId
+      latest.threadId === threadId &&
+      latest.state === state
     );
   } catch {
     return false;

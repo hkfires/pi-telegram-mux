@@ -129,6 +129,18 @@ describe("Status Bar module", () => {
       expect(res).toEqual({ text: "tg: disconnected", color: "dim" });
     });
 
+    it("returns topic deleted status when state is topic-missing", () => {
+      const res = getTgStatusText({
+        config: mockConfig,
+        isReconnecting: false,
+        isConflict: false,
+        hasActiveTransport: true,
+        bindingState: "topic-missing",
+        threadId: null,
+      });
+      expect(res).toEqual({ text: "tg: topic deleted", color: "dim" });
+    });
+
     it("returns error status when state is create-unknown", () => {
       const res = getTgStatusText({
         config: mockConfig,

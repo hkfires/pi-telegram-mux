@@ -12,6 +12,7 @@ import { TelegramClient, validateBotAndChat } from "./telegram.js";
 import type { BindingState, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic } from "./types.js";
 
 const MAX_MIRRORED_TEXT_LENGTH = 65_536;
+const TOPIC_MISSING_NOTICE = "Telegram topic is no longer available. A new topic will be created when you send your next prompt in Pi.";
 
 export const TG_STATUS_KEY = "tg";
 export type TgStatusColor = "muted" | "dim";
@@ -58,6 +59,7 @@ export function getTgStatusText(options: {
       return { text: `tg: connected${id}`, color: "muted" };
     }
     case "disconnected": return { text: "tg: disconnected", color: "dim" };
+    case "topic-missing": return { text: "tg: topic deleted", color: "dim" };
     case "create-unknown": return { text: "tg: error", color: "muted" };
     default: return { text: "tg: ready", color: "dim" };
   }
@@ -165,9 +167,11 @@ export class MuxRuntime {
     this.connectionError = null;
     const resolved = resolveBindingState(ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId(), config.chatId);
     const uncertain = this.unknownCreates.has(`${ctx.sessionManager.getSessionId()}:${config.chatId}`);
-    this.bindingState = resolved.state === "unbound" && uncertain ? "create-unknown" : resolved.state;
+    this.bindingState = (resolved.state === "unbound" || resolved.state === "topic-missing") && uncertain ? "create-unknown" : resolved.state;
     this.currentThreadId = resolved.threadId;
     this.lastValidThreadId = resolved.lastValidThreadId;
+    // A manual disconnect can still restore the previous topic and its pending reopen.
+    if (this.lastValidThreadId === null) this.topicNeedsReopen = false;
   }
 
   /** Only one connection attempt may be in flight, and shutdown invalidates it. */
@@ -441,6 +445,8 @@ export class MuxRuntime {
       if (this.bindingState === "bound" && (event?.reason === "startup" || event?.reason === "resume" || event?.reason === "reload")) {
         this.topicNeedsReopen = true;
         await this.reopenTopic(ctx);
+      } else if (this.bindingState === "topic-missing") {
+        ctx.ui?.notify(TOPIC_MISSING_NOTICE, "warning");
       }
     }
   }
@@ -457,6 +463,22 @@ export class MuxRuntime {
       await this.callTelegram("reopenForumTopic", { chat_id: config.chatId, message_thread_id: target.threadId }, target, controller.signal);
     } catch (error) {
       if (!this.isTargetCurrent(target, ctx) || version !== this.transportVersion) return false;
+      // Match the specific Telegram response, whose text is also preserved over IPC.
+      if (error instanceof Error && /^(?:Bad Request: )?(?:TOPIC_ID_INVALID|message thread not found)$/i.test(error.message)) {
+        if (appendBindingEntry(this.pi, ctx, config.chatId, null, "topic-missing")) {
+          this.invalidateRun();
+          this.unregisterRoute(ctx);
+          this.bindingState = "topic-missing";
+          this.currentThreadId = null;
+          this.lastValidThreadId = null;
+          this.topicNeedsReopen = false;
+          this.connectionError = null;
+          ctx.ui?.notify(TOPIC_MISSING_NOTICE, "warning");
+          this.updateStatusBar(ctx);
+          return false;
+        }
+        error = new Error("Telegram topic is no longer available, but saving the binding reset failed", { cause: error });
+      }
       // Telegram returns this error when the topic is already open, including through IPC.
       if (!(error instanceof Error && /^(?:Bad Request: )?TOPIC_NOT_MODIFIED$/i.test(error.message))) {
         this.connectionError = error instanceof Error ? error : new Error("Telegram topic reopen failed", { cause: error });
@@ -490,19 +512,30 @@ export class MuxRuntime {
     };
     this.currentRun = run;
     if (!this.isRunCurrent(run)) return;
-    const canCreate = !origin && !ctx.sessionManager.getEntries().some(e => e.type === "message" && e.message.role === "assistant");
+    // A missing topic is replaced on the next local prompt, even in a session with history.
+    const isTopicMissing = !origin && this.bindingState === "topic-missing";
+    const canCreate = isTopicMissing || (!origin && !ctx.sessionManager.getEntries().some(e => e.type === "message" && e.message.role === "assistant"));
+    if (isTopicMissing) {
+      ctx.ui?.notify("Telegram topic was deleted. Creating a replacement topic for this session...", "warning");
+    }
     // Enqueue preparation, never await Telegram/IPC in a Pi lifecycle handler.
     // Normal consecutive runs share a binding generation and retain FIFO order.
     this.outbox.enqueue(async signal => {
       if (!this.isRunCurrent(run) || signal.aborted) return;
-      if (canCreate && this.bindingState === "unbound") {
+      if (canCreate && (this.bindingState === "unbound" || this.bindingState === "topic-missing")) {
+        const wasMissing = this.bindingState === "topic-missing";
         if (!ctx.sessionManager.getSessionFile()) await new Promise<void>(resolve => {
           const done = () => { signal.removeEventListener("abort", done); resolve(); };
           signal.addEventListener("abort", done, { once: true });
           void settled.then(done);
         });
         if (!this.isRunCurrent(run) || signal.aborted) return;
-        if (ctx.sessionManager.getSessionFile()) run.target = await this.createTopic(ctx, run.generation, signal);
+        if (ctx.sessionManager.getSessionFile()) {
+          run.target = await this.createTopic(ctx, run.generation, signal);
+          if (wasMissing && run.target) {
+            ctx.ui?.notify(`Connected to new topic ${run.target.threadId}.`, "info");
+          }
+        }
       }
       if (!this.isRunCurrent(run) || signal.aborted) return;
       if (!run.target && this.bindingState === "bound" && this.currentThreadId !== null) {
@@ -574,6 +607,11 @@ export class MuxRuntime {
     const sessionId = ctx.sessionManager.getSessionId();
     const sessionName = ctx.sessionManager.getSessionName?.() || path.basename(ctx.cwd);
     const name = `Pi: ${sessionName} [${sessionId.slice(-6)}]`.slice(0, 128);
+    // Persist the attempt before sending it so a restart cannot automatically
+    // repeat an uncertain replacement after a timeout or binding write failure.
+    if (this.bindingState === "topic-missing" && !appendBindingEntry(this.pi, ctx, config.chatId, null, "create-unknown")) {
+      throw new Error("Failed to save the topic replacement attempt; no new topic was requested");
+    }
     this.createInFlight = true;
     this.unknownCreates.add(`${sessionId}:${config.chatId}`);
     this.bindingState = "create-unknown";
@@ -708,6 +746,11 @@ export class MuxRuntime {
         }
       }
       await this.setupTransport(ctx);
+      if (this.bindingState === "topic-missing") {
+        ctx.ui?.notify(TOPIC_MISSING_NOTICE, "warning");
+        this.updateStatusBar(ctx);
+        return;
+      }
       if (this.bindingState === "bound") {
         if (await this.registerRoute(ctx) && this.active && (!this.topicNeedsReopen || (!this.connectionError && await this.reopenTopic(ctx)))) {
           this.updateStatusBar(ctx);

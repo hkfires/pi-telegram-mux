@@ -142,6 +142,49 @@ describe("forum topic lifecycle", () => {
       expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: connected (denied)");
     });
 
+    it("preserves a pending reopen when settings change while manually disconnected", async () => {
+      const original = TelegramClient.prototype.callApi;
+      let permissionDenied = true;
+      let closed = true;
+      const api = vi.spyOn(TelegramClient.prototype, "callApi").mockImplementation(async function (method, params, ...args) {
+        if (method === "reopenForumTopic" && params?.message_thread_id === 50) {
+          if (permissionDenied) throw new TelegramApiError("Forbidden: missing topic permission", 403);
+          closed = false;
+          return true as any;
+        }
+        if (method === "sendMessage" && params?.message_thread_id === 50) {
+          if (closed) throw new TelegramApiError("Bad Request: TOPIC_CLOSED", 400);
+          return { message_id: 1 } as any;
+        }
+        return original.call(this, method, params, ...args);
+      });
+      const f = await runtimeFixture(dir, "recovered", 50, "resume");
+      fixtures.push(f);
+      expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: error");
+      f.runtime.handleTgDisconnect(f.ctx);
+      permissionDenied = false;
+      f.ui.select.mockImplementationOnce(async (_title, options) => options[1])
+        .mockImplementationOnce(async (_title, options) => options[0]);
+      await f.runtime.handleTgSetup(f.ctx);
+      expect(f.runtime.getBindingState()).toBe("disconnected");
+
+      await f.runtime.handleTgConnect(f.ctx);
+      await f.runtime.onBeforeAgentStart({ prompt: "after repair" }, f.ctx);
+      f.runtime.onMessageStart({ role: "user", content: "after repair" }, f.ctx);
+      f.runtime.onMessageEnd({ role: "assistant", content: "recovered answer", stopReason: "stop" });
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.runtime.outbox.error).toBeNull();
+      expect(closed).toBe(false);
+      expect(api.mock.calls.filter(([method]) => method === "reopenForumTopic")).toHaveLength(2);
+      expect(api.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params)).toEqual([
+        { chat_id: testConfig.chatId, message_thread_id: 50, text: "🧑‍💻 [Prompt]\nafter repair" },
+        { chat_id: testConfig.chatId, message_thread_id: 50, text: "recovered answer" },
+      ]);
+      expect(api.mock.calls.filter(([method]) => method === "createForumTopic")).toHaveLength(0);
+      expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: connected (overed)");
+    });
+
     it("treats an already-open topic as successful", async () => {
       const original = TelegramClient.prototype.callApi;
       vi.spyOn(TelegramClient.prototype, "callApi").mockImplementation(function (method, ...args) {
