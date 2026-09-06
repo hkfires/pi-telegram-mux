@@ -7,7 +7,7 @@ import { configFingerprint, loadConfig, saveConfig, validateConfig } from "./con
 import { LeaderCoordinator } from "./coordinator.js";
 import { IpcError, IpcFollowerClient } from "./ipc.js";
 import { BoundedOutbox } from "./outbox.js";
-import { extractAssistantText, extractUserText, splitTelegramMessage } from "./render.js";
+import { extractAssistantText, extractUserText, renderTelegramMarkdown, splitTelegramMessage } from "./render.js";
 import { TelegramClient, validateBotAndChat } from "./telegram.js";
 import type { BindingState, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic } from "./types.js";
 
@@ -635,12 +635,20 @@ export class MuxRuntime {
   private async sendText(text: string, target: OutputTarget, ctx: ExtensionContext, signal: AbortSignal): Promise<void> {
     const config = this.config;
     if (!config) return;
-    for (const chunk of splitTelegramMessage(text)) {
-      if (!chunk.trim()) continue;
+    for (const chunk of renderTelegramMarkdown(text)) {
+      if (!chunk.text.trim()) continue;
       if (this.configurationTask) await this.waitForConfiguration(signal);
       if (!this.isTargetCurrent(target, ctx) || signal.aborted) return;
+      const params: Record<string, unknown> = {
+        chat_id: config.chatId,
+        message_thread_id: target.threadId,
+        text: chunk.text,
+      };
+      if (chunk.entities && chunk.entities.length > 0) {
+        params.entities = chunk.entities;
+      }
       // Delivery failures propagate to the bounded outbox's visible failure boundary.
-      await this.callTelegram("sendMessage", { chat_id: config.chatId, message_thread_id: target.threadId, text: chunk }, target, signal);
+      await this.callTelegram("sendMessage", params, target, signal);
     }
   }
 

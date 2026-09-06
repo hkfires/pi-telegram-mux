@@ -62,7 +62,8 @@ describe("polling recovery ownership and unconfigured synchronization", () => {
     follower.runtime.onMessageStart({ role: "user", content: "old prompt" }, follower.ctx);
     follower.runtime.onMessageEnd({ role: "assistant", content: "old answer", stopReason: "stop" });
     await follower.runtime.onAgentSettled(follower.ctx);
-    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    // Initial delivery includes the renderer's first load, before recovery starts.
+    await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 5000 });
     failPoll();
     await vi.waitFor(() => expect(ipc.getStatus().error?.code).toBe(`TELEGRAM_HTTP_${errorCode}`));
     const oldSignal = call.mock.calls[0][3]!;

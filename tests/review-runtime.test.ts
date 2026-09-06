@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runtimeFixture, testConfig, telegramUpdate } from "./helpers.js";
 import { TelegramClient } from "../src/telegram.js";
 import { encodeFrame } from "../src/ipc.js";
+import type { TelegramMessageEntity } from "../src/types.js";
 
 function deferred() {
   let resolve!: () => void;
@@ -31,6 +32,54 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     vi.spyOn(TelegramClient.prototype, "getChat").mockImplementation(async id => ({ id, type: "supergroup", is_forum: true }));
     vi.spyOn(TelegramClient.prototype, "getChatMember").mockResolvedValue({ status: "administrator", can_manage_topics: true });
   }
+
+  describe.each(["leader", "follower"])("%s formatted delivery", role => {
+    const code = "if value:\n    print(value)\n".repeat(200).trimEnd();
+    it.each([
+      { name: "plain reply", markdown: "已完成修复。", text: "已完成修复。" },
+      { name: "formatted reply", markdown: "**完成**：修改了 `src/render.ts`，参考 [使用指南](https://example.com/docs)。", text: "完成：修改了 src/render.ts，参考 使用指南。", entity: "text_link" },
+      { name: "long code", markdown: "```python\n" + code + "\n```", text: code, entity: "pre" },
+      { name: "entity rejection", markdown: "[docs](https://example.com/docs)", text: "docs", entity: "text_link", description: "Bad Request: can't parse entities" },
+      { name: "topic rejection", markdown: "[docs](https://example.com/docs)", text: "docs", entity: "text_link", description: "Bad Request: TOPIC_CLOSED" },
+    ])("delivers $name with the correct target and failure status", async ({ markdown, text, entity, description }) => {
+      const requests: Record<string, unknown>[] = [];
+      const fetch = globalThis.fetch;
+      vi.stubGlobal("fetch", (input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).endsWith("/sendMessage")) return fetch(input, init);
+        requests.push(JSON.parse(init!.body as string));
+        if (description) {
+          return Promise.resolve(new Response(JSON.stringify({ ok: false, error_code: 400, description }), { status: 400 }));
+        }
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, result: { message_id: requests.length } })));
+      });
+      const leader = await fixture();
+      const f = role === "leader" ? leader : await runtimeFixture(dir, "follower", 51);
+      if (f !== leader) fixtures.push(f);
+      await f.runtime.onBeforeAgentStart(f.ctx);
+      f.runtime.onMessageEnd({ role: "assistant", content: markdown, stopReason: "stop" });
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
+
+      expect(requests.map(request => request.text).join("")).toBe(text);
+      expect(requests.length > 1).toBe(text.length > 4096);
+      for (const request of requests) {
+        expect(request).toMatchObject({ chat_id: testConfig.chatId, message_thread_id: f.runtime.getCurrentThreadId() });
+        expect((request.text as string).length).toBeLessThanOrEqual(4096);
+        const entities = (request.entities ?? []) as TelegramMessageEntity[];
+        if (entity) expect(entities.some(item => item.type === entity)).toBe(true);
+        else expect(entities).toEqual([]);
+        if (entity === "text_link") expect(entities.some(item => item.url === "https://example.com/docs")).toBe(true);
+      }
+      if (description) {
+        expect(requests).toHaveLength(1);
+        expect(f.runtime.outbox.error?.message).toBe(description);
+        expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: error");
+        expect(f.ui.notify).toHaveBeenCalledWith("Telegram sync paused: " + description, "error");
+      } else {
+        expect(f.runtime.outbox.error).toBeNull();
+      }
+    });
+  });
 
   describe.each(["leader", "follower"])("paused %s input protection", role => {
     it.each(["delivery", "overflow"])("rejects input after %s failure and accepts fresh work after recovery", async cause => {
@@ -85,9 +134,9 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     });
 
     it.each([
-      { name: "leading answer block", prompt: "first prompt", answer: " ".repeat(4096) + "  indented answer\n", expected: [prefix + "first prompt", "  indented answer\n"] },
-      { name: "middle answer block", prompt: "first prompt", answer: "x".repeat(4096) + "\n".repeat(4096) + "  tail\n", expected: [prefix + "first prompt", "x".repeat(4096), "  tail\n"] },
-      { name: "trailing answer block", prompt: "first prompt", answer: "x".repeat(4096) + "\n", expected: [prefix + "first prompt", "x".repeat(4096)] },
+      { name: "leading code block", prompt: "first prompt", answer: "```text\n" + " ".repeat(4096) + "  indented answer\n\n```", expected: [prefix + "first prompt", "  indented answer\n"] },
+      { name: "middle code block", prompt: "first prompt", answer: "```text\n" + "x".repeat(4096) + "\n".repeat(4096) + "  tail\n\n```", expected: [prefix + "first prompt", "x".repeat(4096), "  tail\n"] },
+      { name: "trailing code block", prompt: "first prompt", answer: "```text\n" + "x".repeat(4096) + "\n\n```", expected: [prefix + "first prompt", "x".repeat(4096)] },
       { name: "trailing prompt block", prompt: "x".repeat(4096 - prefix.length) + "\n", answer: "first answer", expected: [prefix + "x".repeat(4096 - prefix.length), "first answer"] },
     ])("skips a blank $name and keeps subsequent messages flowing", async ({ prompt, answer, expected }) => {
       for (const [text, reply] of [[prompt, answer], ["next prompt", "next answer"]]) {

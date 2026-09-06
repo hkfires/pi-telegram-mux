@@ -69,7 +69,8 @@ describe("cross-instance recovery and dependent-send isolation", () => {
       vi.spyOn(peer.runtime, "setupTransport").mockImplementationOnce(async ctx => { await resume; return setup(ctx); });
       await peer.runtime.onBeforeAgentStart(peer.ctx);
       peer.runtime.onMessageStart({ role: "user", content: "old prompt" }, peer.ctx);
-      await vi.waitFor(() => expect(network.sent).toHaveLength(1));
+      // Initial delivery includes the renderer's first load, before recovery starts.
+      await vi.waitFor(() => expect(network.sent).toHaveLength(1), { timeout: 5000 });
       network.failPoll!(errorCode);
       await vi.waitFor(() => expect(((requester.runtime as any).followerClient as IpcFollowerClient).getStatus().error?.code).toBe(`TELEGRAM_HTTP_${errorCode}`));
       const recovery = initiator === "leader" ? leader : requester;

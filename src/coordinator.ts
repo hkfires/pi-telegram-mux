@@ -337,7 +337,8 @@ export class LeaderCoordinator {
       const route = target ? this.routes.get(target.threadId) : undefined;
       if (!target || !route || route.runtimeId !== runtimeId || route.sessionId !== target.sessionId || route.generation !== target.generation ||
           this.routeOwners.get(target.threadId) !== socket || params.message_thread_id !== target.threadId ||
-          typeof params.text !== "string" || !params.text.trim() || params.text.length > 4096) throw new Error("Output target fenced or invalid message");
+          typeof params.text !== "string" || !params.text.trim() || params.text.length > 4096 ||
+          (params.entities !== undefined && (!Array.isArray(params.entities) || params.entities.length > 100))) throw new Error("Output target fenced or invalid message");
     } else if (method === "closeForumTopic" || method === "reopenForumTopic") {
       if (!Number.isSafeInteger(params.message_thread_id) || (params.message_thread_id as number) <= 0) {
         throw new Error("Invalid message_thread_id for forum topic");

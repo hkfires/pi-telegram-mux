@@ -94,6 +94,14 @@ export interface TelegramChat {
   is_forum?: boolean;
 }
 
+export interface TelegramMessageEntity {
+  type: string;
+  offset: number;
+  length: number;
+  url?: string;
+  language?: string;
+}
+
 export interface TelegramMessage {
   message_id: number;
   message_thread_id?: number;
