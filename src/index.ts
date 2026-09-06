@@ -39,9 +39,13 @@ export default function (pi: ExtensionAPI): void {
 
   // Register local commands
   pi.registerCommand("tg-setup", {
-    description: "Configure Telegram Bot Token, Supergroup Chat ID, and Allowed User ID",
+    description: "Configure Telegram integration",
     handler: async (args, ctx) => {
-      await runtime.handleTgSetup(args, ctx);
+      if (args.trim()) {
+        ctx.ui.notify("Run /tg-setup without arguments to open settings.", "warning");
+        return;
+      }
+      await runtime.handleTgSetup(ctx);
     },
   });
 

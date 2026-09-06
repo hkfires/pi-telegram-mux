@@ -117,9 +117,13 @@ describe("polling recovery ownership and unconfigured synchronization", () => {
       await vi.waitFor(() => expect(coordinator.getStatus().error?.code).toBe(pollFailure.code));
       const connect = vi.spyOn(IpcFollowerClient.prototype, "connect");
       const start = vi.spyOn(LeaderCoordinator.prototype, "start");
-      if (outcome === "validation failure") vi.spyOn(TelegramClient.prototype, "getMe").mockRejectedValueOnce(new TelegramApiError("Simulated setup validation failure", 401));
+      if (outcome === "validation failure") {
+        vi.spyOn(TelegramClient.prototype, "getMe").mockRejectedValueOnce(new TelegramApiError("Simulated setup validation failure", 401));
+        f.ui.select.mockResolvedValueOnce("Connection settings");
+        f.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce(String(testConfig.allowedUserId));
+      }
 
-      await f.runtime.handleTgSetup(outcome === "cancel" ? "" : `${testConfig.botToken} ${testConfig.chatId} ${testConfig.allowedUserId}`, f.ctx);
+      await f.runtime.handleTgSetup(f.ctx);
       // Even an explicit connection attempt must recognize the still-live Leader.
       await f.runtime.setupTransport(f.ctx);
 

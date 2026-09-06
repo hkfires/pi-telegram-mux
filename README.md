@@ -10,7 +10,7 @@ English | [简体中文](README.zh-CN.md)
 
 - **Bi-directional Interaction**: Send prompts on your computer and sync prompts along with final responses to Telegram. Reply directly inside a topic on Telegram to dispatch new tasks to Pi on your computer.
 - **Multi-session Multiplexing**: Multiple running Pi instances share a single Telegram Bot. Each Pi session maps to its own dedicated Forum Topic without requiring external servers or background daemons.
-- **Automatic Binding & Lifecycle**: Automatically creates a topic on the first prompt in a blank session; attempts to close it when leaving the bound session (`/reload` keeps it open); reopens the existing topic when restoring a session via `/resume`, `-c`, `-r`, or `--session`.
+- **Automatic Binding & Lifecycle**: Creates a topic on the first prompt in a new session and reuses it when the session is restored.
 - **Remote Control**: Query session status or abort currently running tasks directly from Telegram.
 - **Restricted Access**: Accepts tasks only from the configured Telegram User ID for security.
 
@@ -65,19 +65,16 @@ pi -e /path/to/pi-telegram-mux/extensions/index.ts
 
 ### 2. Configure in Pi
 
-Launch `pi` and run:
+Run this command in Pi to open the settings menu:
 
 ```text
 /tg-setup
 ```
 
-Follow the interactive prompts to enter your Bot Token, Supergroup Chat ID, and User ID. Configuration is verified and saved automatically.
-
-You can also pass arguments directly:
-
-```text
-/tg-setup <Bot Token> <Chat ID> <User ID>
-```
+| Option | Purpose |
+| --- | --- |
+| Connection settings | Set the Bot Token, group Chat ID, and allowed User ID |
+| Auto-close topics | Automatically close topics when leaving sessions; off by default |
 
 Configuration is stored in `~/.pi/agent/pi-telegram-mux/config.json` by default (or under `PI_CODING_AGENT_DIR` if defined).
 
@@ -104,7 +101,7 @@ For an existing session with history that is not yet bound to a topic, run `/tg-
 
 | Command | Purpose |
 | --- | --- |
-| `/tg-setup` | Configure or update Bot Token, Chat ID, and allowed User ID |
+| `/tg-setup` | Configure Telegram integration |
 | `/tg-status` | Display connection status, current topic, and error details |
 | `/tg-connect` | Create a topic, resume existing binding, or reconnect after an issue |
 | `/tg-disconnect` | Detach the current session from Telegram (preserves the forum topic) |

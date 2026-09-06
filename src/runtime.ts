@@ -643,7 +643,7 @@ export class MuxRuntime {
     const coordinator = this.coordinator;
     const follower = this.followerClient;
     const shouldClose = event?.reason !== "reload" && this.active && !this.configuring && !this.getIsReconnecting() && !hasError &&
-      config && target && this.bindingState === "bound" && target.threadId === this.currentThreadId &&
+      config?.autoCloseTopics === true && target && this.bindingState === "bound" && target.threadId === this.currentThreadId &&
       target.sessionId === ctx.sessionManager.getSessionId() && this.hasActiveTransport();
     // Fence inputs and cancel queued output synchronously, retaining the last acknowledged route only for closure.
     this.active = false;
@@ -677,7 +677,7 @@ export class MuxRuntime {
     this.activeCtx = ctx;
     const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
     const failure = this.connectionError?.message ?? status?.error?.message ?? status?.feedbackError?.message ?? this.outbox.error?.message;
-    ctx.ui?.notify(`[Telegram Mux Status]\nConfig: ${this.config ? "configured" : "missing"}\nRole: ${this.isLeader ? "Leader" : this.followerClient ? "Follower" : "None"}\nSession ID: ${ctx.sessionManager.getSessionId()?.slice(-6)}\nBinding: ${this.bindingState}\nThread ID: ${this.currentThreadId ?? "none"}\nRuntime: ${this.getIsIdle() && ctx.isIdle() ? "idle" : "busy"}\nPolling: ${status?.polling ?? "offline"}\nPending sync: ${this.outbox.size}\nError: ${failure ?? "none"}`, "info");
+    ctx.ui?.notify(`[Telegram Mux Status]\nConfig: ${this.config ? "configured" : "missing"}\nRole: ${this.isLeader ? "Leader" : this.followerClient ? "Follower" : "None"}\nSession ID: ${ctx.sessionManager.getSessionId()?.slice(-6)}\nBinding: ${this.bindingState}\nThread ID: ${this.currentThreadId ?? "none"}\nAuto-close topics: ${this.config?.autoCloseTopics ? "ON" : "OFF"}\nRuntime: ${this.getIsIdle() && ctx.isIdle() ? "idle" : "busy"}\nPolling: ${status?.polling ?? "offline"}\nPending sync: ${this.outbox.size}\nError: ${failure ?? "none"}`, "info");
     this.updateStatusBar(ctx);
   }
 
@@ -754,7 +754,7 @@ export class MuxRuntime {
     ctx.ui?.notify("Disconnected from Telegram topic.", "info");
   }
 
-  public async handleTgSetup(args: string, ctx: ExtensionContext): Promise<void> {
+  public async handleTgSetup(ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== "tui" || !this.active || this.configuring || this.recovering || this.configurationTask) return;
     this.activeCtx = ctx;
     this.configuring = true;
@@ -762,40 +762,74 @@ export class MuxRuntime {
     this.configurationTask = new Promise<void>(resolve => { finishConfiguration = resolve; });
     let saved = false;
     try {
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      const botToken = parts.length >= 3 ? parts[0] : await ctx.ui.input("Bot Token:");
-      if (!botToken) return;
-      const chatInput = parts.length >= 3 ? parts[1] : await ctx.ui.input("Forum Supergroup Chat ID:");
-      if (!chatInput) return;
-      const userInput = parts.length >= 3 ? parts[2] : await ctx.ui.input("Allowed User ID:");
-      if (!userInput) return;
-      const config = validateConfig({ version: 1, botToken, chatId: Number(chatInput), allowedUserId: Number(userInput) });
-      const client = new TelegramClient({ botToken: config.botToken });
-      await validateBotAndChat(client, config.chatId, config.allowedUserId);
-      if (!this.active) return;
-      await saveConfig(this.agentDir, config);
-      saved = true;
-      this.invalidateRun();
-      if (this.coordinator) {
-        await this.coordinator.reloadConfig();
-      } else if (this.followerClient?.isConnected()) {
-        // The Leader applies the new config before acknowledging, then reconnects peers.
-        await this.followerClient.reloadConfig();
-        await this.stopTransport();
-        this.applyConfig(config, ctx);
-      } else {
-        await this.stopTransport();
-        this.applyConfig(config, ctx);
+      while (this.active) {
+        // Each menu selection has its own save outcome; the command retains the
+        // configuration barrier until the user leaves the top-level menu.
+        saved = false;
+        this.configuring = true;
+        try {
+          const connectionOption = "Connection settings";
+          const autoCloseOption = `Auto-close topics: ${this.config?.autoCloseTopics ? "ON" : "OFF"}`;
+          const setting = await ctx.ui.select("Telegram settings", [connectionOption, autoCloseOption]);
+          if (setting === undefined || !this.active) return;
+          let changes: Partial<MuxConfig>;
+          if (setting === connectionOption) {
+            const botToken = await ctx.ui.input("Bot Token:");
+            if (!this.active) return;
+            if (!botToken) continue;
+            const chatInput = await ctx.ui.input("Forum Supergroup Chat ID:");
+            if (!this.active) return;
+            if (!chatInput) continue;
+            const userInput = await ctx.ui.input("Allowed User ID:");
+            if (!this.active) return;
+            if (!userInput) continue;
+            changes = { botToken, chatId: Number(chatInput), allowedUserId: Number(userInput) };
+            const connection = validateConfig({ version: 1, ...changes });
+            const client = new TelegramClient({ botToken: connection.botToken });
+            await validateBotAndChat(client, connection.chatId, connection.allowedUserId);
+          } else if (setting === autoCloseOption) {
+            if (!this.config) {
+              ctx.ui.notify("Configure the Telegram connection first.", "warning");
+              continue;
+            }
+            const options = ["OFF - keep topics open (faster exit)", "ON - close topics (may wait up to 3 seconds)"];
+            const selected = await ctx.ui.select(`Auto-close topics (current: ${this.config.autoCloseTopics ? "ON" : "OFF"})`, options);
+            if (selected === undefined) continue;
+            changes = { autoCloseTopics: selected === options[1] };
+          } else return;
+          if (!this.active) return;
+          // Merge only the selected setting into the latest saved configuration so
+          // changes made by another instance while the dialog was open are retained.
+          const config = await loadConfig(this.agentDir, changes);
+          if (!this.active) return;
+          if (!config) throw new Error("Telegram configuration missing");
+          await saveConfig(this.agentDir, config);
+          saved = true;
+          this.invalidateRun();
+          if (this.coordinator) {
+            await this.coordinator.reloadConfig();
+          } else if (this.followerClient?.isConnected()) {
+            // The Leader applies the new config before acknowledging, then reconnects peers.
+            await this.followerClient.reloadConfig();
+            await this.stopTransport();
+            this.applyConfig(config, ctx);
+          } else {
+            await this.stopTransport();
+            this.applyConfig(config, ctx);
+          }
+          this.configuring = false;
+          await this.setupTransport(ctx);
+          this.updateStatusBar(ctx);
+          ctx.ui.notify("Telegram configuration saved and applied.", "info");
+        } catch (err) {
+          if (saved) {
+            await this.stopTransport();
+            ctx.ui?.notify("Configuration saved, but could not confirm updates on all processes. Please restart all Pi instances.", "error");
+            return;
+          }
+          ctx.ui?.notify(`Telegram configuration validation failed: ${err instanceof Error ? err.message : "Unknown error"}`, "error");
+        }
       }
-      this.configuring = false;
-      await this.setupTransport(ctx);
-      this.updateStatusBar(ctx);
-      ctx.ui.notify("Telegram configuration verified, saved, and applied.", "info");
-    } catch (err) {
-      if (saved) {
-        await this.stopTransport();
-        ctx.ui?.notify("Configuration saved, but could not confirm updates on all processes. Please restart all Pi instances.", "error");
-      } else ctx.ui?.notify(`Telegram configuration validation failed: ${err instanceof Error ? err.message : "Unknown error"}`, "error");
     } finally {
       this.configuring = false;
       this.configurationTask = null;

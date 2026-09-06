@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MuxRuntime } from "../src/runtime.js";
 import { LeaderCoordinator } from "../src/coordinator.js";
+import { saveConfig } from "../src/config.js";
 import { IpcError } from "../src/ipc.js";
 import { TelegramApiError, TelegramClient } from "../src/telegram.js";
 import { runtimeFixture, testConfig } from "./helpers.js";
@@ -13,7 +14,10 @@ type Fixture = Awaited<ReturnType<typeof runtimeFixture>>;
 describe("forum topic lifecycle", () => {
   let dir: string;
   const fixtures: Fixture[] = [];
-  beforeEach(async () => { dir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-topic-lifecycle-")); });
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-topic-lifecycle-"));
+    await saveConfig(dir, { ...testConfig, autoCloseTopics: true });
+  });
   afterEach(async () => {
     vi.useRealTimers();
     vi.restoreAllMocks();

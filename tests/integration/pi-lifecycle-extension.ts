@@ -51,7 +51,7 @@ export default function (pi: ExtensionAPI) {
   if (scenario !== "reconnect") pi.on("input", async (event, ctx) => {
     if (scenario === "follow-up") return { action: "continue" };
     await new Promise(resolve => setTimeout(resolve, 20));
-    if (scenario === "config") await runtime.handleTgSetup("fake-regression-token -100999 999", tui(ctx));
+    if (scenario === "config") await runtime.handleTgSetup(tui(ctx));
     return { action: "transform", text: "completely transformed" };
   });
   pi.on("before_agent_start", async (event, ctx) => { starts++; await runtime.onBeforeAgentStart(event, tui(ctx)); });

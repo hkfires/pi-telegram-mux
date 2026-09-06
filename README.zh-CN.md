@@ -10,7 +10,7 @@ Pi 编码助手的 Telegram 论坛超级群多路复用插件。让你通过 Tel
 
 - **双向交互**：在电脑上提问，提示词与最终回复同步到手机；在手机话题中发送文字，交给电脑上的 Pi 执行。
 - **多会话管理**：多个 Pi 实例共享一个 Telegram Bot，每个会话对应一个独立话题，无需额外部署服务。
-- **自动连接与生命周期**：空白会话首次提问时自动创建话题；退出已绑定会话时尝试关闭话题（`/reload` 保留话题）；通过 `/resume`、`-c`、`-r` 或 `--session` 恢复会话时，重新打开并继续使用原话题。
+- **自动连接与生命周期**：新会话首次提问时自动创建话题，恢复会话时继续使用原话题。
 - **远程控制**：在手机查询会话状态，或中止正在执行的任务。
 - **指定用户访问**：只接收配置的 Telegram 用户发来的任务。
 
@@ -65,21 +65,16 @@ pi -e /path/to/pi-telegram-mux/extensions/index.ts
 
 ### 2. 在 Pi 中配置
 
-启动 `pi`，输入：
+在 Pi 中运行以下命令，打开设置菜单：
 
 ```text
 /tg-setup
 ```
 
-依次填写 Bot Token、群组 Chat ID 和你的用户 ID。验证成功后会保存配置，后续无需重复填写。
-
-也可以直接传入参数：
-
-```text
-/tg-setup <Bot Token> <Chat ID> <用户 ID>
-```
-
-Bot Token 请填写从 BotFather 获取的实际 Token。
+| 选项 | 作用 |
+| --- | --- |
+| Connection settings（连接配置） | 设置 Bot Token、群组 Chat ID 和允许使用的用户 ID |
+| Auto-close topics（自动关闭话题） | 离开会话时自动关闭话题，默认关闭 |
 
 配置默认保存在 `~/.pi/agent/pi-telegram-mux/config.json`。如果设置了 `PI_CODING_AGENT_DIR`，则使用该目录。
 
@@ -106,7 +101,7 @@ Bot Token 请填写从 BotFather 获取的实际 Token。
 
 | 命令 | 用途 |
 | --- | --- |
-| `/tg-setup` | 配置或更换 Bot、群组和允许访问的用户 |
+| `/tg-setup` | 配置 Telegram 插件 |
 | `/tg-status` | 查看连接状态、当前话题和错误信息 |
 | `/tg-connect` | 创建话题、恢复已有绑定，或在同步异常后重新连接 |
 | `/tg-disconnect` | 停止当前会话的同步，保留群内话题 |

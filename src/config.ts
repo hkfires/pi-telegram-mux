@@ -56,18 +56,23 @@ export function validateConfig(data: unknown): MuxConfig {
     throw new Error("Invalid config: allowedUserId must be a positive safe integer");
   }
 
+  if (obj.autoCloseTopics !== undefined && typeof obj.autoCloseTopics !== "boolean") {
+    throw new Error("Invalid config: autoCloseTopics must be a boolean");
+  }
+
   // Strictly return only MuxConfig fields to avoid extra persistence.
   return {
     version: 1,
     botToken: obj.botToken.trim(),
     chatId: obj.chatId,
     allowedUserId: obj.allowedUserId,
+    autoCloseTopics: obj.autoCloseTopics ?? false,
   };
 }
 
 /** Compare effective configuration without sending the token over IPC. */
 export function configFingerprint(config: MuxConfig): string {
-  return createHash("sha256").update(JSON.stringify([config.botToken, config.chatId, config.allowedUserId])).digest("hex");
+  return createHash("sha256").update(JSON.stringify([config.botToken, config.chatId, config.allowedUserId, config.autoCloseTopics ?? false])).digest("hex");
 }
 
 /**
@@ -90,19 +95,32 @@ export function loadConfigSync(agentDir: string): MuxConfig | null {
 }
 
 /**
- * Async load and validate config from disk.
+ * Load configuration and validate it after applying optional settings updates.
+ * A complete connection update can rebuild malformed configuration; ordinary
+ * loads and updates to individual preferences still require valid connection data.
  */
-export async function loadConfig(agentDir: string): Promise<MuxConfig | null> {
+export async function loadConfig(agentDir: string, updates?: Partial<MuxConfig>): Promise<MuxConfig | null> {
   const configPath = getConfigPath(agentDir);
+  const canRebuild = updates?.botToken !== undefined && updates.chatId !== undefined && updates.allowedUserId !== undefined;
+  let data: unknown;
   try {
     const content = await fs.readFile(configPath, "utf-8");
-    return validateConfig(JSON.parse(content));
+    data = JSON.parse(content);
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-    throw err;
+      if (!updates) return null;
+    } else if (!canRebuild || !(err instanceof SyntaxError)) throw err;
   }
+  if (updates) {
+    const stored = data && typeof data === "object" && !Array.isArray(data) ? data : {};
+    const merged = { ...stored, ...updates };
+    if (canRebuild) {
+      if (updates.version === undefined) merged.version = 1;
+      if (updates.autoCloseTopics === undefined && typeof merged.autoCloseTopics !== "boolean") merged.autoCloseTopics = false;
+    }
+    data = merged;
+  }
+  return validateConfig(data);
 }
 
 /** Atomic rename with bounded retries for Windows readers holding a sharing lock. */

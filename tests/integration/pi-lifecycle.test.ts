@@ -24,6 +24,14 @@ it.each(["transformed", "config", "follow-up", "reconnect"])("uses real Pi 0.85 
     });
     let stderr = "";
     const messages: unknown[] = [];
+    const setupReplies = [
+      { method: "select", title: "Telegram settings", value: "Connection settings" },
+      { method: "input", title: "Bot Token:", value: testConfig.botToken },
+      { method: "input", title: "Forum Supergroup Chat ID:", value: "-100999" },
+      { method: "input", title: "Allowed User ID:", value: "999" },
+      { method: "select", title: "Telegram settings", cancelled: true },
+    ];
+    let setupReplyIndex = 0;
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", chunk => { stderr += chunk; });
     const result = await new Promise<any>((resolve, reject) => {
@@ -40,6 +48,14 @@ it.each(["transformed", "config", "follow-up", "reconnect"])("uses real Pi 0.85 
           try {
             let message = JSON.parse(line);
             messages.push(message);
+            if (message.type === "extension_ui_request" && ["select", "input"].includes(message.method)) {
+              // Drive the real menu dialogs through Pi's RPC UI protocol.
+              const reply = setupReplies[setupReplyIndex++];
+              if (scenario !== "config" || !reply || message.method !== reply.method || message.title !== reply.title) {
+                throw new Error("Unexpected setup dialog");
+              }
+              child!.stdin!.write(JSON.stringify({ type: "extension_ui_response", id: message.id, value: reply.value, cancelled: reply.cancelled }) + "\n");
+            }
             if (message.type === "extension_ui_request" && message.method === "notify" && message.message.startsWith('{"type":"mux_review_result"')) message = JSON.parse(message.message);
             if (message.type === "extension_error" || (message.type === "response" && message.success === false)) throw new Error(JSON.stringify(message));
             if (message.type === "mux_review_result") { clearTimeout(timer); resolve(message); }
@@ -55,6 +71,7 @@ it.each(["transformed", "config", "follow-up", "reconnect"])("uses real Pi 0.85 
       child!.stdin!.write(JSON.stringify({ type: "prompt", message: scenario === "follow-up" ? "local-one" : scenario === "reconnect" ? "/review-reconnect" : "/review-inbound" }) + "\n");
     });
     expect(result.error).toBeUndefined();
+    expect(setupReplyIndex).toBe(scenario === "config" ? setupReplies.length : 0);
     expect(result.idle).toBe(true);
     expect(result.starts).toBe(1);
     if (scenario === "follow-up") {

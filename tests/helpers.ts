@@ -13,7 +13,7 @@ export async function runtimeFixture(agentDir: string, id: string, threadId: num
   try { await fs.access(getConfigPath(agentDir)); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; await saveConfig(agentDir, testConfig); }
   const entries: any[] = threadId === null ? [] : [{ type: "custom", customType: "pi-telegram-mux.binding", data: { version: 1, sessionId: id, chatId: testConfig.chatId, threadId } }];
-  const ui = { notify: vi.fn(), setStatus: vi.fn(), confirm: vi.fn(async () => true), input: vi.fn() };
+  const ui = { notify: vi.fn(), setStatus: vi.fn(), confirm: vi.fn(async () => true), input: vi.fn(), select: vi.fn(async (_title: string, _options: string[]): Promise<string | undefined> => undefined) };
   const ctx = {
     mode: "tui", cwd: agentDir, ui, isIdle: vi.fn(() => true), abort: vi.fn(),
     sessionManager: { getSessionId: () => id, getEntries: () => entries, getSessionFile: () => `${agentDir}/${id}.jsonl` },

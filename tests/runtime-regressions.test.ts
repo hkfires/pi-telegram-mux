@@ -87,8 +87,9 @@ describe("Runtime lifecycle and safety regressions", () => {
     let answer!: (value: string | undefined) => void;
     follower.ui.input.mockReturnValueOnce(new Promise(resolve => { answer = resolve; }))
       .mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce(String(testConfig.allowedUserId));
+    follower.ui.select.mockResolvedValueOnce("Connection settings");
     if (outcome === "validation failure") vi.spyOn(TelegramClient.prototype, "getMe").mockRejectedValueOnce(new Error("Simulated validation failure"));
-    const setup = follower.runtime.handleTgSetup("", follower.ctx);
+    const setup = follower.runtime.handleTgSetup(follower.ctx);
     await leader.runtime.onSessionShutdown(leader.ctx);
     await vi.waitFor(() => expect((follower.runtime as any).followerClient).toBeNull());
     answer(outcome === "cancel" ? undefined : testConfig.botToken);
@@ -111,6 +112,7 @@ describe("Runtime lifecycle and safety regressions", () => {
   });
 
   it.each(["disconnect", "tree", "shutdown", "switch"])("fences remaining output chunks after %s", async action => {
+    await configModule.saveConfig(dir, { ...testConfig, autoCloseTopics: true });
     const f = await fixture("chunk");
     await f.runtime.onBeforeAgentStart(f.ctx);
     f.runtime.onMessageEnd({ role: "assistant", content: "x".repeat(9000) });
@@ -223,7 +225,9 @@ describe("Runtime lifecycle and safety regressions", () => {
     const f = await fixture("preflight-config");
     const admission = f.runtime.handleInboundText("old authorized prompt", f.ctx);
     validateSetup();
-    await f.runtime.handleTgSetup(`${testConfig.botToken} -100999 999`, f.ctx);
+    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce("-100999").mockResolvedValueOnce("999");
+    await f.runtime.handleTgSetup(f.ctx);
     expect(await admission).toMatchObject({ accepted: false });
     expect(await f.runtime.handleInboundText("second", f.ctx)).toEqual({ accepted: false, busy: true });
     const call = vi.spyOn(f.runtime, "callTelegram");
@@ -250,7 +254,10 @@ describe("Runtime lifecycle and safety regressions", () => {
     const c = coordinatorOf(leader);
     const previousGeneration = c.getRoutes().get(51)!.generation;
     validateSetup();
-    await (origin === "leader" ? leader : follower).runtime.handleTgSetup(`${testConfig.botToken} ${testConfig.chatId} 999`, (origin === "leader" ? leader : follower).ctx);
+    const owner = origin === "leader" ? leader : follower;
+    owner.ui.select.mockResolvedValueOnce("Connection settings");
+    owner.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce("999");
+    await owner.runtime.handleTgSetup(owner.ctx);
     await vi.waitFor(() => {
       expect(c.getRoutes().get(51)?.generation).toBeGreaterThan(previousGeneration);
       expect(follower.runtime.getIsReconnecting()).toBe(false);
@@ -277,7 +284,9 @@ describe("Runtime lifecycle and safety regressions", () => {
     const leader = await fixture("leader", 50);
     const follower = await fixture("follower", 51);
     validateSetup();
-    await leader.runtime.handleTgSetup(`${testConfig.botToken} -100999 999`, leader.ctx);
+    leader.ui.select.mockResolvedValueOnce("Connection settings");
+    leader.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce("-100999").mockResolvedValueOnce("999");
+    await leader.runtime.handleTgSetup(leader.ctx);
     await vi.waitFor(() => expect(follower.runtime.getBindingState()).toBe("unbound"), { timeout: 4000 });
     expect(leader.runtime.getBindingState()).toBe("unbound");
     expect(coordinatorOf(leader).getRoutes().size).toBe(0);
@@ -288,9 +297,11 @@ describe("Runtime lifecycle and safety regressions", () => {
     const follower = await fixture("follower", 51);
     (follower.runtime as any).followerClient.close();
     validateSetup();
-    await follower.runtime.handleTgSetup(`${testConfig.botToken} ${testConfig.chatId} 999`, follower.ctx);
+    follower.ui.select.mockResolvedValueOnce("Connection settings");
+    follower.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce("999");
+    await follower.runtime.handleTgSetup(follower.ctx);
     expect(follower.runtime.hasActiveTransport()).toBe(true);
-    expect(follower.ui.notify.mock.calls.some(call => String(call[0]).includes("saved, and applied"))).toBe(true);
+    expect(follower.ui.notify.mock.calls.some(call => String(call[0]).includes("saved and applied"))).toBe(true);
     const c = coordinatorOf(leader);
     await c.processUpdate(telegramUpdate(50, "old authorization"));
     await c.processUpdate(telegramUpdate(51, "old authorization"));
@@ -303,7 +314,9 @@ describe("Runtime lifecycle and safety regressions", () => {
     const call = vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({ message_thread_id: 61 } as any);
     await f.runtime.onBeforeAgentStart({ prompt: "old-chat prompt" }, f.ctx);
     validateSetup();
-    await f.runtime.handleTgSetup(`${testConfig.botToken} -100999 999`, f.ctx);
+    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce("-100999").mockResolvedValueOnce("999");
+    await f.runtime.handleTgSetup(f.ctx);
     call.mockClear();
     f.runtime.onMessageEnd({ role: "assistant", content: "old-chat confidential answer" });
     await f.runtime.onAgentSettled(f.ctx);
@@ -316,7 +329,9 @@ describe("Runtime lifecycle and safety regressions", () => {
     const call = vi.spyOn(f.runtime, "callTelegram").mockRejectedValue(new Error("Unknown create timeout"));
     await f.runtime.onBeforeAgentStart({ prompt: "first" }, f.ctx);
     validateSetup();
-    await f.runtime.handleTgSetup(`${testConfig.botToken} ${testConfig.chatId} 999`, f.ctx);
+    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce("999");
+    await f.runtime.handleTgSetup(f.ctx);
     f.runtime.onMessageEnd({ role: "assistant", content: "late first answer" });
     await f.runtime.onAgentSettled(f.ctx);
     await f.runtime.onBeforeAgentStart({ prompt: "second" }, f.ctx);
@@ -336,7 +351,9 @@ describe("Runtime lifecycle and safety regressions", () => {
         : method === "getChatMember" ? { status: "administrator", can_manage_topics: true } : undefined;
       return result ? Promise.resolve(new Response(JSON.stringify({ ok: true, result }), { status: 200 })) : fetch(url, init);
     });
-    await f.runtime.handleTgSetup(`123:literal-test-token ${testConfig.chatId} ${testConfig.allowedUserId}`, f.ctx);
+    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.input.mockResolvedValueOnce("123:literal-test-token").mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce(String(testConfig.allowedUserId));
+    await f.runtime.handleTgSetup(f.ctx);
     expect((await loadConfig(dir))?.botToken).toBe("123:literal-test-token");
     await vi.waitFor(() => expect(requested.some(url => url.includes("bot123:literal-test-token/getUpdates"))).toBe(true));
     expect(requested.some(url => url.includes("bot123:literal-test-token/getMe"))).toBe(true);

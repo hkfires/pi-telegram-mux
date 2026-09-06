@@ -510,6 +510,7 @@ describe("runtime module", () => {
     });
 
     it("automatically closes forum topic on session shutdown when bound", async () => {
+      await saveConfig(tempDir, { ...mockConfig, autoCloseTopics: true });
       const mockPi = { appendEntry: vi.fn() } as any;
       const runtime = new MuxRuntime(mockPi, tempDir);
       const entries: any[] = [
@@ -572,6 +573,7 @@ describe("runtime module", () => {
     });
 
     it("tolerates closeForumTopic failure during session shutdown", async () => {
+      await saveConfig(tempDir, { ...mockConfig, autoCloseTopics: true });
       const mockPi = { appendEntry: vi.fn() } as any;
       const runtime = new MuxRuntime(mockPi, tempDir);
       const entries: any[] = [
@@ -671,6 +673,7 @@ describe("runtime module", () => {
     });
 
     it("closes old topic on /new lifecycle and readies new unbound session", async () => {
+      await saveConfig(tempDir, { ...mockConfig, autoCloseTopics: true });
       const mockPi = { appendEntry: vi.fn() } as any;
       const runtime = new MuxRuntime(mockPi, tempDir);
       const oldEntries: any[] = [

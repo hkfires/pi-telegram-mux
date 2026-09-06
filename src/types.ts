@@ -12,6 +12,7 @@ export interface MuxConfig {
   botToken: string; // literal Bot Token
   chatId: number; // numeric ID of Forum Supergroup
   allowedUserId: number; // numeric Telegram user ID
+  autoCloseTopics?: boolean; // Close topics when leaving a session; defaults to false.
 }
 
 /**
