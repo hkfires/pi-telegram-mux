@@ -87,6 +87,10 @@ export default function (pi: ExtensionAPI): void {
     runtime.onMessageEnd(event.message);
   });
 
+  pi.on("turn_end", (event) => {
+    runtime.onTurnEnd(event.message);
+  });
+
   pi.on("agent_settled", async (_event, ctx) => {
     await runtime.onAgentSettled(ctx);
   });

@@ -300,6 +300,135 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     expect(texts).toEqual(["🧑‍💻 [Prompt]\nfirst", "🧑‍💻 [Prompt]\nsteering", "🧑‍💻 [Prompt]\nfollow-up", "first answer", "🧑‍💻 [Prompt]\nsecond", "second answer"]);
   });
 
+  it.each([false, true])("delivers ten queued replies once in FIFO order before settling (slow transport: %s)", async slow => {
+    const f = await fixture();
+    const gate = deferred();
+    const texts: unknown[] = [];
+    vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (_method, params) => {
+      if (slow) await gate.promise;
+      texts.push(params.text);
+      return {} as any;
+    });
+    const expected: string[] = [];
+    try {
+      await f.runtime.onBeforeAgentStart(f.ctx);
+      for (let i = 1; i <= 10; i++) {
+        f.runtime.onMessageStart({ role: "user", content: `prompt ${i}` }, f.ctx);
+        const message = { role: "assistant", content: `answer ${i}`, stopReason: i % 2 ? "length" : "stop" };
+        f.runtime.onMessageStart(message, f.ctx);
+        f.runtime.onMessageEnd(message);
+        f.runtime.onTurnEnd(message);
+        f.runtime.onTurnEnd(message);
+        expected.push(`🧑‍💻 [Prompt]\nprompt ${i}`, `answer ${i}`);
+        expect(f.runtime.getIsIdle()).toBe(false);
+        if (!slow) {
+          await f.runtime.outbox.whenIdle();
+          expect(texts).toEqual(expected);
+        }
+      }
+      gate.resolve();
+      await f.runtime.outbox.whenIdle();
+      expect(texts).toEqual(expected);
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(texts).toEqual(expected);
+      expect(f.runtime.getIsIdle()).toBe(true);
+    } finally {
+      gate.resolve();
+    }
+  });
+
+  it.each(["toolUse", "stop", "length"])("does not flush tool commentary before steering (stop reason: %s)", async stopReason => {
+    const f = await fixture();
+    const call = vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({} as any);
+    await f.runtime.onBeforeAgentStart(f.ctx);
+    f.runtime.onMessageStart({ role: "user", content: "original" }, f.ctx);
+    const toolMessage = { role: "assistant", stopReason, content: [
+      { type: "text", text: "Running tests now" },
+      { type: "toolCall", id: "tool-1", name: "bash", arguments: {} },
+    ] };
+    f.runtime.onMessageEnd(toolMessage);
+    f.runtime.onTurnEnd(toolMessage);
+    f.runtime.onMessageStart({ role: "user", content: "also check types" }, f.ctx);
+    const answer = { role: "assistant", content: "All checks completed", stopReason: "stop" };
+    f.runtime.onMessageStart(answer, f.ctx);
+    f.runtime.onMessageEnd(answer);
+    f.runtime.onTurnEnd(answer);
+    await f.runtime.outbox.whenIdle();
+    expect(call.mock.calls.map(([, params]) => params.text)).toEqual([
+      "🧑‍💻 [Prompt]\noriginal", "🧑‍💻 [Prompt]\nalso check types", "All checks completed",
+    ]);
+    expect(f.runtime.getIsIdle()).toBe(false);
+  });
+
+  it.each(["error", "aborted"])("keeps %s handling at settlement after an earlier reply", async stopReason => {
+    const f = await fixture();
+    const call = vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({} as any);
+    await f.runtime.onBeforeAgentStart(f.ctx);
+    f.runtime.onTurnEnd({ role: "assistant", content: "first answer", stopReason: "stop" });
+    f.runtime.onMessageStart({ role: "user", content: "next" }, f.ctx);
+    const terminal = { role: "assistant", content: "", stopReason };
+    f.runtime.onMessageEnd(terminal);
+    f.runtime.onTurnEnd(terminal);
+    await f.runtime.outbox.whenIdle();
+    expect(call.mock.calls.map(([, params]) => params.text)).toEqual(["first answer", "🧑‍💻 [Prompt]\nnext"]);
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.outbox.whenIdle();
+    expect(call.mock.calls.map(([, params]) => params.text)).toEqual([
+      "first answer", "🧑‍💻 [Prompt]\nnext",
+      stopReason === "error" ? "⚠️ Task failed. Please check local Pi errors."
+        : "⏹ Task aborted.",
+    ]);
+  });
+
+  it.each([true, false])("delivers length text without added warnings (turn end: %s)", async turnEnd => {
+    const f = await fixture();
+    const call = vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({} as any);
+    await f.runtime.onBeforeAgentStart(f.ctx);
+    const message = { role: "assistant", content: "Already generated text", stopReason: "length" };
+    f.runtime.onMessageEnd(message);
+    if (turnEnd) {
+      f.runtime.onTurnEnd(message);
+      await f.runtime.outbox.whenIdle();
+      expect(call.mock.calls.map(([, params]) => params.text)).toEqual([message.content]);
+      expect(f.runtime.getIsIdle()).toBe(false);
+    }
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.outbox.whenIdle();
+    expect(call.mock.calls.map(([, params]) => params.text)).toEqual([message.content]);
+  });
+
+  it("delivers a later assistant reply after length without a new user message", async () => {
+    const f = await fixture();
+    const call = vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({} as any);
+    await f.runtime.onBeforeAgentStart(f.ctx);
+    for (const stopReason of ["length", "stop"]) {
+      const message = { role: "assistant", content: `reply ending with ${stopReason}`, stopReason };
+      f.runtime.onMessageStart(message, f.ctx);
+      f.runtime.onMessageEnd(message);
+      f.runtime.onTurnEnd(message);
+    }
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.outbox.whenIdle();
+    expect(call.mock.calls.map(([, params]) => params.text)).toEqual(["reply ending with length", "reply ending with stop"]);
+  });
+
+  it("delivers a retry success without publishing the transient failure", async () => {
+    const f = await fixture();
+    const call = vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({} as any);
+    await f.runtime.onBeforeAgentStart(f.ctx);
+    f.runtime.onTurnEnd({ role: "assistant", content: "", stopReason: "error" });
+    await f.runtime.outbox.whenIdle();
+    expect(call).not.toHaveBeenCalled();
+    const answer = { role: "assistant", content: "retry succeeded", stopReason: "stop" };
+    f.runtime.onMessageStart(answer, f.ctx);
+    f.runtime.onMessageEnd(answer);
+    f.runtime.onTurnEnd(answer);
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.outbox.whenIdle();
+    expect(call.mock.calls.map(([, params]) => params.text)).toEqual(["retry succeeded"]);
+  });
+
   it("retains prompts until first-turn session persistence becomes available", async () => {
     const f = await fixture(null);
     let file: string | undefined;
@@ -314,6 +443,10 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     expect(calls).toEqual([]);
     file = path.join(dir, "session.jsonl");
     f.runtime.onMessageEnd({ role: "assistant", content: "answer", stopReason: "stop" });
+    f.runtime.onTurnEnd({ role: "assistant", content: "answer", stopReason: "stop" });
+    await f.runtime.outbox.whenIdle();
+    expect(calls).toEqual(["create", "🧑‍💻 [Prompt]\nfirst", "answer"]);
+    expect(f.runtime.getIsIdle()).toBe(false);
     await f.runtime.onAgentSettled(f.ctx);
     await f.runtime.outbox.whenIdle();
     expect(calls).toEqual(["create", "🧑‍💻 [Prompt]\nfirst", "answer"]);

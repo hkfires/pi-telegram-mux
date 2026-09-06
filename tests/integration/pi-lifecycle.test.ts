@@ -6,7 +6,7 @@ import { expect, it } from "vitest";
 import { saveConfig } from "../../src/config.js";
 import { testConfig } from "../helpers.js";
 
-it.each(["transformed", "config", "follow-up", "reconnect"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
+it.each(["transformed", "config", "follow-up", "length-follow-up", "reconnect"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-pi-lifecycle-"));
   let child: ChildProcess | undefined;
   try {
@@ -68,15 +68,15 @@ it.each(["transformed", "config", "follow-up", "reconnect"])("uses real Pi 0.85 
       });
       child!.once("error", error => { clearTimeout(timer); reject(error); });
       child!.once("exit", code => { clearTimeout(timer); reject(new Error(`Pi exited (${code}): ${stderr}`)); });
-      child!.stdin!.write(JSON.stringify({ type: "prompt", message: scenario === "follow-up" ? "local-one" : scenario === "reconnect" ? "/review-reconnect" : "/review-inbound" }) + "\n");
+      child!.stdin!.write(JSON.stringify({ type: "prompt", message: scenario === "follow-up" || scenario === "length-follow-up" ? "local-one" : scenario === "reconnect" ? "/review-reconnect" : "/review-inbound" }) + "\n");
     });
     expect(result.error).toBeUndefined();
     expect(setupReplyIndex).toBe(scenario === "config" ? setupReplies.length : 0);
     expect(result.idle).toBe(true);
     expect(result.starts).toBe(1);
-    if (scenario === "follow-up") {
+    if (scenario === "follow-up" || scenario === "length-follow-up") {
       expect(result.received).toEqual(["local-one", "local-follow-up"]);
-      expect(result.texts).toEqual(["🧑‍💻 [Prompt]\nlocal-one", "🧑‍💻 [Prompt]\nlocal-follow-up", "answer 2"]);
+      expect(result.texts).toEqual(["🧑‍💻 [Prompt]\nlocal-one", "answer 1", "🧑‍💻 [Prompt]\nlocal-follow-up", "answer 2"]);
     } else if (scenario === "reconnect") {
       expect(result.received).toEqual(["ready task"]);
       expect(result.texts).toEqual(["answer 1"]);

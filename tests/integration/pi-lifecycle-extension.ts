@@ -24,7 +24,10 @@ export default function (pi: ExtensionAPI) {
     streamSimple: model => {
       const stream = new AssistantMessageEventStream();
       const message = { role: "assistant" as const, content: [{ type: "text" as const, text: `answer ${++answers}` }], api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: "stop" as const, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-      setTimeout(() => { stream.push({ type: "start", partial: message }); stream.push({ type: "done", reason: "stop", message }); stream.end(); }, 25);
+      const response = scenario === "length-follow-up" && answers === 1
+        ? { ...message, stopReason: "length" as const, usage: { ...message.usage, output: model.maxTokens, totalTokens: model.maxTokens + 1 } }
+        : message;
+      setTimeout(() => { stream.push({ type: "start", partial: response }); stream.push({ type: "done", reason: response.stopReason, message: response }); stream.end(); }, 25);
       return stream;
     },
   });
@@ -49,7 +52,7 @@ export default function (pi: ExtensionAPI) {
     await runtime.onSessionStart(tui(ctx));
   });
   if (scenario !== "reconnect") pi.on("input", async (event, ctx) => {
-    if (scenario === "follow-up") return { action: "continue" };
+    if (scenario === "follow-up" || scenario === "length-follow-up") return { action: "continue" };
     await new Promise(resolve => setTimeout(resolve, 20));
     if (scenario === "config") await runtime.handleTgSetup(tui(ctx));
     return { action: "transform", text: "completely transformed" };
@@ -59,10 +62,11 @@ export default function (pi: ExtensionAPI) {
     runtime.onMessageStart(event.message, tui(ctx));
     if (event.message.role === "user") {
       received.push(typeof event.message.content === "string" ? event.message.content : event.message.content.filter(part => part.type === "text").map(part => part.text).join(""));
-      if (scenario === "follow-up" && received.length === 1) pi.sendUserMessage("local-follow-up", { deliverAs: "followUp" });
+      if ((scenario === "follow-up" || scenario === "length-follow-up") && received.length === 1) pi.sendUserMessage("local-follow-up", { deliverAs: "followUp" });
     }
   });
   pi.on("message_end", event => { runtime.onMessageEnd(event.message); });
+  pi.on("turn_end", event => { runtime.onTurnEnd(event.message); });
   pi.on("agent_settled", async (_event, ctx) => {
     await runtime.onAgentSettled(tui(ctx));
     // Test observation only: production handlers never await the outbox.

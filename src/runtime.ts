@@ -89,6 +89,7 @@ interface MirrorRun {
   firstUserMessage: boolean;
   text: string;
   stopReason?: string;
+  replyQueued?: boolean;
   settled: Promise<void>;
   settle: () => void;
 }
@@ -404,10 +405,11 @@ export class MuxRuntime {
   public onMessageStart(message: unknown, ctx: ExtensionContext): void {
     const run = this.currentRun;
     if (!run || !message || typeof message !== "object" || !("role" in message)) return;
-    if (message.role === "assistant") { run.text = ""; run.stopReason = undefined; return; }
+    if (message.role === "assistant") { run.text = ""; run.stopReason = undefined; run.replyQueued = false; return; }
     if (message.role !== "user") return;
     run.text = "";
     run.stopReason = undefined;
+    run.replyQueued = false;
     if (run.firstUserMessage) {
       run.firstUserMessage = false;
       if (run.origin) {
@@ -560,6 +562,23 @@ export class MuxRuntime {
     const text = extractAssistantText(message);
     run.text = text.length <= MAX_MIRRORED_TEXT_LENGTH ? text : "⚠️ Response exceeds background sync size limit. Please view it locally in Pi.";
     run.stopReason = "stopReason" in message && typeof message.stopReason === "string" ? message.stopReason : undefined;
+    run.replyQueued = false;
+  }
+
+  public onTurnEnd(message: unknown): void {
+    const run = this.currentRun;
+    if (!run || run.replyQueued || !this.isRunCurrent(run) || !message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") return;
+    // Pi has applied message_end replacements and persisted the assistant by now.
+    // Deliver returned text even at the output limit. Tool commentary stays local,
+    // and transient errors still wait for Pi's retry outcome.
+    this.onMessageEnd(message);
+    if ((run.stopReason !== "stop" && run.stopReason !== "length") || ("content" in message && Array.isArray(message.content) && message.content.some(part => part?.type === "toolCall"))) return;
+    const text = run.text;
+    if (text.trim()) this.outbox.enqueue(signal => this.sendRunText(text, run, signal), Buffer.byteLength(text, "utf-8"));
+    run.replyQueued = true;
+    // Release first-turn topic preparation without marking the agent idle or
+    // dropping the run: queued user messages still belong to this agent run.
+    run.settle();
   }
 
   public async onAgentSettled(ctx: ExtensionContext): Promise<void> {
@@ -569,11 +588,11 @@ export class MuxRuntime {
     this.currentRun = null;
     if (!run) return;
     run.settle();
-    if (!this.isRunCurrent(run)) return;
+    if (!this.isRunCurrent(run) || run.replyQueued) return;
     const text = run.stopReason === "error" ? "⚠️ Task failed. Please check local Pi errors."
       : run.stopReason === "aborted" ? "⏹ Task aborted."
       : run.stopReason === "toolUse" || run.stopReason === "pending" ? "⚠️ Task did not produce a final response. Please check local Pi status."
-      : run.stopReason === "length" ? `⚠️ Response reached length limit.\n${run.text}` : run.text;
+      : run.text;
     if (text.trim()) this.outbox.enqueue(signal => this.sendRunText(text, run, signal), Buffer.byteLength(text, "utf-8"));
   }
 
