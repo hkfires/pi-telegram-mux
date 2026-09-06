@@ -6,7 +6,7 @@ import { MuxRuntime } from "../src/runtime.js";
 import { LeaderCoordinator } from "../src/coordinator.js";
 import { IpcError } from "../src/ipc.js";
 import { TelegramApiError, TelegramClient } from "../src/telegram.js";
-import { runtimeFixture } from "./helpers.js";
+import { runtimeFixture, testConfig } from "./helpers.js";
 
 type Fixture = Awaited<ReturnType<typeof runtimeFixture>>;
 
@@ -48,6 +48,29 @@ describe("forum topic lifecycle", () => {
       expect(replacement.runtime.hasActiveTransport()).toBe(true);
       expect(replacement.ui.notify).not.toHaveBeenCalled();
       expect(api.mock.calls.filter(([method]) => method === "reopenForumTopic")).toHaveLength(1);
+    });
+
+    describe.each(["queued", "sent", "acknowledged"])("navigation registration %s", timing => {
+      it.each(["new", "resume", "fork"] as const)("closes the outgoing topic on %s", async reason => {
+        const f = await runtimeFixture(dir, "outgoing", 50);
+        fixtures.push(f);
+        const api = vi.spyOn(TelegramClient.prototype, "callApi");
+        if (reason === "fork") f.runtime.onSessionBeforeFork(f.ctx);
+        else f.runtime.onSessionBeforeSwitch(f.ctx);
+        // Pi awaits before-event handlers, allowing the registration to be sent
+        // before shutdown without waiting for its IPC acknowledgement.
+        if (timing === "sent") await Promise.resolve();
+        if (timing === "acknowledged") await f.runtime.outbox.whenIdle();
+        const closing = f.runtime.onSessionShutdown({ reason }, f.ctx);
+        await expect(f.runtime.handleInboundText("late input", f.ctx)).resolves.toMatchObject({ accepted: false, busy: true });
+        await closing;
+        expect(api.mock.calls.filter(([method]) => method === "closeForumTopic")).toEqual([
+          ["closeForumTopic", { chat_id: testConfig.chatId, message_thread_id: 50 }, undefined, expect.any(AbortSignal)],
+        ]);
+        expect(f.runtime.hasActiveTransport()).toBe(false);
+        expect(f.runtime.outbox.error).toBeNull();
+        expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+      });
     });
 
     it.each([
@@ -193,6 +216,33 @@ describe("forum topic lifecycle", () => {
     expect(observedSignal?.aborted).toBe(true);
     await operation;
     vi.useRealTimers();
+  });
+
+  it.each(["rejected", "timeout"])("releases a follower without closing when its final registration fails (%s)", async outcome => {
+    fixtures.push(await runtimeFixture(dir, "host", 10));
+    const f = await runtimeFixture(dir, "outgoing", 50);
+    fixtures.push(f);
+    const api = vi.spyOn(TelegramClient.prototype, "callApi");
+    let signal: AbortSignal | undefined;
+    vi.spyOn((f.runtime as any).followerClient, "register").mockImplementation((_registration, requestedSignal) => {
+      signal = requestedSignal as AbortSignal;
+      if (outcome === "rejected") return Promise.reject(new Error("Topic already claimed by another Runtime"));
+      return new Promise((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const closing = f.runtime.onSessionShutdown({ reason: "new" }, f.ctx);
+    if (outcome === "timeout") {
+      await vi.advanceTimersByTimeAsync(2999);
+      expect(signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(signal?.aborted).toBe(true);
+    }
+    await closing;
+    vi.useRealTimers();
+    expect(api.mock.calls.filter(([method]) => method === "closeForumTopic")).toHaveLength(0);
+    expect(f.runtime.hasActiveTransport()).toBe(false);
+    const coordinator = (fixtures[0].runtime as any).coordinator as LeaderCoordinator;
+    await vi.waitFor(() => expect(coordinator.getRoutes().has(50)).toBe(false));
   });
 
   it("does not reopen or close a topic when a follower wins the initial route claim", async () => {

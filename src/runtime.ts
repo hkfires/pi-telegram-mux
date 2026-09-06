@@ -655,7 +655,14 @@ export class MuxRuntime {
         try {
           const params = { chat_id: config.chatId, message_thread_id: target.threadId };
           if (coordinator) await coordinator.callTelegram("closeForumTopic", params, this.runtimeId, target, undefined, controller.signal);
-          else if (follower) await follower.callTelegram("closeForumTopic", params, target, undefined, controller.signal);
+          else if (follower) {
+            // Cancelling an earlier registration cannot undo a claim already
+            // accepted by the Leader. Confirm a newer generation on the same
+            // socket before closing, within the shared shutdown deadline.
+            const closingTarget = { ...target, generation: this.generation };
+            await follower.register({ runtimeId: this.runtimeId, ...closingTarget }, controller.signal);
+            await follower.callTelegram("closeForumTopic", params, closingTarget, undefined, controller.signal);
+          }
         } finally { clearTimeout(timer); }
       } catch {
         // Topic closure is best-effort on shutdown; do not block shutdown if Telegram is unreachable
