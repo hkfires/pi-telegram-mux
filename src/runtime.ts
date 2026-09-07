@@ -175,9 +175,14 @@ export class MuxRuntime {
     const notice = failure ? formatTransportNotice(failure) : "";
     if (notice && notice !== this.lastTransportError) ctx.ui.notify(notice, status?.polling === "retrying" ? "warning" : "error");
     this.lastTransportError = notice;
+    // Reuse the reconnecting label for polling retries, not the runtime admission
+    // gate. Real delivery/connection failures still take priority over polling retries.
+    const pollingRetry = status?.polling === "retrying";
+    const hasError = Boolean(this.outbox.error || this.connectionError || status?.feedbackError || (!pollingRetry && status?.error));
     const { text, color } = getTgStatusText({
-      config: this.config, isReconnecting: this.getIsReconnecting(),
-      isConflict: status?.polling === "conflict", hasError: Boolean(this.outbox.error || failure || this.connectionError), hasActiveTransport: this.hasActiveTransport(),
+      config: this.config, isReconnecting: this.getIsReconnecting() || (pollingRetry && !hasError),
+      isConflict: status?.polling === "conflict", hasError,
+      hasActiveTransport: this.hasActiveTransport(),
       bindingState: this.bindingState, threadId: this.currentThreadId, shortId: sessionId?.slice(-6),
     });
     ctx.ui.setStatus(TG_STATUS_KEY, formatStatus(text, color, ctx.ui.theme));

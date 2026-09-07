@@ -534,7 +534,7 @@ export class LeaderCoordinator {
         return await send();
       } catch (error) {
         // Retry only a single, definitively rejected request, never the settings action or
-        // a whole multi-request job. Ambiguous network/timeout failures still fail closed.
+        // a whole multi-request job. The job boundary reports ambiguous failures without replay.
         if (!(error instanceof RateLimitError)) throw error;
         await delay(Math.max(1, error.retryAfter ?? 1) * 1000, undefined, { signal });
       }
@@ -594,6 +594,15 @@ export class LeaderCoordinator {
         }
       } catch (error) {
         this.menus.delete(token);
+        // Feedback jobs are independent. An uncertain reply/update ends only this
+        // job, not the bot-wide queue; never retry it or the already executed action.
+        if (isRecoverableTelegramError(error)) {
+          if (!signal.aborted && this.running && !this.reloading && this.client === client) this.publishStatus({ ...this.status, interactionError: {
+            code: this.describeError(error).code,
+            message: `Telegram command feedback for topic ${route.threadId} could not be confirmed. It was not resent; later feedback can continue. Check Telegram and local Pi before repeating an action.`,
+          } });
+          return;
+        }
         // Menu creation or its one failure notice can also be rejected. Contain generic 400s
         // to this interaction, report them explicitly, and leave unrelated feedback operational.
         if ((menu !== undefined || messageId !== undefined) && error instanceof TelegramApiError && error.errorCode === 400) {

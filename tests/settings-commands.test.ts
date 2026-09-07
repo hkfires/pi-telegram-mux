@@ -699,6 +699,47 @@ describe("Telegram session settings commands", () => {
     expect(send).toHaveBeenCalledTimes(2);
   });
 
+  describe.each([
+    new TelegramRequestError("TELEGRAM_TIMEOUT", "Telegram request timed out"),
+    new TelegramRequestError("ECONNRESET", "SECRET_TEXT"),
+    new TelegramApiError("HTTP 503", 503),
+  ])("transient menu feedback failure (%s)", error => {
+    it.each(["sendMessage", "editMessageText"])("isolates %s without replaying a selection or retaining unknown menu buttons", async method => {
+      const send = vi.spyOn(TelegramClient.prototype, "sendMessage").mockResolvedValue({ message_id: 900 } as any);
+      if (method === "sendMessage") send.mockRejectedValueOnce(error);
+      const original = TelegramClient.prototype.callApi;
+      const call = vi.spyOn(TelegramClient.prototype, "callApi").mockImplementation(function (name, ...args) {
+        if (name === "editMessageText") return Promise.reject(error);
+        return original.call(this, name, ...args);
+      });
+      const f = await fixture();
+      const other = await fixture("other", 51);
+      const coordinator = coordinatorOf(f);
+      await coordinator.processUpdate(telegramUpdate(50, "/thinking"));
+      await coordinator.feedback.whenIdle();
+      const token = button(send.mock.calls[0][2]!.reply_markup!, "high");
+      await coordinator.processUpdate(click(token));
+      await coordinator.feedback.whenIdle();
+      expect(f.settings.setThinkingLevel).toHaveBeenCalledTimes(method === "editMessageText" ? 1 : 0);
+      expect(coordinator.feedback.error).toBeNull();
+      expect(coordinator.getStatus().feedbackError).toBeUndefined();
+      expect(coordinator.getStatus().interactionError?.code).toBe(error.code);
+      expect((coordinator as any).menus.size).toBe(0);
+      await vi.waitFor(() => expect(other.ui.notify).toHaveBeenCalledWith(expect.stringContaining(error.code), "warning"));
+      expect(JSON.stringify([coordinator.getStatus(), f.ui.notify.mock.calls, other.ui.notify.mock.calls])).not.toContain("SECRET_TEXT");
+      // Even if Telegram accepted an unconfirmed menu, its buttons cannot execute.
+      await coordinator.processUpdate(click(token));
+      await coordinator.feedback.whenIdle();
+      expect(f.settings.setThinkingLevel).toHaveBeenCalledTimes(method === "editMessageText" ? 1 : 0);
+      expect(call.mock.calls.filter(([name]) => name === "editMessageText")).toHaveLength(method === "editMessageText" ? 1 : 0);
+      expect(send).toHaveBeenCalledTimes(1);
+      await coordinator.processUpdate(telegramUpdate(51, "/status", 3));
+      await coordinator.feedback.whenIdle();
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls[1][2]).toEqual({ message_thread_id: 51 });
+    });
+  });
+
   it.each([new TelegramApiError("Unauthorized", 401), new TelegramDecodeError("Malformed JSON")])("does not hide transport/authentication/decoding failures at the menu boundary (%s)", async error => {
     const send = vi.spyOn(TelegramClient.prototype, "sendMessage").mockResolvedValue({ message_id: 900 } as any);
     const original = TelegramClient.prototype.callApi;
