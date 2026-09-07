@@ -1,6 +1,6 @@
 {
   "name": "pi-telegram-mux",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Telegram Forum Supergroup multiplexer extension for pi-coding-agent",
   "type": "module",
   "main": "dist/index.js",
