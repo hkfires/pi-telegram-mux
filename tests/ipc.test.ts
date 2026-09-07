@@ -72,6 +72,12 @@ describe("IPC protocol regressions", () => {
     await registered.callTelegram("closeForumTopic", { chat_id: testConfig.chatId, message_thread_id: 50 }, target);
     expect(api).toHaveBeenCalledWith("closeForumTopic", { chat_id: testConfig.chatId, message_thread_id: 50 }, undefined, expect.any(AbortSignal));
     api.mockClear();
+
+    await expect(registered.callTelegram("setMessageReaction", { chat_id: testConfig.chatId, message_id: 0 })).rejects.toThrow("Invalid message_id");
+    await expect(registered.callTelegram("setMessageReaction", { chat_id: testConfig.chatId, message_id: 123 })).rejects.toThrow("fenced");
+    await registered.callTelegram("setMessageReaction", { chat_id: testConfig.chatId, message_id: 123, reaction: [{ type: "emoji", emoji: "⚡" }] }, target);
+    expect(api).toHaveBeenCalledWith("setMessageReaction", { chat_id: testConfig.chatId, message_id: 123, reaction: [{ type: "emoji", emoji: "⚡" }] }, undefined, expect.any(AbortSignal), { ignoreRateLimit: true });
+    api.mockClear();
   });
 
   it.each(["closeForumTopic", "reopenForumTopic"])("fences ownership, session and generation for %s", async method => {

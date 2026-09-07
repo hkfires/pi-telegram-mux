@@ -735,5 +735,191 @@ describe("runtime module", () => {
       expect(runtime.getCurrentThreadId()).toBeNull();
       expect(spyCall).not.toHaveBeenCalled();
     });
+
+    it("updates reaction from 👀 to 💯 on completion for Telegram inbound message", async () => {
+      const mockPi = {
+        appendEntry: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any;
+
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: {
+            version: 1,
+            sessionId: "sess-reaction-inbound",
+            chatId: mockConfig.chatId,
+            threadId: 777,
+          },
+        },
+      ];
+
+      const mockCtx = {
+        mode: "tui",
+        isIdle: () => true,
+        sessionManager: {
+          getSessionId: () => "sess-reaction-inbound",
+          getEntries: () => entries,
+          getSessionFile: () => "/tmp/sess.jsonl",
+        },
+      } as any;
+
+      await runtime.onSessionStart(mockCtx);
+
+      const reactions: Array<{ messageId: number; emoji: string }> = [];
+      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
+        if (method === "setMessageReaction") {
+          reactions.push({ messageId: params.message_id, emoji: params.reaction?.[0]?.emoji });
+        }
+        return { message_id: 100 } as any;
+      });
+
+      mockPi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      });
+
+      const admission = runtime.handleInboundText("Do a calculation", mockCtx, 999);
+      expect((await admission).accepted).toBe(true);
+      await runtime.outbox.whenIdle();
+
+      // Initial reaction should be 👀 on inbound message 999
+      expect(reactions).toEqual([{ messageId: 999, emoji: "👀" }]);
+
+      // Complete agent run
+      runtime.onMessageEnd({ role: "assistant", content: "Result is 42", stopReason: "stop" });
+      await runtime.onAgentSettled(mockCtx);
+      await runtime.outbox.whenIdle();
+
+      // Final reaction should transition to 💯
+      expect(reactions).toEqual([
+        { messageId: 999, emoji: "👀" },
+        { messageId: 999, emoji: "💯" },
+      ]);
+    });
+
+    it("updates reaction to 😱 on error and 😭 on abort for inbound message", async () => {
+      const mockPi = {
+        appendEntry: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any;
+
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: {
+            version: 1,
+            sessionId: "sess-reaction-error",
+            chatId: mockConfig.chatId,
+            threadId: 777,
+          },
+        },
+      ];
+
+      const mockCtx = {
+        mode: "tui",
+        isIdle: () => true,
+        sessionManager: {
+          getSessionId: () => "sess-reaction-error",
+          getEntries: () => entries,
+          getSessionFile: () => "/tmp/sess.jsonl",
+        },
+      } as any;
+
+      await runtime.onSessionStart(mockCtx);
+
+      const reactions: Array<{ messageId: number; emoji: string }> = [];
+      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
+        if (method === "setMessageReaction") {
+          reactions.push({ messageId: params.message_id, emoji: params.reaction?.[0]?.emoji });
+        }
+        return { message_id: 100 } as any;
+      });
+
+      mockPi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      });
+
+      await runtime.handleInboundText("Fail task", mockCtx, 888);
+      await runtime.outbox.whenIdle();
+
+      runtime.onMessageEnd({ role: "assistant", content: "", stopReason: "error" });
+      await runtime.onAgentSettled(mockCtx);
+      await runtime.outbox.whenIdle();
+
+      expect(reactions).toEqual([
+        { messageId: 888, emoji: "👀" },
+        { messageId: 888, emoji: "😱" },
+      ]);
+    });
+
+    it("sets 👀 and 💯 reactions on mirrored local prompt", async () => {
+      const mockPi = {
+        appendEntry: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any;
+
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: {
+            version: 1,
+            sessionId: "sess-local-prompt",
+            chatId: mockConfig.chatId,
+            threadId: 777,
+          },
+        },
+      ];
+
+      const mockCtx = {
+        mode: "tui",
+        isIdle: () => true,
+        sessionManager: {
+          getSessionId: () => "sess-local-prompt",
+          getEntries: () => entries,
+          getSessionFile: () => "/tmp/sess.jsonl",
+        },
+      } as any;
+
+      await runtime.onSessionStart(mockCtx);
+
+      const reactions: Array<{ messageId: number; emoji: string }> = [];
+      let sentCount = 0;
+      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
+        if (method === "sendMessage") {
+          sentCount++;
+          // First send is prompt mirror, assign message_id 501
+          return { message_id: 500 + sentCount } as any;
+        }
+        if (method === "setMessageReaction") {
+          reactions.push({ messageId: params.message_id, emoji: params.reaction?.[0]?.emoji });
+        }
+        return true as any;
+      });
+
+      // Local terminal prompt
+      await runtime.onBeforeAgentStart(mockCtx);
+      runtime.onMessageStart({ role: "user", content: "Run tests locally" }, mockCtx);
+      await runtime.outbox.whenIdle();
+
+      // Mirrored prompt was sent (msg 501), reaction 👀 applied to msg 501
+      expect(reactions).toEqual([{ messageId: 501, emoji: "👀" }]);
+
+      // Complete agent run
+      runtime.onMessageEnd({ role: "assistant", content: "All tests pass", stopReason: "stop" });
+      await runtime.onAgentSettled(mockCtx);
+      await runtime.outbox.whenIdle();
+
+      // Final reaction should be 💯 on msg 501
+      expect(reactions).toEqual([
+        { messageId: 501, emoji: "👀" },
+        { messageId: 501, emoji: "💯" },
+      ]);
+    });
   });
 });

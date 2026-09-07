@@ -9,7 +9,7 @@ import { IpcError, IpcFollowerClient } from "./ipc.js";
 import { BoundedOutbox } from "./outbox.js";
 import { extractAssistantText, extractUserText, renderTelegramMarkdown, splitTelegramMessage } from "./render.js";
 import { TelegramClient, validateBotAndChat } from "./telegram.js";
-import type { BindingState, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic } from "./types.js";
+import type { BindingState, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic, TelegramMessage } from "./types.js";
 
 const MAX_MIRRORED_TEXT_LENGTH = 65_536;
 const TOPIC_MISSING_NOTICE = "Telegram topic is no longer available. A new topic will be created when you send your next prompt in Pi.";
@@ -74,6 +74,7 @@ interface Admission {
   generation: number;
   config: MuxConfig | null;
   consumed: boolean;
+  messageId?: number;
   resolve?: (result: InboundResult) => void;
   timer: NodeJS.Timeout;
 }
@@ -85,6 +86,7 @@ interface MirrorRun {
   ctx: ExtensionContext;
   target: OutputTarget | null;
   origin?: Admission;
+  promptMessageIds: number[];
   suppressed: boolean;
   firstUserMessage: boolean;
   text: string;
@@ -121,6 +123,7 @@ export class MuxRuntime {
   private createInFlight = false;
   private readonly unknownCreates = new Set<string>();
   private currentRun: MirrorRun | null = null;
+  private cleanupTask: Promise<void> | null = null;
   private pendingInput?: Admission;
   private readonly inputOrigin = new AsyncLocalStorage<Admission>();
   public readonly outbox: BoundedOutbox;
@@ -215,7 +218,7 @@ export class MuxRuntime {
             client.setStatusHandler(() => { if (this.active && version === this.transportVersion) this.updateStatusBar(ctx); });
             client.setInboundHandler(msg => {
               if (!this.isTargetCurrent(msg.target, ctx) || msg.fromId !== this.config?.allowedUserId) return Promise.resolve({ accepted: false, busy: true });
-              return this.handleInboundText(msg.text, ctx);
+              return this.handleInboundText(msg.text, ctx, msg.messageId);
             });
             client.setAbortHandler(target => {
               if (!this.isTargetCurrent(target, ctx) || !ctx.abort) return false;
@@ -330,7 +333,7 @@ export class MuxRuntime {
       const target: OutputTarget = { sessionId, threadId, generation: this.generation };
       const ok = this.coordinator.registerLocalRoute({
         ...target, runtimeId: this.runtimeId,
-        dispatchInbound: text => this.isTargetCurrent(target, ctx) ? this.handleInboundText(text, ctx) : Promise.resolve({ accepted: false, busy: true }),
+        dispatchInbound: (text, messageId) => this.isTargetCurrent(target, ctx) ? this.handleInboundText(text, ctx, messageId) : Promise.resolve({ accepted: false, busy: true }),
         abortRun: () => { if (!this.isTargetCurrent(target, ctx) || !ctx.abort) return false; ctx.abort(); return true; },
       });
       if (!ok) ctx.ui?.notify("This topic is already occupied by another Pi instance. Please close duplicate sessions before reconnecting.", "warning");
@@ -368,7 +371,7 @@ export class MuxRuntime {
     throw new Error("No active transport to Telegram Leader");
   }
 
-  public handleInboundText(text: string, ctx: ExtensionContext): Promise<InboundResult> {
+  public handleInboundText(text: string, ctx: ExtensionContext, messageId?: number): Promise<InboundResult> {
     if (!this.active || this.configuring || this.getIsReconnecting() || this.bindingState !== "bound" || !this.getIsIdle() || !ctx.isIdle()) return Promise.resolve({ accepted: false, busy: true });
     if (this.outbox.error) return Promise.resolve({ accepted: false, busy: false, statusReply: "Telegram sync is paused. Please check errors on your computer and run /tg-connect to retry." });
     if (!text.trim() || text.length > 4096) return Promise.resolve({ accepted: false, busy: true });
@@ -379,7 +382,7 @@ export class MuxRuntime {
         // reservation until a real admission event, even after reporting uncertainty.
         this.finishInput({ accepted: false, busy: false, statusReply: "Task admission result unknown. Mobile input has been paused; please check local session and do not resend automatically. If unconfirmed, restart this Pi instance." }, false);
       }, 2000);
-      const admission: Admission = { sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, consumed: false, resolve, timer };
+      const admission: Admission = { sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, consumed: false, messageId, resolve, timer };
       this.pendingInput = admission;
       // Async context survives Pi's awaited input transformations. Neither origin
       // nor authority is inferred from mutable prompt text or a global pending slot.
@@ -423,7 +426,13 @@ export class MuxRuntime {
       // Actual user-message admission also covers steering/follow-up messages,
       // which Pi delivers without another before_agent_start event.
       const prompt = `🧑‍💻 [Prompt]\n${text.length <= MAX_MIRRORED_TEXT_LENGTH ? text : "Prompt is too long. Please view it locally in Pi; task results will still be synced."}`;
-      this.outbox.enqueue(signal => this.sendRunText(prompt, run, signal), Buffer.byteLength(prompt, "utf-8"));
+      this.outbox.enqueue(async signal => {
+        const sent = await this.sendRunText(prompt, run, signal);
+        if (sent && typeof sent.message_id === "number" && run.target && !signal.aborted) {
+          run.promptMessageIds.push(sent.message_id);
+          await this.setReaction(run.target, sent.message_id, "👀", signal);
+        }
+      }, Buffer.byteLength(prompt, "utf-8"));
     }
   }
 
@@ -502,13 +511,29 @@ export class MuxRuntime {
     const ctx = maybeCtx ?? eventOrCtx as ExtensionContext;
     this.activeCtx = ctx;
     this.isIdle = false;
+    const oldRun = this.currentRun;
+    if (oldRun && !oldRun.replyQueued && oldRun.promptMessageIds.length > 0 && oldRun.target) {
+      const target = oldRun.target;
+      const ids = [...oldRun.promptMessageIds];
+      this.outbox.enqueue(async signal => {
+        if (!signal.aborted) {
+          for (const id of ids) {
+            await this.setReaction(target, id, "😭", signal);
+          }
+        }
+      });
+    }
     const origin = this.inputOrigin.getStore();
     let settle!: () => void;
     const settled = new Promise<void>(resolve => { settle = resolve; });
+    const promptMessageIds: number[] = [];
+    if (origin && !origin.consumed && typeof origin.messageId === "number") {
+      promptMessageIds.push(origin.messageId);
+    }
     // Runs admitted during recovery/configuration must never gain a target later.
     const run: MirrorRun = {
       sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, ctx,
-      target: null, origin: origin?.consumed ? undefined : origin,
+      target: null, origin: origin?.consumed ? undefined : origin, promptMessageIds,
       suppressed: this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.generation !== this.generation || origin.config !== this.config || origin.sessionId !== ctx.sessionManager.getSessionId())),
       firstUserMessage: true, text: "", settled, settle,
     };
@@ -544,6 +569,10 @@ export class MuxRuntime {
         run.target = { sessionId: run.sessionId, threadId: this.currentThreadId, generation: run.generation };
         if (!await this.registerRoute(ctx, signal)) throw new Error("Failed to register the Telegram topic; synchronization has stopped.");
       }
+      if (!this.isRunCurrent(run) || signal.aborted || !run.target) return;
+      for (const msgId of run.promptMessageIds) {
+        await this.setReaction(run.target, msgId, "👀", signal);
+      }
     });
   }
 
@@ -574,7 +603,7 @@ export class MuxRuntime {
     this.onMessageEnd(message);
     if ((run.stopReason !== "stop" && run.stopReason !== "length") || ("content" in message && Array.isArray(message.content) && message.content.some(part => part?.type === "toolCall"))) return;
     const text = run.text;
-    if (text.trim()) this.outbox.enqueue(signal => this.sendRunText(text, run, signal), Buffer.byteLength(text, "utf-8"));
+    if (text.trim()) this.outbox.enqueue(async signal => { await this.sendRunText(text, run, signal); }, Buffer.byteLength(text, "utf-8"));
     run.replyQueued = true;
     // Release first-turn topic preparation without marking the agent idle or
     // dropping the run: queued user messages still belong to this agent run.
@@ -588,17 +617,57 @@ export class MuxRuntime {
     this.currentRun = null;
     if (!run) return;
     run.settle();
-    if (!this.isRunCurrent(run) || run.replyQueued) return;
+    const emoji = run.stopReason === "error" ? "😱"
+      : run.stopReason === "aborted" ? "😭"
+      : "💯";
+    if (!this.isRunCurrent(run) || run.replyQueued) {
+      if (this.isRunCurrent(run)) {
+        this.outbox.enqueue(async signal => {
+          if (run.target && !signal.aborted) {
+            for (const msgId of run.promptMessageIds) {
+              await this.setReaction(run.target, msgId, emoji, signal);
+            }
+          }
+        });
+      }
+      return;
+    }
     const text = run.stopReason === "error" ? "⚠️ Task failed. Please check local Pi errors."
       : run.stopReason === "aborted" ? "⏹ Task aborted."
       : run.stopReason === "toolUse" || run.stopReason === "pending" ? "⚠️ Task did not produce a final response. Please check local Pi status."
       : run.text;
-    if (text.trim()) this.outbox.enqueue(signal => this.sendRunText(text, run, signal), Buffer.byteLength(text, "utf-8"));
+    if (text.trim()) this.outbox.enqueue(async signal => { await this.sendRunText(text, run, signal); }, Buffer.byteLength(text, "utf-8"));
+    this.outbox.enqueue(async signal => {
+      if (run.target && !signal.aborted) {
+        for (const msgId of run.promptMessageIds) {
+          await this.setReaction(run.target, msgId, emoji, signal);
+        }
+      }
+    });
   }
 
-  private async sendRunText(text: string, run: MirrorRun, signal: AbortSignal): Promise<void> {
-    if (!this.isRunCurrent(run) || signal.aborted || !run.target) return;
-    await this.sendText(text, run.target, run.ctx, signal);
+  private async setReaction(target: OutputTarget, messageId: number, emoji: string, signal?: AbortSignal): Promise<void> {
+    const config = this.config;
+    if (!config || !this.active || this.bindingState === "disconnected") return;
+    try {
+      await this.callTelegram(
+        "setMessageReaction",
+        {
+          chat_id: config.chatId,
+          message_id: messageId,
+          reaction: [{ type: "emoji", emoji }],
+        },
+        target,
+        signal
+      );
+    } catch {
+      // Best-effort reaction: ignore permissions, unsupported reactions, or rate limits.
+    }
+  }
+
+  private async sendRunText(text: string, run: MirrorRun, signal: AbortSignal): Promise<TelegramMessage | null> {
+    if (!this.isRunCurrent(run) || signal.aborted || !run.target) return null;
+    return this.sendText(text, run.target, run.ctx, signal);
   }
 
   private async waitForConfiguration(signal?: AbortSignal): Promise<void> {
@@ -651,13 +720,14 @@ export class MuxRuntime {
     }
   }
 
-  private async sendText(text: string, target: OutputTarget, ctx: ExtensionContext, signal: AbortSignal): Promise<void> {
+  private async sendText(text: string, target: OutputTarget, ctx: ExtensionContext, signal: AbortSignal): Promise<TelegramMessage | null> {
     const config = this.config;
-    if (!config) return;
+    if (!config) return null;
+    let firstMessage: TelegramMessage | null = null;
     for (const chunk of renderTelegramMarkdown(text)) {
       if (!chunk.text.trim()) continue;
       if (this.configurationTask) await this.waitForConfiguration(signal);
-      if (!this.isTargetCurrent(target, ctx) || signal.aborted) return;
+      if (!this.isTargetCurrent(target, ctx) || signal.aborted) return null;
       const params: Record<string, unknown> = {
         chat_id: config.chatId,
         message_thread_id: target.threadId,
@@ -667,8 +737,12 @@ export class MuxRuntime {
         params.entities = chunk.entities;
       }
       // Delivery failures propagate to the bounded outbox's visible failure boundary.
-      await this.callTelegram("sendMessage", params, target, signal);
+      const sent = await this.callTelegram<TelegramMessage>("sendMessage", params, target, signal);
+      if (!firstMessage && sent && typeof sent === "object" && typeof (sent as TelegramMessage).message_id === "number") {
+        firstMessage = sent;
+      }
     }
+    return firstMessage;
   }
 
   private invalidateRun(): void {
@@ -679,23 +753,61 @@ export class MuxRuntime {
     this.finishInput({ accepted: false, busy: false, statusReply: "Session changed; execution result unknown. Please check local status." }, false);
   }
 
-  public onSessionBeforeSwitch(ctx: ExtensionContext): void {
+  private cleanupRunReactions(): Promise<void> | null {
+    const run = this.currentRun;
+    const target = run?.target;
+    const config = this.config;
+    const coordinator = this.coordinator;
+    const follower = this.followerClient;
+    if (!run || !target || !config || !this.active || this.configuring || !run.promptMessageIds.length) return this.cleanupTask;
+    const messageIds = run.promptMessageIds.splice(0);
+    const previous = this.cleanupTask;
+    const task = (async () => {
+      if (previous) await previous;
+      // Retain the acknowledged route while ordinary output is synchronously fenced.
+      // All reactions share one deadline so cleanup cannot hold navigation or exit open.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      try {
+        for (const messageId of messageIds) {
+          if (controller.signal.aborted) break;
+          const params = { chat_id: config.chatId, message_id: messageId, reaction: [{ type: "emoji", emoji: "😭" }] };
+          try {
+            if (coordinator) await coordinator.callTelegram("setMessageReaction", params, this.runtimeId, target, undefined, controller.signal);
+            else if (follower) await follower.callTelegram("setMessageReaction", params, target, undefined, controller.signal);
+          } catch {
+            // Cleanup is best-effort; a failed reaction must not block route release.
+          }
+        }
+      } finally { clearTimeout(timer); }
+    })().finally(() => { if (this.cleanupTask === task) this.cleanupTask = null; });
+    this.cleanupTask = task;
+    return task;
+  }
+
+  public onSessionBeforeSwitch(ctx: ExtensionContext): Promise<void> {
+    const cleanup = this.cleanupRunReactions();
     this.invalidateRun();
     // before_* can be cancelled by another extension; release ownership at shutdown.
     // Only enabled integration needs registration; configured transport failures remain errors.
     if (this.active && this.config) this.outbox.enqueue(async signal => {
+      if (cleanup) await cleanup;
       if (!signal.aborted && !await this.registerRoute(ctx, signal)) throw new Error("Failed to update Telegram navigation route.");
     });
     this.clearStatusBar(ctx);
+    return cleanup ?? Promise.resolve();
   }
 
-  public onSessionBeforeFork(ctx: ExtensionContext): void { this.onSessionBeforeSwitch(ctx); }
-  public onSessionBeforeTree(): void {
+  public onSessionBeforeFork(ctx: ExtensionContext): Promise<void> { return this.onSessionBeforeSwitch(ctx); }
+  public onSessionBeforeTree(): Promise<void> {
+    const cleanup = this.cleanupRunReactions();
     this.invalidateRun();
     const ctx = this.activeCtx;
     if (ctx && this.active && this.config) this.outbox.enqueue(async signal => {
+      if (cleanup) await cleanup;
       if (!signal.aborted && !await this.registerRoute(ctx, signal)) throw new Error("Failed to update Telegram navigation route.");
     });
+    return cleanup ?? Promise.resolve();
   }
 
   public async onSessionShutdown(eventOrCtx: { reason?: string } | ExtensionContext, maybeCtx?: ExtensionContext): Promise<void> {
@@ -710,9 +822,11 @@ export class MuxRuntime {
     const shouldClose = event?.reason !== "reload" && this.active && !this.configuring && !this.getIsReconnecting() && !hasError &&
       config?.autoCloseTopics === true && target && this.bindingState === "bound" && target.threadId === this.currentThreadId &&
       target.sessionId === ctx.sessionManager.getSessionId() && this.hasActiveTransport();
+    const cleanup = this.cleanupRunReactions();
     // Fence inputs and cancel queued output synchronously, retaining the last acknowledged route only for closure.
     this.active = false;
     this.invalidateRun();
+    if (cleanup) await cleanup;
     if (shouldClose) {
       try {
         const controller = new AbortController();
@@ -815,6 +929,7 @@ export class MuxRuntime {
 
   public handleTgDisconnect(ctx: ExtensionContext): void {
     if (!this.active || ctx.mode !== "tui" || !this.config || this.configuring || this.recovering) return;
+    if (this.bindingState === "disconnected") return;
     if (!appendBindingEntry(this.pi, ctx, this.config.chatId, null)) { ctx.ui?.notify("Failed to write disconnect record.", "error"); return; }
     this.invalidateRun();
     this.unregisterRoute(ctx);

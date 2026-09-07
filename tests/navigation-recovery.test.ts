@@ -20,6 +20,78 @@ describe("navigation registration and outbox recovery status", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  describe.each(["leader", "follower"])("reaction cleanup for %s", role => {
+    it.each(["disconnect", "disconnect-twice", "switch", "fork", "tree", "shutdown", "shutdown-timeout"])("handles reactions and route ownership on %s", async action => {
+      const originalFetch = globalThis.fetch;
+      const completed: number[] = [];
+      let messageId = 0;
+      let reactions = 0;
+      let aborted = 0;
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/sendMessage")) {
+          return new Response(JSON.stringify({ ok: true, result: { message_id: ++messageId } }));
+        }
+        if (url.endsWith("/setMessageReaction")) {
+          reactions++;
+          const params = JSON.parse(String(init?.body));
+          if (params.reaction[0].emoji === "😭") {
+            await new Promise<void>((resolve, reject) => {
+              const timer = action === "shutdown-timeout" ? undefined : setTimeout(resolve, 20);
+              const abort = () => { clearTimeout(timer); aborted++; reject(new Error("Aborted")); };
+              if (init?.signal?.aborted) abort();
+              else init?.signal?.addEventListener("abort", abort, { once: true });
+            });
+            completed.push(params.message_id);
+          }
+          return new Response(JSON.stringify({ ok: true, result: true }));
+        }
+        return originalFetch(input, init);
+      });
+      if (role === "follower") fixtures.push(await runtimeFixture(dir, "host", 10));
+      const f = await runtimeFixture(dir, "outgoing", 50);
+      fixtures.push(f);
+      await f.runtime.onBeforeAgentStart(f.ctx);
+      for (const content of ["initial prompt", "steering prompt"]) {
+        f.runtime.onMessageStart({ role: "user", content }, f.ctx);
+        await f.runtime.outbox.whenIdle();
+      }
+      expect(messageId).toBe(2);
+      expect(reactions).toBe(2);
+
+      const generation = f.runtime.getGeneration();
+      const cleanup = action.startsWith("disconnect") ? f.runtime.handleTgDisconnect(f.ctx)
+        : action === "switch" ? f.runtime.onSessionBeforeSwitch(f.ctx)
+        : action === "fork" ? f.runtime.onSessionBeforeFork(f.ctx)
+        : action === "tree" ? f.runtime.onSessionBeforeTree()
+        : f.runtime.onSessionShutdown(f.ctx);
+      expect(f.runtime.getGeneration()).toBe(generation + 1);
+      await expect(f.runtime.handleInboundText("late input", f.ctx)).resolves.toMatchObject({ accepted: false, busy: true });
+      const repeated = action === "disconnect-twice" ? f.runtime.handleTgDisconnect(f.ctx) : undefined;
+      await Promise.all([cleanup, repeated]);
+      await f.runtime.outbox.whenIdle();
+
+      expect(completed).toEqual(action === "shutdown-timeout" || action.startsWith("disconnect") ? [] : [1, 2]);
+      // Follower cancellation reaches the Leader on the next socket event.
+      await vi.waitFor(() => expect(aborted).toBe(action === "shutdown-timeout" ? 1 : 0));
+      expect(f.runtime.outbox.error).toBeNull();
+      if (action.startsWith("shutdown")) expect(f.runtime.hasActiveTransport()).toBe(false);
+      else if (action.startsWith("disconnect")) {
+        expect(f.runtime.getBindingState()).toBe("disconnected");
+        expect(reactions).toBe(2);
+        if (action === "disconnect-twice") {
+          const replacement = await runtimeFixture(dir, "replacement", 50);
+          fixtures.push(replacement);
+          expect(await replacement.runtime.registerRoute(replacement.ctx)).toBe(true);
+        } else {
+          await f.runtime.handleTgConnect(f.ctx);
+          expect(f.runtime.getBindingState()).toBe("bound");
+          expect(reactions).toBe(2);
+        }
+      }
+    }, 10_000);
+  });
+
   it.each(navigationEvents)("does not enqueue %s registration for an unconfigured TUI session", async event => {
     const ui = { setStatus: vi.fn(), notify: vi.fn() };
     const ctx = {

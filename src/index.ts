@@ -96,15 +96,15 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_before_switch", async (_event, ctx) => {
-    runtime.onSessionBeforeSwitch(ctx);
+    await runtime.onSessionBeforeSwitch(ctx);
   });
 
   pi.on("session_before_fork", async (_event, ctx) => {
-    runtime.onSessionBeforeFork(ctx);
+    await runtime.onSessionBeforeFork(ctx);
   });
 
   pi.on("session_before_tree", async () => {
-    runtime.onSessionBeforeTree();
+    await runtime.onSessionBeforeTree();
   });
 
   pi.on("session_shutdown", async (event, ctx) => {

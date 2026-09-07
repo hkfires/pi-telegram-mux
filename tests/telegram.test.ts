@@ -308,4 +308,61 @@ describe("telegram client module", () => {
     expect(error.message).toBe("Telegram request timed out (getUpdates)");
     expect(error.message).not.toContain("This operation was aborted");
   });
+
+  it("calls setMessageReaction successfully", async () => {
+    const client = new TelegramClient({
+      botToken: mockToken,
+      apiBase: mockApiBase,
+    });
+
+    let receivedBody = "";
+    nextHandler = (req, res) => {
+      let body = "";
+      req.on("data", chunk => { body += chunk; });
+      req.on("end", () => {
+        receivedBody = body;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result: true }));
+      });
+    };
+
+    const result = await client.setMessageReaction(-100123, 42, [{ type: "emoji", emoji: "⚡" }]);
+    expect(result).toBe(true);
+    expect(JSON.parse(receivedBody)).toEqual({
+      chat_id: -100123,
+      message_id: 42,
+      reaction: [{ type: "emoji", emoji: "⚡" }],
+    });
+  });
+
+  it("does not set rate-limit pause when setMessageReaction receives 429", async () => {
+    const client = new TelegramClient({
+      botToken: mockToken,
+      apiBase: mockApiBase,
+    });
+
+    nextHandler = (_req, res) => {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ok: false,
+        error_code: 429,
+        description: "Too Many Requests: retry after 5",
+        parameters: { retry_after: 5 },
+      }));
+    };
+
+    const reactionResult = await client.setMessageReaction(-100123, 42, [{ type: "emoji", emoji: "👀" }]);
+    expect(reactionResult).toBe(false);
+    // Crucial: Rate limit must NOT be recorded for cosmetic reactions
+    expect(client.isRateLimited()).toBe(false);
+
+    // Follow-up normal API call should not be rate-limited
+    nextHandler = (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, result: { message_id: 999 } }));
+    };
+
+    const sendResult = await client.sendMessage(-100123, "Answer");
+    expect(sendResult).toMatchObject({ message_id: 999 });
+  });
 });

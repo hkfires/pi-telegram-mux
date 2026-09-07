@@ -120,9 +120,10 @@ export class TelegramClient {
     method: string,
     params?: Record<string, unknown>,
     timeoutMs?: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options?: { ignoreRateLimit?: boolean }
   ): Promise<T> {
-    if (this.isRateLimited()) {
+    if (this.isRateLimited() && !options?.ignoreRateLimit) {
       const waitSec = Math.ceil(this.getRemainingPauseMs() / 1000);
       throw new RateLimitError(waitSec);
     }
@@ -181,7 +182,9 @@ export class TelegramClient {
         // Telegram permits omitted response parameters; use a conservative 5s pause.
         const retryAfter = parsed.parameters?.retry_after ?? 5;
         if (!Number.isSafeInteger(retryAfter) || retryAfter <= 0) throw new TelegramDecodeError("Invalid Telegram retry_after");
-        this.recordRateLimit(retryAfter);
+        if (!options?.ignoreRateLimit) {
+          this.recordRateLimit(retryAfter);
+        }
         throw new RateLimitError(retryAfter);
       }
 
@@ -297,6 +300,27 @@ export class TelegramClient {
       params.message_thread_id = options.message_thread_id;
     }
     return this.callApi<TelegramMessage>("sendMessage", params, undefined, signal);
+  }
+
+  public async setMessageReaction(
+    chatId: number,
+    messageId: number,
+    reaction?: Array<{ type: "emoji"; emoji: string }>,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    if (this.isRateLimited()) {
+      return false;
+    }
+    const params: Record<string, unknown> = {
+      chat_id: chatId,
+      message_id: messageId,
+      reaction: reaction ?? [],
+    };
+    try {
+      return await this.callApi<boolean>("setMessageReaction", params, undefined, signal, { ignoreRateLimit: true });
+    } catch {
+      return false;
+    }
   }
 
   public async getUpdates(options?: {

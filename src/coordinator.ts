@@ -348,6 +348,16 @@ export class LeaderCoordinator {
           this.routeOwners.get(target.threadId) !== socket || params.message_thread_id !== target.threadId) {
         throw new Error("Forum topic target fenced");
       }
+    } else if (method === "setMessageReaction") {
+      if (!Number.isSafeInteger(params.message_id) || (params.message_id as number) <= 0) {
+        throw new Error("Invalid message_id for setMessageReaction");
+      }
+      const route = target ? this.routes.get(target.threadId) : undefined;
+      if (!target || !route || route.runtimeId !== runtimeId || route.sessionId !== target.sessionId || route.generation !== target.generation ||
+          this.routeOwners.get(target.threadId) !== socket) {
+        throw new Error("Output target fenced for setMessageReaction");
+      }
+      return this.client.callApi<T>(method, params, undefined, signal, { ignoreRateLimit: true });
     } else if (method !== "createForumTopic" || typeof params.name !== "string" || !params.name.trim() || params.name.length > 128) {
       throw new Error("Unsupported Telegram request");
     }
@@ -414,7 +424,7 @@ export class LeaderCoordinator {
         const stopped = route.abortRun ? (await route.abortRun()) !== false : false;
         reply = stopped ? "Abort signal sent." : "Could not confirm abort; please check local session.";
       } else {
-        const result = await route.dispatchInbound(text, update.update_id);
+        const result = await route.dispatchInbound(text, msg.message_id);
         reply = result.busy ? "Current session is busy. Please try again later." : result.statusReply;
       }
     } catch (error) {
