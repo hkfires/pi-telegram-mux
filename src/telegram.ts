@@ -3,6 +3,7 @@ import type {
   TelegramChat,
   TelegramChatMember,
   TelegramForumTopic,
+  TelegramInlineKeyboardMarkup,
   TelegramMessage,
   TelegramUpdate,
   TelegramUser,
@@ -289,7 +290,7 @@ export class TelegramClient {
   public async sendMessage(
     chatId: number,
     text: string,
-    options?: { message_thread_id?: number },
+    options?: { message_thread_id?: number; reply_markup?: TelegramInlineKeyboardMarkup },
     signal?: AbortSignal
   ): Promise<TelegramMessage> {
     const params: Record<string, unknown> = {
@@ -299,6 +300,7 @@ export class TelegramClient {
     if (options?.message_thread_id) {
       params.message_thread_id = options.message_thread_id;
     }
+    if (options?.reply_markup) params.reply_markup = options.reply_markup;
     return this.callApi<TelegramMessage>("sendMessage", params, undefined, signal);
   }
 
@@ -350,6 +352,15 @@ export class TelegramClient {
           (update.message.text !== undefined && typeof update.message.text !== "string"))))) {
       throw new TelegramDecodeError("Invalid Telegram getUpdates result");
     }
+    if (updates.some(update => update.callback_query !== undefined && (
+      !update.callback_query || typeof update.callback_query.id !== "string" || !update.callback_query.id || update.callback_query.id.length > 256 ||
+      !Number.isSafeInteger(update.callback_query.from?.id) || typeof update.callback_query.from.is_bot !== "boolean" ||
+      (update.callback_query.data !== undefined && (typeof update.callback_query.data !== "string" || Buffer.byteLength(update.callback_query.data, "utf-8") > 64)) ||
+      (update.callback_query.message !== undefined && (!update.callback_query.message ||
+        !Number.isSafeInteger(update.callback_query.message.chat?.id) || !Number.isSafeInteger(update.callback_query.message.message_id) ||
+        !Number.isSafeInteger(update.callback_query.message.date) ||
+        (update.callback_query.message.message_thread_id !== undefined && !Number.isSafeInteger(update.callback_query.message.message_thread_id))))
+    ))) throw new TelegramDecodeError("Invalid Telegram callback query");
     return updates;
   }
 }

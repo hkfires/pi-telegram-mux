@@ -11,7 +11,7 @@ beforeEach(() => {
     if (url.hostname === "api.telegram.org" && url.pathname.endsWith("/getMe")) {
       return Promise.resolve(new Response(JSON.stringify({ ok: true, result: { id: 1, is_bot: true, first_name: "Fixture", username: "fixture_bot" } })));
     }
-    if (url.hostname === "api.telegram.org" && (url.pathname.endsWith("/closeForumTopic") || url.pathname.endsWith("/reopenForumTopic"))) {
+    if (url.hostname === "api.telegram.org" && (url.pathname.endsWith("/closeForumTopic") || url.pathname.endsWith("/reopenForumTopic") || url.pathname.endsWith("/setMyCommands") || url.pathname.endsWith("/answerCallbackQuery") || url.pathname.endsWith("/editMessageText"))) {
       return Promise.resolve(new Response(JSON.stringify({ ok: true, result: true })));
     }
     if (url.hostname === "api.telegram.org" && url.pathname.endsWith("/getUpdates")) {

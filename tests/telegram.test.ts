@@ -79,6 +79,41 @@ describe("telegram client module", () => {
     expect(me.username).toBe("test_bot");
   });
 
+  it("serializes an inline keyboard with the target topic", async () => {
+    const client = new TelegramClient({ botToken: mockToken, apiBase: mockApiBase });
+    let body: any;
+    nextHandler = (req, res) => {
+      let text = "";
+      req.on("data", chunk => { text += chunk; });
+      req.on("end", () => {
+        body = JSON.parse(text);
+        res.end(JSON.stringify({ ok: true, result: { message_id: 900 } }));
+      });
+    };
+    const reply_markup = { inline_keyboard: [[{ text: "high", callback_data: "mux:0123456789abcdef01234567:0" }]] };
+    await client.sendMessage(-100123, "Thinking", { message_thread_id: 50, reply_markup });
+    expect(body).toEqual({ chat_id: -100123, text: "Thinking", message_thread_id: 50, reply_markup });
+  });
+
+  it("decodes callback updates and rejects malformed callback payloads", async () => {
+    const client = new TelegramClient({ botToken: mockToken, apiBase: mockApiBase });
+    const valid = { id: "query", from: { id: 123, is_bot: false }, data: "mux:0123456789abcdef01234567:0", message: { message_id: 900, chat: { id: -100123 }, date: 1 } };
+    let query: unknown = valid;
+    nextHandler = (_req, res) => { res.end(JSON.stringify({ ok: true, result: [{ update_id: 1, callback_query: query }] })); };
+    expect((await client.getUpdates())[0].callback_query).toEqual(valid);
+    for (const bad of [null, {}, { ...valid, id: 3 }, { ...valid, from: null }, { ...valid, from: { id: 123 } },
+      { ...valid, data: "x".repeat(65) }, { ...valid, message: { ...valid.message, message_id: "900" } },
+      { ...valid, message: { ...valid.message, message_thread_id: "50" } }]) {
+      query = bad;
+      await expect(client.getUpdates()).rejects.toThrow(TelegramDecodeError);
+    }
+    // Telegram can send inaccessible messages and callbacks without a message; the coordinator rejects them safely.
+    query = { ...valid, message: { ...valid.message, date: 0 } };
+    await expect(client.getUpdates()).resolves.toHaveLength(1);
+    query = { ...valid, message: undefined };
+    await expect(client.getUpdates()).resolves.toHaveLength(1);
+  });
+
   it("handles 429 Too Many Requests and pauses", async () => {
     const client = new TelegramClient({
       botToken: mockToken,

@@ -91,13 +91,14 @@ If the original topic has been deleted, restoring the session displays a warning
 
 ### Telegram Commands
 
-| Action / Command | Purpose |
-| --- | --- |
-| Send text message | Submit a new task to the corresponding Pi session |
-| `/status` | View the status of the associated Pi session |
-| `/stop` | Abort the currently running task in that session |
+Send text in a topic to submit a task. These commands automatically appear in the authorized user's Telegram `/` menu—just select one:
 
-*Commands also support `/status@YourBotUsername` and `/stop@YourBotUsername`. When Pi is busy, please wait for the current turn to complete before submitting new tasks.*
+| Command | Purpose |
+| --- | --- |
+| `/model` | Choose a model using buttons, with pagination |
+| `/thinking` | Choose a thinking level using buttons |
+| `/status` | View session status |
+| `/stop` | Stop the current task |
 
 ### Pi Terminal Commands
 

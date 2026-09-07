@@ -95,16 +95,18 @@ export default function (pi: ExtensionAPI): void {
     await runtime.onAgentSettled(ctx);
   });
 
+  pi.on("input", (event, ctx) => runtime.onInput(ctx, event.source === "interactive" ? event.text : undefined));
+
   pi.on("session_before_switch", async (_event, ctx) => {
-    await runtime.onSessionBeforeSwitch(ctx);
+    return runtime.onSessionBeforeSwitch(ctx);
   });
 
   pi.on("session_before_fork", async (_event, ctx) => {
-    await runtime.onSessionBeforeFork(ctx);
+    return runtime.onSessionBeforeFork(ctx);
   });
 
   pi.on("session_before_tree", async () => {
-    await runtime.onSessionBeforeTree();
+    return runtime.onSessionBeforeTree();
   });
 
   pi.on("session_shutdown", async (event, ctx) => {

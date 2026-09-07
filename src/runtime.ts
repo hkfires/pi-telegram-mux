@@ -12,6 +12,13 @@ import { MarkdownWorker } from "./markdown-worker.js";
 import { TelegramClient, validateBotAndChat } from "./telegram.js";
 import type { BindingState, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic, TelegramMessage } from "./types.js";
 
+// Pi cannot cancel setModel(). Keep its safety barrier across extension reloads, but never
+// await it during shutdown: quitting the Pi process is the safe recovery for a hung provider.
+const modelChangesKey = Symbol.for("pi-telegram-mux.pending-model-changes.v1");
+const processState = globalThis as typeof globalThis & { [modelChangesKey]?: Map<string, Promise<boolean>> };
+const pendingModelChanges = processState[modelChangesKey] ??= new Map<string, Promise<boolean>>();
+const SETTINGS_PENDING_NOTICE = "A Telegram model change is still pending. Wait for it to finish, or quit and restart Pi if it is stuck. /reload cannot cancel it.";
+
 const MAX_MIRRORED_TEXT_LENGTH = 65_536;
 const TOPIC_MISSING_NOTICE = "Telegram topic is no longer available. A new topic will be created when you send your next prompt in Pi.";
 
@@ -118,6 +125,9 @@ export class MuxRuntime {
   private setupTask: Promise<void> | null = null;
   private reconnectTimer?: NodeJS.Timeout;
   private lastTransportError = "";
+  private lastCommandMenuError = "";
+  private lastInteractionError = "";
+  private settingsFailure?: string;
   private connectionError: Error | null = null;
   private configuring = false;
   private configurationTask: Promise<void> | null = null;
@@ -126,6 +136,7 @@ export class MuxRuntime {
   private currentRun: MirrorRun | null = null;
   private cleanupTask: Promise<void> | null = null;
   private pendingInput?: Admission;
+  private settingsCommandInFlight = false;
   private readonly inputOrigin = new AsyncLocalStorage<Admission>();
   public readonly outbox: BoundedOutbox;
   private readonly markdownWorker = new MarkdownWorker();
@@ -139,7 +150,11 @@ export class MuxRuntime {
 
   public getBindingState(): BindingState { return this.bindingState; }
   public getCurrentThreadId(): number | null { return this.currentThreadId; }
-  public getIsIdle(): boolean { return this.isIdle && !this.pendingInput; }
+  public getIsIdle(): boolean { return this.isIdle && !this.pendingInput && !this.settingsCommandInFlight && !this.hasPendingModelChange(); }
+
+  private hasPendingModelChange(ctx: ExtensionContext | null = this.activeCtx): boolean {
+    return Boolean(ctx && pendingModelChanges.has(JSON.stringify([this.agentDir, ctx.sessionManager.getSessionId()])));
+  }
   public getIsLeader(): boolean { return this.isLeader; }
   public getIsReconnecting(): boolean { return this.isReconnecting || this.recovering; }
   public getGeneration(): number { return this.generation; }
@@ -150,6 +165,12 @@ export class MuxRuntime {
     if (typeof ctx?.ui?.setStatus !== "function") return;
     const sessionId = ctx.sessionManager?.getSessionId?.();
     const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
+    const menuNotice = status?.commandMenuError ? formatTransportNotice(status.commandMenuError) : "";
+    if (menuNotice && menuNotice !== this.lastCommandMenuError) ctx.ui.notify(`Command menu unavailable; will retry automatically. ${menuNotice}`, "warning");
+    this.lastCommandMenuError = menuNotice;
+    const interactionNotice = status?.interactionError ? formatTransportNotice(status.interactionError) : "";
+    if (interactionNotice && interactionNotice !== this.lastInteractionError) ctx.ui.notify(interactionNotice, "warning");
+    this.lastInteractionError = interactionNotice;
     const failure = status?.error ?? status?.feedbackError;
     const notice = failure ? formatTransportNotice(failure) : "";
     if (notice && notice !== this.lastTransportError) ctx.ui.notify(notice, status?.polling === "retrying" ? "warning" : "error");
@@ -377,6 +398,18 @@ export class MuxRuntime {
     if (!this.active || this.configuring || this.getIsReconnecting() || this.bindingState !== "bound" || !this.getIsIdle() || !ctx.isIdle()) return Promise.resolve({ accepted: false, busy: true });
     if (this.outbox.error) return Promise.resolve({ accepted: false, busy: false, statusReply: "Telegram sync is paused. Please check errors on your computer and run /tg-connect to retry." });
     if (!text.trim() || text.length > 4096) return Promise.resolve({ accepted: false, busy: true });
+    const settingsCommand = /^\/(model|thinking)(?:@[a-z\d_]+)?(?:\s+([\s\S]*))?$/i.exec(text.trim());
+    if (settingsCommand) {
+      const reference = crypto.randomUUID();
+      const task = this.handleSettingsCommand(settingsCommand[1].toLowerCase(), settingsCommand[2]?.trim() ?? "", ctx, reference);
+      let timer: NodeJS.Timeout;
+      const deadline = new Promise<InboundResult>(resolve => {
+        timer = setTimeout(() => resolve({ accepted: false, busy: false, statusReply: `Settings update result unknown (reference ${reference}). Do not resend automatically. ${SETTINGS_PENDING_NOTICE}` }), 2000);
+      });
+      // A slow provider or model-select hook must not block the bot-wide poller.
+      // Keep the settings reservation until the actual operation settles, even on timeout.
+      return Promise.race([task, deadline]).finally(() => clearTimeout(timer));
+    }
     // Reserve admission synchronously. Pi's void return is not an execution ACK.
     return new Promise(resolve => {
       const timer = setTimeout(() => {
@@ -396,6 +429,114 @@ export class MuxRuntime {
         ctx.ui?.notify(`Telegram input failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     });
+  }
+
+  private reportSettingsFailure(code: string, reference: string, cause?: unknown): void {
+    // Provider messages, stacks and arbitrary codes may contain credentials. This boundary
+    // keeps a correlated failure and allowlisted OS error code without copying provider text.
+    const rawCode = cause instanceof Error && "code" in cause ? cause.code : undefined;
+    const causeCode = typeof rawCode === "string" &&
+      ["ETIMEDOUT", "ENOTFOUND", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ABORT_ERR"].includes(rawCode) ? rawCode : undefined;
+    const diagnostic = `${code} (reference ${reference})${causeCode ? ` [${causeCode}]` : ""}. Provider details are redacted; verify local model/authentication settings before retrying.`;
+    this.settingsFailure = diagnostic;
+    if (this.active && this.activeCtx) this.activeCtx.ui.notify(diagnostic, "error");
+    else console.error(`[pi-telegram-mux] ${diagnostic}`);
+  }
+
+  private async handleSettingsCommand(command: string, args: string, ctx: ExtensionContext, reference: string): Promise<InboundResult> {
+    // Settings commands have their own completion path: they do not start an agent turn.
+    this.settingsCommandInFlight = true;
+    const generation = this.generation;
+    const sessionId = ctx.sessionManager.getSessionId();
+    let reply: string;
+    let menu: InboundResult["menu"];
+    let accepted = true;
+    let failureCode = "PI_SETTINGS_QUERY_FAILED";
+    try {
+      if (command === "thinking") {
+        const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+        const level = levels.find(value => value === args.toLowerCase());
+        if (!args) {
+          reply = `Thinking: ${this.pi.getThinkingLevel()}\nSelect a thinking level below, or use /thinking <level>.\nPi adjusts unsupported levels to the current model's capabilities.`;
+        } else if (!level) {
+          accepted = false;
+          reply = `Invalid thinking level. Use: ${levels.join(", ")}.`;
+        } else {
+          failureCode = "PI_THINKING_CHANGE_FAILED";
+          this.pi.setThinkingLevel(level);
+          this.settingsFailure = undefined;
+          const actual = this.pi.getThinkingLevel();
+          reply = `Thinking: ${actual}${actual !== level ? ` (requested ${level}; adjusted to model capabilities)` : ""}`;
+        }
+        if (!level) {
+          const current = this.pi.getThinkingLevel();
+          menu = levels.map(value => [{ text: `${value === current ? "✓ " : ""}${value}`, command: `/thinking ${value}` }]);
+        }
+      } else {
+        const available = ctx.modelRegistry.getAvailable();
+        const scoped = ctx.scopedModels ?? [];
+        const models = available.filter(model => `${model.provider}/${model.id}`.length <= 4089 &&
+          (!scoped.length || scoped.some(entry => entry.model.provider === model.provider && entry.model.id === model.id)));
+        const pageMatch = /^page ([1-9]\d*)$/.exec(args);
+        if (!args || pageMatch) {
+          const page = pageMatch ? Number(pageMatch[1]) : 1;
+          const pages = Math.max(1, Math.ceil(models.length / 8));
+          if (!Number.isSafeInteger(page) || page > pages) {
+            accepted = false;
+            reply = `Invalid page. Use /model page 1 through /model page ${pages}.`;
+          } else {
+            const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
+            menu = models.slice((page - 1) * 8, page * 8).map(model => {
+              const id = `${model.provider}/${model.id}`;
+              return [{ text: `${id === current ? "✓ " : ""}${Array.from(id).slice(0, 60).join("")}${Array.from(id).length > 60 ? "…" : ""}`, command: `/model ${id}` }];
+            });
+            const navigation: NonNullable<InboundResult["menu"]>[number] = [];
+            if (page > 1) navigation.push({ text: "‹ Previous", command: `/model page ${page - 1}` });
+            if (page < pages) navigation.push({ text: "Next ›", command: `/model page ${page + 1}` });
+            if (navigation.length) menu.push(navigation);
+            reply = `Model: ${current}\nThinking: ${this.pi.getThinkingLevel()}\nAvailable models (${page}/${pages})\n${models.length ? "Select a model below to switch." : "No available models. Configure authentication locally in Pi."}`;
+          }
+        } else {
+          const model = models.find(model => `${model.provider}/${model.id}` === args);
+          if (!model) {
+            accepted = false;
+            reply = "Model unavailable or outside this session's model scope. Use /model and copy an exact provider/model_id.";
+          } else {
+            failureCode = "PI_MODEL_CHANGE_FAILED";
+            const key = JSON.stringify([this.agentDir, sessionId]);
+            const changing = this.pi.setModel(model);
+            pendingModelChanges.set(key, changing);
+            const clear = () => { if (pendingModelChanges.get(key) === changing) pendingModelChanges.delete(key); };
+            void changing.then(clear, clear);
+            if (!(await changing)) {
+              accepted = false;
+              this.reportSettingsFailure("PI_MODEL_AUTH_UNAVAILABLE", reference);
+              reply = `Model switch failed: authentication is not configured (reference ${reference}). Check local Pi settings.`;
+            } else {
+              this.settingsFailure = undefined;
+              reply = `Model: ${model.provider}/${model.id}\nThinking: ${this.pi.getThinkingLevel()}`;
+            }
+          }
+        }
+      }
+      if (!this.active || generation !== this.generation || sessionId !== ctx.sessionManager.getSessionId()) {
+        accepted = false;
+        reply = "Session changed during settings update. Result unknown; check local Pi settings.";
+        menu = undefined;
+      }
+    } catch (error) {
+      // Settings execution is an explicit boundary. Record failures even if the Telegram
+      // deadline already won, and translate them into a credential-safe error response.
+      this.reportSettingsFailure(failureCode, reference, error);
+      accepted = false;
+      reply = `Settings update failed or result unknown [${failureCode}; reference ${reference}]. Check local Pi settings before retrying.`;
+      menu = undefined;
+    } finally {
+      this.settingsCommandInFlight = false;
+    }
+    // Model identifiers are provider-controlled; keep feedback within Telegram's limit.
+    if (reply.length > 4000) reply = `${Array.from(reply).slice(0, 1900).join("")}\nList truncated; check the full model identifiers locally.`;
+    return { accepted, busy: false, statusReply: reply, ...(menu ? { menu } : {}) };
   }
 
   private finishInput(result: InboundResult, release = true): void {
@@ -444,6 +585,7 @@ export class MuxRuntime {
     if (ctx.mode !== "tui") return;
     this.active = true;
     this.activeCtx = ctx;
+    if (this.hasPendingModelChange(ctx)) ctx.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
     const version = this.transportVersion;
     const config = await loadConfig(this.agentDir);
     if (!this.active || version !== this.transportVersion) return;
@@ -789,7 +931,20 @@ export class MuxRuntime {
     return task;
   }
 
-  public onSessionBeforeSwitch(ctx: ExtensionContext): Promise<void> {
+  public onInput(ctx: ExtensionContext, interactiveText?: string): { action: "handled" } | undefined {
+    // This only fences settings already in progress. Pi exposes no terminal input-preflight
+    // event for downstream handled/failed inputs, so a full bidirectional lock needs SDK support.
+    if (!this.settingsCommandInFlight && !this.hasPendingModelChange(ctx)) return undefined;
+    if (interactiveText !== undefined) ctx.ui.setEditorText?.(interactiveText);
+    ctx.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
+    return { action: "handled" };
+  }
+
+  public onSessionBeforeSwitch(ctx: ExtensionContext): Promise<void | { cancel: true }> {
+    if (this.settingsCommandInFlight || this.hasPendingModelChange(ctx)) {
+      ctx.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
+      return Promise.resolve({ cancel: true });
+    }
     const cleanup = this.cleanupRunReactions();
     this.invalidateRun();
     // before_* can be cancelled by another extension; release ownership at shutdown.
@@ -802,8 +957,12 @@ export class MuxRuntime {
     return cleanup ?? Promise.resolve();
   }
 
-  public onSessionBeforeFork(ctx: ExtensionContext): Promise<void> { return this.onSessionBeforeSwitch(ctx); }
-  public onSessionBeforeTree(): Promise<void> {
+  public onSessionBeforeFork(ctx: ExtensionContext): Promise<void | { cancel: true }> { return this.onSessionBeforeSwitch(ctx); }
+  public onSessionBeforeTree(): Promise<void | { cancel: true }> {
+    if (this.settingsCommandInFlight || this.hasPendingModelChange()) {
+      this.activeCtx?.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
+      return Promise.resolve({ cancel: true });
+    }
     const cleanup = this.cleanupRunReactions();
     this.invalidateRun();
     const ctx = this.activeCtx;
@@ -830,6 +989,8 @@ export class MuxRuntime {
     // Fence inputs and cancel queued output synchronously, retaining the last acknowledged route only for closure.
     this.active = false;
     this.invalidateRun();
+    // Do not await an uncancellable provider/model-select hook here. The process-wide
+    // barrier fences input and session replacement after reload until it really settles.
     await this.markdownWorker.close();
     if (cleanup) await cleanup;
     if (shouldClose) {
@@ -861,7 +1022,7 @@ export class MuxRuntime {
     this.activeCtx = ctx;
     const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
     const failure = this.connectionError?.message ?? status?.error?.message ?? status?.feedbackError?.message ?? this.outbox.error?.message;
-    ctx.ui?.notify(`[Telegram Mux Status]\nConfig: ${this.config ? "configured" : "missing"}\nRole: ${this.isLeader ? "Leader" : this.followerClient ? "Follower" : "None"}\nSession ID: ${ctx.sessionManager.getSessionId()?.slice(-6)}\nBinding: ${this.bindingState}\nThread ID: ${this.currentThreadId ?? "none"}\nAuto-close topics: ${this.config?.autoCloseTopics ? "ON" : "OFF"}\nRuntime: ${this.getIsIdle() && ctx.isIdle() ? "idle" : "busy"}\nPolling: ${status?.polling ?? "offline"}\nPending sync: ${this.outbox.size}\nError: ${failure ?? "none"}`, "info");
+    ctx.ui?.notify(`[Telegram Mux Status]\nConfig: ${this.config ? "configured" : "missing"}\nRole: ${this.isLeader ? "Leader" : this.followerClient ? "Follower" : "None"}\nSession ID: ${ctx.sessionManager.getSessionId()?.slice(-6)}\nBinding: ${this.bindingState}\nThread ID: ${this.currentThreadId ?? "none"}\nAuto-close topics: ${this.config?.autoCloseTopics ? "ON" : "OFF"}\nRuntime: ${this.getIsIdle() && ctx.isIdle() ? "idle" : "busy"}\nPolling: ${status?.polling ?? "offline"}\nPending sync: ${this.outbox.size}\nError: ${failure ?? "none"}\nSettings error: ${this.settingsFailure ?? "none"}\nInteraction warning: ${status?.interactionError?.message ?? "none"}`, "info");
     this.updateStatusBar(ctx);
   }
 

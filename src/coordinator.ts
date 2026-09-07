@@ -4,13 +4,21 @@ import { setTimeout as delay } from "node:timers/promises";
 import { configFingerprint, loadConfig } from "./config.js";
 import { encodeFrame, FrameParser, tryAcquireLeaderLock } from "./ipc.js";
 import { BoundedOutbox } from "./outbox.js";
-import { ConflictError, isRecoverableTelegramError, RateLimitError, TelegramClient } from "./telegram.js";
+import { ConflictError, isRecoverableTelegramError, RateLimitError, TelegramApiError, TelegramClient } from "./telegram.js";
 import { IPC_PROTOCOL_VERSION, type InboundResult, type IpcMessage, type MuxConfig, type OutputTarget, type RuntimeRegistration, type TelegramUpdate, type TransportStatus } from "./types.js";
 
 export interface RouteEntry extends OutputTarget {
   runtimeId: string;
   dispatchInbound: (text: string, messageId: number) => Promise<InboundResult>;
   abortRun?: () => boolean | void | Promise<boolean | void>;
+}
+
+interface SettingsMenu {
+  route: RouteEntry;
+  generation: number;
+  expiresAt: number;
+  messageId?: number;
+  commands: string[];
 }
 
 interface FollowerConnection {
@@ -47,6 +55,8 @@ export class LeaderCoordinator {
   private reloading: Promise<void> | null = null;
   private readonly routes = new Map<number, RouteEntry>();
   private readonly routeOwners = new Map<number, net.Socket>();
+  private readonly menus = new Map<string, SettingsMenu>();
+  private callbackAnswersInFlight = 0;
   private readonly connections = new Map<net.Socket, FollowerConnection>();
   private readonly pending = new Map<string, { socket: net.Socket; resolve: (value: InboundResult | boolean) => void; timer: NodeJS.Timeout; kind: "inbound" | "abort" }>();
 
@@ -210,6 +220,7 @@ export class LeaderCoordinator {
           accepted: msg.accepted === true,
           busy: msg.busy === true,
           statusReply: typeof msg.statusReply === "string" ? msg.statusReply.slice(0, 4096) : undefined,
+          menu: msg.menu,
         });
       }
       return;
@@ -377,6 +388,8 @@ export class LeaderCoordinator {
   }
 
   private async poll(signal: AbortSignal): Promise<void> {
+    let menuRegistered = false;
+    let nextMenuAttempt = 0;
     while (this.running && !signal.aborted) {
       try {
         if (this.client.isRateLimited()) {
@@ -384,7 +397,28 @@ export class LeaderCoordinator {
           continue;
         }
         if (!this.botUsername) this.botUsername = (await this.client.getMe(signal)).username!.toLowerCase();
-        const updates = await this.client.getUpdates({ offset: this.offset, limit: 100, timeout: 25, allowed_updates: ["message"], signal });
+        // Command discovery is auxiliary: retry independently without marking the transport failed.
+        if (!menuRegistered && Date.now() >= nextMenuAttempt) {
+          try {
+            await this.client.callApi("setMyCommands", {
+              scope: { type: "chat_member", chat_id: this.config.chatId, user_id: this.config.allowedUserId },
+              commands: [
+                { command: "model", description: "List or select the current session model" },
+                { command: "thinking", description: "View or change the current session thinking level" },
+                { command: "status", description: "Show topic connection status" },
+                { command: "stop", description: "Stop the current session run" },
+              ],
+            }, 5000, signal);
+            menuRegistered = true;
+            if (this.status.commandMenuError) this.publishStatus({ ...this.status, commandMenuError: undefined });
+          } catch (error) {
+            if (signal.aborted) return;
+            this.publishStatus({ ...this.status, commandMenuError: this.describeError(error) });
+            nextMenuAttempt = Date.now() + 60_000;
+          }
+        }
+        if (this.client.isRateLimited()) continue;
+        const updates = await this.client.getUpdates({ offset: this.offset, limit: 100, timeout: 25, allowed_updates: ["message", "callback_query"], signal });
         if (signal.aborted || !this.running) return;
         if (this.status.polling !== "online") this.publishStatus({ ...this.status, polling: "online", error: undefined });
         for (const update of updates) {
@@ -405,6 +439,7 @@ export class LeaderCoordinator {
   }
 
   public async processUpdate(update: TelegramUpdate): Promise<void> {
+    if (update.callback_query) return this.processSettingsCallback(update.callback_query);
     const msg = update.message;
     if (!this.running || this.reloading || !msg || msg.chat.id !== this.config.chatId || msg.message_thread_id === undefined ||
         msg.from?.id !== this.config.allowedUserId || msg.from.is_bot || typeof msg.text !== "string" || !msg.text.trim() || msg.text.length > 4096) return;
@@ -414,10 +449,9 @@ export class LeaderCoordinator {
     const command = /^\/([a-z\d_]+)(?:@([a-z\d_]+))?(?:\s|$)/i.exec(text);
     if (command?.[2] && command[2].toLowerCase() !== this.botUsername) return;
     const name = command?.[1].toLowerCase();
-    const client = this.client;
-    const chatId = this.config.chatId;
     const generation = route.generation;
     let reply: string | undefined;
+    let menu: InboundResult["menu"];
     try {
       if (name === "status") reply = `Topic: Online\nSession: ${route.sessionId.slice(-6)}\nRoute: Active`;
       else if (name === "stop") {
@@ -426,6 +460,7 @@ export class LeaderCoordinator {
       } else {
         const result = await route.dispatchInbound(text, msg.message_id);
         reply = result.busy ? "Current session is busy. Please try again later." : result.statusReply;
+        menu = result.busy ? undefined : result.menu;
       }
     } catch (error) {
       // Inbound dispatch boundary: execution may already have started. Return an
@@ -433,13 +468,144 @@ export class LeaderCoordinator {
       this.publishStatus({ ...this.status, feedbackError: this.describeError(error) });
       reply = "Execution result unknown. Please check local Pi errors; do not resend automatically.";
     }
-    if (reply) {
-      const feedback = reply;
-      this.feedback.enqueue(async signal => {
-        if (signal.aborted || !this.running || this.reloading || this.client !== client || this.routes.get(route.threadId) !== route || route.generation !== generation) return;
-        await client.sendMessage(chatId, feedback, { message_thread_id: route.threadId }, signal);
-      }, Buffer.byteLength(feedback, "utf-8"));
+    if (reply) this.enqueueSettingsFeedback(route, generation, reply, menu);
+  }
+
+  private async processSettingsCallback(query: NonNullable<TelegramUpdate["callback_query"]>): Promise<void> {
+    const msg = query.message;
+    if (!this.running || this.reloading || !msg || msg.chat.id !== this.config.chatId ||
+        query.from?.id !== this.config.allowedUserId || query.from.is_bot ||
+        typeof query.id !== "string" || !query.id || typeof query.data !== "string" || !query.data.startsWith("mux:")) return;
+    const match = /^mux:([a-f\d]{24}):(\d{1,2})$/.exec(query.data);
+    const menu = match ? this.menus.get(match[1]) : undefined;
+    const command = menu?.commands[Number(match?.[2])];
+    const valid = menu && command && performance.now() < menu.expiresAt && msg.date !== 0 &&
+      msg.message_id === menu.messageId && (msg.message_thread_id === undefined || msg.message_thread_id === menu.route.threadId) &&
+      this.routes.get(menu.route.threadId) === menu.route && menu.route.generation === menu.generation;
+    // Consume all sibling buttons before awaiting anything: replayed/double clicks cannot execute twice.
+    if (valid) this.menus.delete(match![1]);
+    const client = this.client;
+    const signal = this.pollController?.signal;
+    // The click acknowledgement is cosmetic, not an execution prerequisite.
+    // Bound background requests so stale-button spam cannot exhaust the transport.
+    if (this.callbackAnswersInFlight < 32) {
+      this.callbackAnswersInFlight++;
+      void client.callApi("answerCallbackQuery", {
+        callback_query_id: query.id,
+        text: valid ? "Processing…" : "Menu expired. Send /model or /thinking to open a new menu.",
+        show_alert: !valid,
+      }, 5000, signal).catch(error => {
+        if (signal?.aborted || !this.running || this.reloading || this.client !== client) return;
+        if (isRecoverableTelegramError(error)) return;
+        if (error instanceof TelegramApiError && error.errorCode === 400) {
+          // Telegram provides only a generic 400, not a stable expired-query subcode.
+          // The acknowledgement boundary reports the rejected interaction without poisoning transport.
+          this.publishStatus({ ...this.status, interactionError: {
+            code: "TELEGRAM_CALLBACK_REJECTED",
+            message: "Telegram rejected a button acknowledgement (HTTP 400). Check the selection result; do not repeat it automatically.",
+          } });
+          return;
+        }
+        // Keep authentication/protocol failures visible, but never retry the settings action.
+        this.publishStatus({ ...this.status, feedbackError: this.describeError(error) });
+      }).finally(() => { this.callbackAnswersInFlight--; });
     }
+    if (!valid || !this.running || this.reloading || this.client !== client ||
+        this.routes.get(menu.route.threadId) !== menu.route || menu.route.generation !== menu.generation) return;
+    let result: InboundResult;
+    try {
+      result = await menu.route.dispatchInbound(command, msg.message_id);
+    } catch (error) {
+      this.publishStatus({ ...this.status, feedbackError: this.describeError(error) });
+      result = { accepted: false, busy: false, statusReply: "Execution result unknown. Check local Pi; do not click again." };
+    }
+    const reply = result.busy ? "The current session is busy. Send /model or /thinking again when the task finishes." : result.statusReply ?? "Operation finished. Send /model or /thinking to view settings.";
+    this.enqueueSettingsFeedback(menu.route, menu.generation, reply, result.busy ? undefined : result.menu, msg.message_id);
+  }
+
+  private async deliverFeedback<T>(client: TelegramClient, signal: AbortSignal, route: RouteEntry, generation: number, send: () => Promise<T>): Promise<T | undefined> {
+    for (;;) {
+      signal.throwIfAborted();
+      const pauseMs = client.getRemainingPauseMs();
+      if (pauseMs > 0) await delay(pauseMs, undefined, { signal });
+      signal.throwIfAborted();
+      if (!this.running || this.reloading || this.client !== client || this.routes.get(route.threadId) !== route || route.generation !== generation) return undefined;
+      try {
+        return await send();
+      } catch (error) {
+        // Retry only a single, definitively rejected request, never the settings action or
+        // a whole multi-request job. Ambiguous network/timeout failures still fail closed.
+        if (!(error instanceof RateLimitError)) throw error;
+        await delay(Math.max(1, error.retryAfter ?? 1) * 1000, undefined, { signal });
+      }
+    }
+  }
+
+  private enqueueSettingsFeedback(route: RouteEntry, generation: number, text: string, menu?: InboundResult["menu"], messageId?: number): void {
+    // Only bounded settings actions from an authenticated Runtime can become buttons.
+    if (menu && (!Array.isArray(menu) || menu.length > 12 || menu.some(row => !Array.isArray(row) || !row.length || row.length > 3 || row.some(button =>
+      !button || typeof button.text !== "string" || !button.text.trim() || button.text.length > 128 ||
+      typeof button.command !== "string" || button.command.length > 4096 || !/^\/(model|thinking)(?:\s|$)/.test(button.command))))) {
+      this.publishStatus({ ...this.status, feedbackError: { code: "INVALID_SETTINGS_MENU", message: "Runtime returned an invalid settings menu" } });
+      return;
+    }
+    const client = this.client;
+    const chatId = this.config.chatId;
+    this.feedback.enqueue(async signal => {
+      if (signal.aborted || !this.running || this.reloading || this.client !== client || this.routes.get(route.threadId) !== route || route.generation !== generation) return;
+      const now = performance.now();
+      for (const [id, existing] of this.menus) {
+        if (now >= existing.expiresAt || ((menu || messageId !== undefined) && existing.route.threadId === route.threadId)) this.menus.delete(id);
+      }
+      // Ephemeral tokens never contain model identifiers and cannot outlive this Leader.
+      const token = crypto.randomBytes(12).toString("hex");
+      const state: SettingsMenu = { route, generation, expiresAt: now + 10 * 60_000, commands: [] };
+      const replyMarkup = { inline_keyboard: (menu ?? []).map(row => row.map(button => {
+        const index = state.commands.push(button.command) - 1;
+        return { text: button.text, callback_data: `mux:${token}:${index}` };
+      })) };
+      if (menu) {
+        while (this.menus.size >= 128) this.menus.delete(this.menus.keys().next().value!);
+        this.menus.set(token, state);
+      }
+      try {
+        if (messageId !== undefined) {
+          try {
+            await this.deliverFeedback(client, signal, route, generation, () => client.callApi("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: replyMarkup }, undefined, signal));
+            state.messageId = messageId;
+          } catch (error) {
+            // A generic 400 definitively rejects this edit, but does not identify why.
+            // Report it and send one plain-text failure notice, never infer deletion from wording,
+            // retry a settings action, or reuse potentially invalid keyboard markup.
+            if (!(error instanceof TelegramApiError) || error.errorCode !== 400) throw error;
+            this.menus.delete(token);
+            if (signal.aborted || !this.running || this.reloading || this.client !== client || this.routes.get(route.threadId) !== route || route.generation !== generation) return;
+            this.publishStatus({ ...this.status, interactionError: {
+              code: "TELEGRAM_MENU_REJECTED",
+              message: "Telegram rejected a settings menu update (HTTP 400). The selection may already have completed.",
+            } });
+            await this.deliverFeedback(client, signal, route, generation, () => client.sendMessage(chatId,
+              "The settings menu could not be updated (HTTP 400). The selection may already have completed. Send /model or /thinking to check.",
+              { message_thread_id: route.threadId }, signal));
+          }
+        } else {
+          const sent = await this.deliverFeedback(client, signal, route, generation, () => client.sendMessage(chatId, text, { message_thread_id: route.threadId, ...(menu ? { reply_markup: replyMarkup } : {}) }, signal));
+          state.messageId = sent?.message_id;
+        }
+      } catch (error) {
+        this.menus.delete(token);
+        // Menu creation or its one failure notice can also be rejected. Contain generic 400s
+        // to this interaction, report them explicitly, and leave unrelated feedback operational.
+        if ((menu !== undefined || messageId !== undefined) && error instanceof TelegramApiError && error.errorCode === 400) {
+          if (!signal.aborted && this.running && !this.reloading && this.client === client) this.publishStatus({ ...this.status, interactionError: {
+            code: "TELEGRAM_MENU_REJECTED",
+            message: "Telegram rejected a settings menu or its failure notice (HTTP 400). Open a new menu to check settings.",
+          } });
+          return;
+        }
+        throw error;
+      }
+    }, Buffer.byteLength(JSON.stringify({ text, menu }), "utf-8"));
   }
 
   /** Stop the old poller before applying validated configuration to every Runtime. */
@@ -463,6 +629,7 @@ export class LeaderCoordinator {
       if (!this.running) throw new Error("Coordinator stopped during configuration update");
       this.routes.clear();
       this.routeOwners.clear();
+      this.menus.clear();
       // Authentication can finish while the old poller is draining. Reset those
       // peers too, before publishing the new configuration without another await.
       for (const [socket, state] of this.connections) {
@@ -490,6 +657,7 @@ export class LeaderCoordinator {
     for (const [socket, state] of this.connections) { clearTimeout(state.authTimer); socket.destroy(); }
     this.routes.clear();
     this.routeOwners.clear();
+    this.menus.clear();
     this.stopping = (async () => {
       await this.pollingTask;
       if (this.server) await new Promise<void>(resolve => this.server!.close(() => resolve()));

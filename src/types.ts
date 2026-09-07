@@ -55,15 +55,18 @@ export interface InboundResult {
   accepted: boolean;
   busy: boolean;
   statusReply?: string;
+  menu?: Array<Array<{ text: string; command: string }>>;
 }
 
 export interface TransportStatus {
   polling: "starting" | "online" | "retrying" | "error" | "conflict";
   error?: { code: string; message: string };
   feedbackError?: { code: string; message: string };
+  commandMenuError?: { code: string; message: string };
+  interactionError?: { code: string; message: string };
 }
 
-export const IPC_PROTOCOL_VERSION = 3;
+export const IPC_PROTOCOL_VERSION = 4;
 
 /**
  * Leader lock metadata stored in {agentDir}/pi-telegram-mux/runtime/leader.json
@@ -111,9 +114,19 @@ export interface TelegramMessage {
   text?: string;
 }
 
+export interface TelegramInlineKeyboardMarkup {
+  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: {
+    id: string;
+    from: TelegramUser;
+    message?: TelegramMessage;
+    data?: string;
+  };
 }
 
 export interface TelegramChatMember {
