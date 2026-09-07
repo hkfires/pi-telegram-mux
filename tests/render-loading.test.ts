@@ -137,7 +137,10 @@ describe("runtime renderer failure visibility", () => {
     const f = role === "leader" ? leader : await runtimeFixture(dir, "follower", 51);
     if (f !== leader) fixtures.push(f);
     const failure = new Error("Simulated " + stage + " failure");
-    (stage === "loading" ? loadRenderer : renderMarkdown).mockImplementation(() => { throw failure; });
+    // Runtime delivery now observes errors at the worker boundary. Synchronous
+    // loader/parser failures are exercised above, and real workers separately.
+    const { MarkdownWorker } = await import("../src/markdown-worker.js");
+    vi.spyOn(MarkdownWorker.prototype, "render").mockRejectedValue(failure);
     const send = vi.spyOn(f.runtime, "callTelegram");
 
     await f.runtime.onBeforeAgentStart(f.ctx);

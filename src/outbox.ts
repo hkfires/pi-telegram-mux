@@ -38,8 +38,18 @@ export class BoundedOutbox {
     const controller = new AbortController();
     this.controller = controller;
     this.activeBytes = job.bytes;
-    // Start on a microtask so synchronous completion cannot race active assignment.
-    this.active = Promise.resolve().then(() => job.work(controller.signal)).catch(error => {
+    // Reserve capacity synchronously, but give terminal I/O a chance before delivery.
+    this.active = new Promise<void>(resolve => {
+      const finish = () => {
+        clearImmediate(immediate);
+        controller.signal.removeEventListener("abort", finish);
+        resolve();
+      };
+      const immediate = setImmediate(finish);
+      controller.signal.addEventListener("abort", finish, { once: true });
+    }).then(() => {
+      if (!controller.signal.aborted) return job.work(controller.signal);
+    }).catch(error => {
       // Delivery boundary: explicit cancellation discards obsolete work. Any other
       // failure stops all dependent jobs and is exposed to the owner's status/UI.
       if (!controller.signal.aborted) this.fail(error instanceof Error ? error : new Error("Telegram background task failed", { cause: error }));

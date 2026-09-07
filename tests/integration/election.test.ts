@@ -22,6 +22,10 @@ describe("real multi-process election and crash recovery", () => {
     await fs.symlink(path.resolve("node_modules"), path.join(build, "node_modules"), process.platform === "win32" ? "junction" : "dir");
     // Compile the current source, never a possibly stale or untracked dist directory.
     for (const file of await fs.readdir(path.resolve("src"))) {
+      if (file.endsWith(".mjs")) {
+        await fs.copyFile(path.resolve("src", file), path.join(build, file));
+        continue;
+      }
       if (!file.endsWith(".ts")) continue;
       const source = await fs.readFile(path.resolve("src", file), "utf-8");
       const result = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022, esModuleInterop: true } });

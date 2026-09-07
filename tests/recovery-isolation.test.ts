@@ -11,7 +11,9 @@ import { runtimeFixture } from "./helpers.js";
 /** Mock HTTP while retaining real client cancellation and local TCP/IPC ordering. */
 function telegramFixture() {
   const originalFetch = globalThis.fetch;
-  const state = { sent: [] as string[], pollCount: 0, failPoll: undefined as ((code: number) => void) | undefined, oldSignal: undefined as AbortSignal | undefined, failNewSend: false };
+  let started!: () => void;
+  const firstSend = new Promise<void>(resolve => { started = resolve; });
+  const state = { firstSend, sent: [] as string[], pollCount: 0, failPoll: undefined as ((code: number) => void) | undefined, oldSignal: undefined as AbortSignal | undefined, failNewSend: false };
   vi.stubGlobal("fetch", (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
     if (url.pathname.endsWith("/getUpdates")) {
@@ -24,6 +26,7 @@ function telegramFixture() {
     if (url.pathname.endsWith("/sendMessage")) {
       const { text } = JSON.parse(init!.body as string);
       state.sent.push(text);
+      started();
       if (text === "🧑‍💻 [Prompt]\nold prompt") return new Promise<Response>((_resolve, reject) => {
         state.oldSignal = init!.signal!;
         state.oldSignal.throwIfAborted();
@@ -232,7 +235,8 @@ describe("cross-instance recovery and dependent-send isolation", () => {
     const oldClient = (peer.runtime as any).followerClient as IpcFollowerClient;
     await peer.runtime.onBeforeAgentStart(peer.ctx);
     peer.runtime.onMessageStart({ role: "user", content: "old prompt" }, peer.ctx);
-    await vi.waitFor(() => expect(network.sent).toHaveLength(1));
+    await network.firstSend;
+    expect(network.sent).toHaveLength(1);
     const coordinator = (leader.runtime as any).coordinator as LeaderCoordinator;
     const socket = [...(coordinator as any).connections.entries()].find(([, state]: any) => state.runtimeId === peer.runtime.runtimeId)![0];
     socket.destroy();

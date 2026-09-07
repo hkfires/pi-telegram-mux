@@ -7,7 +7,8 @@ import { configFingerprint, loadConfig, saveConfig, validateConfig } from "./con
 import { LeaderCoordinator } from "./coordinator.js";
 import { IpcError, IpcFollowerClient } from "./ipc.js";
 import { BoundedOutbox } from "./outbox.js";
-import { extractAssistantText, extractUserText, renderTelegramMarkdown, splitTelegramMessage } from "./render.js";
+import { extractAssistantText, extractUserText, splitTelegramMessage } from "./render.js";
+import { MarkdownWorker } from "./markdown-worker.js";
 import { TelegramClient, validateBotAndChat } from "./telegram.js";
 import type { BindingState, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic, TelegramMessage } from "./types.js";
 
@@ -127,6 +128,7 @@ export class MuxRuntime {
   private pendingInput?: Admission;
   private readonly inputOrigin = new AsyncLocalStorage<Admission>();
   public readonly outbox: BoundedOutbox;
+  private readonly markdownWorker = new MarkdownWorker();
 
   constructor(private readonly pi: ExtensionAPI, private readonly agentDir: string) {
     this.outbox = new BoundedOutbox(error => {
@@ -541,7 +543,8 @@ export class MuxRuntime {
     if (!this.isRunCurrent(run)) return;
     // A missing topic is replaced on the next local prompt, even in a session with history.
     const isTopicMissing = !origin && this.bindingState === "topic-missing";
-    const canCreate = isTopicMissing || (!origin && !ctx.sessionManager.getEntries().some(e => e.type === "message" && e.message.role === "assistant"));
+    // Capture eligibility now: queued work may run after the first assistant reply is persisted.
+    const canCreate = isTopicMissing || (!origin && this.bindingState === "unbound" && !ctx.sessionManager.getEntries().some(e => e.type === "message" && e.message.role === "assistant"));
     if (isTopicMissing) {
       ctx.ui?.notify("Telegram topic was deleted. Creating a replacement topic for this session...", "warning");
     }
@@ -724,7 +727,8 @@ export class MuxRuntime {
     const config = this.config;
     if (!config) return null;
     let firstMessage: TelegramMessage | null = null;
-    for (const chunk of renderTelegramMarkdown(text)) {
+    const chunks = await this.markdownWorker.render(text, signal);
+    for (const chunk of chunks) {
       if (!chunk.text.trim()) continue;
       if (this.configurationTask) await this.waitForConfiguration(signal);
       if (!this.isTargetCurrent(target, ctx) || signal.aborted) return null;
@@ -826,6 +830,7 @@ export class MuxRuntime {
     // Fence inputs and cancel queued output synchronously, retaining the last acknowledged route only for closure.
     this.active = false;
     this.invalidateRun();
+    await this.markdownWorker.close();
     if (cleanup) await cleanup;
     if (shouldClose) {
       try {

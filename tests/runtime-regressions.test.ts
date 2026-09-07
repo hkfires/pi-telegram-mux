@@ -118,13 +118,16 @@ describe("Runtime lifecycle and safety regressions", () => {
     f.runtime.onMessageEnd({ role: "assistant", content: "x".repeat(9000) });
     let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
+    let started!: () => void;
+    const firstSend = new Promise<void>(resolve => { started = resolve; });
     const call = vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (method) => {
-      if (method === "sendMessage") await barrier;
+      if (method === "sendMessage") { started(); await barrier; }
       return {} as any;
     });
     const sending = f.runtime.onAgentSettled(f.ctx);
     const api = vi.spyOn(coordinatorOf(f).getTelegramClient(), "callApi");
-    await vi.waitFor(() => expect(call.mock.calls.filter(c => c[0] === "sendMessage")).toHaveLength(1));
+    await firstSend;
+    expect(call.mock.calls.filter(c => c[0] === "sendMessage")).toHaveLength(1);
     expect(call.mock.calls[0][2]).toMatchObject({ sessionId: "chunk", threadId: 50 });
     if (action === "disconnect") f.runtime.handleTgDisconnect(f.ctx);
     if (action === "tree") f.runtime.onSessionBeforeTree();
@@ -143,6 +146,7 @@ describe("Runtime lifecycle and safety regressions", () => {
     const f = await fixture("unknown", null);
     const call = vi.spyOn(f.runtime, "callTelegram").mockRejectedValue(new Error("Unknown create timeout"));
     await f.runtime.onBeforeAgentStart({ prompt: "first" }, f.ctx);
+    await f.runtime.outbox.whenIdle();
     f.runtime.onMessageEnd({ role: "assistant", content: "answer" });
     await f.runtime.onAgentSettled(f.ctx);
     await f.runtime.onBeforeAgentStart({ prompt: "second" }, f.ctx);
@@ -185,7 +189,7 @@ describe("Runtime lifecycle and safety regressions", () => {
 
   it("reports unknown rather than accepted when Pi emits no admission event", async () => {
     const f = await fixture("no-event");
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const admission = f.runtime.handleInboundText("not accepted by Pi", f.ctx);
     await vi.advanceTimersByTimeAsync(2001);
     expect(await admission).toMatchObject({ accepted: false, busy: false, statusReply: expect.stringContaining("unknown") });
@@ -194,7 +198,7 @@ describe("Runtime lifecycle and safety regressions", () => {
 
   it("keeps an unresolved admission reserved after timeout until Pi actually consumes it", async () => {
     const f = await fixture("slow-preflight");
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const admission = f.runtime.handleInboundText("first", f.ctx);
     await vi.advanceTimersByTimeAsync(2001);
     expect(await admission).toMatchObject({ accepted: false, statusReply: expect.stringContaining("unknown") });
@@ -211,10 +215,11 @@ describe("Runtime lifecycle and safety regressions", () => {
     const coordinator = coordinatorOf(f);
     const send = vi.spyOn(coordinator.getTelegramClient(), "sendMessage").mockResolvedValue({} as any);
     f.pi.sendUserMessage.mockImplementation((text: string) => { void f.runtime.onBeforeAgentStart({ prompt: text }, f.ctx); });
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const processing = coordinator.processUpdate(telegramUpdate(50, "first"));
     await vi.advanceTimersByTimeAsync(2001);
     await processing;
+    await coordinator.feedback.whenIdle();
     expect(send).toHaveBeenCalledWith(testConfig.chatId, expect.stringContaining("unknown"), { message_thread_id: 50 }, expect.any(AbortSignal));
     f.runtime.onMessageStart({ role: "user", content: "first" }, f.ctx);
     await f.runtime.onAgentSettled(f.ctx);
@@ -328,6 +333,7 @@ describe("Runtime lifecycle and safety regressions", () => {
     const f = await fixture("unknown-reload", null);
     const call = vi.spyOn(f.runtime, "callTelegram").mockRejectedValue(new Error("Unknown create timeout"));
     await f.runtime.onBeforeAgentStart({ prompt: "first" }, f.ctx);
+    await f.runtime.outbox.whenIdle();
     validateSetup();
     f.ui.select.mockResolvedValueOnce("Connection settings");
     f.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce("999");

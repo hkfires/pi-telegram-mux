@@ -93,6 +93,7 @@ describe("review regressions: polling, commands and feedback backpressure", () =
     route(50);
     await coordinator.start();
     await coordinator.processUpdate(telegramUpdate(50, "/status"));
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
     await coordinator.processUpdate(telegramUpdate(50, "/stop", 2));
     const old = coordinator.getRoutes().get(50)!;
     coordinator.registerLocalRoute({ ...old, generation: old.generation + 1 });

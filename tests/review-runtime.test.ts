@@ -274,7 +274,8 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     f.runtime.onMessageEnd({ role: "assistant", content: "answer", stopReason: "stop" });
     await f.runtime.onAgentSettled(f.ctx);
     expect(f.runtime.getIsIdle()).toBe(true);
-    expect(calls).toEqual(["create"]);
+    expect(calls).toEqual([]);
+    await vi.waitFor(() => expect(calls).toEqual(["create"]));
     gate.resolve();
     await f.runtime.outbox.whenIdle();
     expect(calls).toEqual(["create", "🧑‍💻 [Prompt]\nlocal", "answer"]);

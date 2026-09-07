@@ -126,6 +126,7 @@ describe("IPC protocol regressions", () => {
     const send = vi.spyOn(coordinator.getTelegramClient(), "sendMessage").mockResolvedValue({} as any);
     await coordinator.processUpdate(telegramUpdate(50, "/stop"));
     expect(abort).toHaveBeenCalledWith(target);
+    await coordinator.feedback.whenIdle();
     expect(send).toHaveBeenCalledWith(testConfig.chatId, "Abort signal sent.", { message_thread_id: 50 }, expect.any(AbortSignal));
   });
 
@@ -134,6 +135,7 @@ describe("IPC protocol regressions", () => {
     await f.register({ runtimeId: "follower", ...target });
     const send = vi.spyOn(coordinator.getTelegramClient(), "sendMessage").mockResolvedValue({} as any);
     await coordinator.processUpdate(telegramUpdate(50, "/stop"));
+    await coordinator.feedback.whenIdle();
     expect(send.mock.calls[0][1]).toContain("Could not confirm abort");
   });
 
