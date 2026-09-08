@@ -888,7 +888,7 @@ describe("Telegram session settings commands", () => {
     expect(poll.mock.calls[0][0]!.allowed_updates).toEqual(["message", "callback_query"]);
   });
 
-  it.each(["answerCallbackQuery", "editMessageText"])("recovers feedback after a real HTTP 429 from %s without replaying the selection", async rejectedMethod => {
+  it.each(["answerCallbackQuery", "editMessageText"])("drops feedback after a real HTTP 429 from %s and accepts fresh work after cooldown", async rejectedMethod => {
     const originalFetch = globalThis.fetch;
     const requests: Array<{ method: string; at: number; params: any }> = [];
     let rejectedAt = 0;
@@ -916,11 +916,187 @@ describe("Telegram session settings commands", () => {
     await coordinator.feedback.whenIdle();
     expect(f.settings.setModel).toHaveBeenCalledTimes(1);
     const edits = requests.filter(request => request.method === "editMessageText");
-    expect(edits).toHaveLength(rejectedMethod === "editMessageText" ? 2 : 1);
-    expect(edits.at(-1)!.at - rejectedAt).toBeGreaterThanOrEqual(990);
+    expect(edits).toHaveLength(rejectedMethod === "editMessageText" ? 1 : 0);
+    expect(coordinator.getStatus().rateLimitUntil).toBeGreaterThan(Date.now());
+    await vi.waitFor(() => expect(coordinator.getStatus().rateLimitUntil).toBeUndefined(), { timeout: 2000 });
+    expect(requests.filter(request => request.method === "editMessageText")).toHaveLength(edits.length);
+    await coordinator.processUpdate(telegramUpdate(51, "/status", 4));
+    await coordinator.feedback.whenIdle();
     expect(coordinator.feedback.error).toBeNull();
     expect(coordinator.getStatus().feedbackError).toBeUndefined();
     expect(requests.at(-1)!.params).toMatchObject({ message_thread_id: 51, text: expect.stringContaining("Topic: Online") });
+  });
+
+  it.each(["leader", "follower"])("drops a rejected %s reply and resumes fresh output without reconnecting", async owner => {
+    const leader = await fixture();
+    const follower = await fixture("follower", 51);
+    const f = owner === "leader" ? leader : follower;
+    const coordinator = coordinatorOf(leader);
+    const reload = vi.spyOn(coordinator, "reloadConfig");
+    const generations = [leader.runtime.getGeneration(), follower.runtime.getGeneration()];
+    for (const peer of [leader, follower]) {
+      vi.spyOn((peer.runtime as any).markdownWorker, "render").mockImplementation(async (text: string) => [{ text }]);
+    }
+    const originalFetch = globalThis.fetch;
+    const sent: string[] = [];
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).endsWith("/sendMessage")) return originalFetch(input, init);
+      const params = JSON.parse(init!.body as string);
+      sent.push(params.text);
+      if (params.text === "rejected reply") return new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 2 } }), { status: 429 });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 901 } }));
+    });
+    await f.runtime.onBeforeAgentStart({ prompt: "initial" }, f.ctx);
+    f.runtime.onTurnEnd({ role: "assistant", content: "rejected reply", stopReason: "stop" });
+    await f.runtime.outbox.whenIdle();
+    await vi.waitFor(() => {
+      for (const peer of [leader, follower]) expect(peer.ui.setStatus).toHaveBeenLastCalledWith("tg", expect.stringContaining("429"));
+    });
+    expect((await follower.runtime.handleInboundText("during cooldown", follower.ctx)).busy).toBe(true);
+    await leader.runtime.handleTgConnect(leader.ctx);
+    await vi.waitFor(() => {
+      for (const peer of [leader, follower]) expect(peer.ui.setStatus.mock.calls.at(-1)?.[1]).toContain("1s");
+    }, { timeout: 1500 });
+    await vi.waitFor(() => expect(coordinator.getStatus().rateLimitUntil).toBeUndefined(), { timeout: 2000 });
+    // A late result belonging to the dropped run must not reappear after recovery.
+    f.runtime.onTurnEnd({ role: "assistant", content: "obsolete late reply", stopReason: "stop" });
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.onBeforeAgentStart({ prompt: "fresh" }, f.ctx);
+    f.runtime.onTurnEnd({ role: "assistant", content: "fresh reply", stopReason: "stop" });
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.outbox.whenIdle();
+    expect(sent).toEqual(["rejected reply", "fresh reply"]);
+    expect(reload).not.toHaveBeenCalled();
+    expect([leader.runtime.getGeneration(), follower.runtime.getGeneration()]).toEqual(generations);
+    expect(f.runtime.outbox.error).toBeNull();
+  });
+
+  it.each([false, true])("preserves cooldown only for the same Bot on reload (token changed: %s)", async changedToken => {
+    const leader = await fixture();
+    const follower = await fixture("follower", 51);
+    const coordinator = coordinatorOf(leader);
+    coordinator.getTelegramClient().recordRateLimit(30);
+    await vi.waitFor(() => expect(follower.ui.setStatus.mock.calls.at(-1)?.[1]).toContain("429"));
+    const next = { ...testConfig, botToken: changedToken ? "replacement-test-token" : testConfig.botToken, autoCloseTopics: false };
+    await saveConfig(dir, next);
+    await coordinator.reloadConfig();
+    expect(coordinator.getTelegramClient().isRateLimited()).toBe(!changedToken);
+    if (changedToken) expect(coordinator.getStatus().rateLimitUntil).toBeUndefined();
+    else expect(coordinator.getStatus().rateLimitUntil).toBeGreaterThan(Date.now());
+    await vi.waitFor(() => {
+      expect(follower.runtime.hasActiveTransport()).toBe(true);
+      expect(follower.runtime.getIsReconnecting()).toBe(false);
+      expect((follower.runtime as any).config.botToken).toBe(next.botToken);
+    }, { timeout: 3000 });
+    const late = await fixture("late", 52);
+    for (const peer of [leader, follower, late]) {
+      expect(String(peer.ui.setStatus.mock.calls.at(-1)?.[1]).includes("429")).toBe(!changedToken);
+      expect((peer.runtime as any).rateLimitUntil > Date.now()).toBe(!changedToken);
+    }
+  });
+
+  it("clears the old Bot cooldown when restarting a Runtime with another token", async () => {
+    const f = await fixture();
+    coordinatorOf(f).getTelegramClient().recordRateLimit(30);
+    await f.runtime.onSessionShutdown(f.ctx);
+    await saveConfig(dir, { ...testConfig, botToken: "replacement-test-token" });
+    await f.runtime.onSessionStart(f.ctx);
+    expect((f.runtime as any).rateLimitUntil).toBe(0);
+    expect(coordinatorOf(f).getTelegramClient().isRateLimited()).toBe(false);
+    expect(f.ui.setStatus.mock.calls.at(-1)?.[1]).not.toContain("429");
+  });
+
+  it("recovers a Follower from an RPC-only 429 without a cooldown broadcast", async () => {
+    const leader = await fixture();
+    const f = await fixture("follower", 51);
+    const coordinator = coordinatorOf(leader);
+    coordinator.getTelegramClient().onRateLimit = undefined;
+    const originalFetch = globalThis.fetch;
+    const sent: string[] = [];
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).endsWith("/sendMessage")) return originalFetch(input, init);
+      sent.push(JSON.parse(init!.body as string).text);
+      return sent.length === 1
+        ? new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 1 } }), { status: 429 })
+        : new Response(JSON.stringify({ ok: true, result: { message_id: 901 } }));
+    });
+    const target = { sessionId: "follower", threadId: 51, generation: f.runtime.getGeneration() };
+    f.runtime.outbox.enqueue(async signal => {
+      await f.runtime.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: 51, text: "rejected" }, target, signal);
+    });
+    await f.runtime.outbox.whenIdle();
+    expect(coordinator.getStatus().rateLimitUntil).toBeUndefined();
+    expect(f.runtime.outbox.error).toMatchObject({ code: "TELEGRAM_HTTP_429", retryAfter: 1 });
+    expect(f.ui.setStatus.mock.calls.at(-1)?.[1]).toContain("429");
+    await vi.waitFor(() => expect(f.runtime.outbox.error).toBeNull(), { timeout: 2000 });
+    f.runtime.outbox.enqueue(async signal => {
+      await f.runtime.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: 51, text: "fresh" }, target, signal);
+    });
+    await f.runtime.outbox.whenIdle();
+    expect(sent).toEqual(["rejected", "fresh"]);
+    expect(f.runtime.outbox.error).toBeNull();
+  });
+
+  it("rechecks the Client deadline when the cooldown timer fires early", async () => {
+    const f = await fixture();
+    const coordinator = coordinatorOf(f);
+    const now = Date.now();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      coordinator.getTelegramClient().recordRateLimit(1);
+      const until = coordinator.getStatus().rateLimitUntil;
+      clock.mockReturnValue(now + 998);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(coordinator.getStatus().rateLimitUntil).toBe(until);
+      expect(coordinator.getTelegramClient().isRateLimited()).toBe(true);
+      clock.mockReturnValue(now + 1000);
+      await vi.advanceTimersByTimeAsync(2);
+      expect(coordinator.getStatus().rateLimitUntil).toBeUndefined();
+      expect(coordinator.getTelegramClient().isRateLimited()).toBe(false);
+    } finally { clock.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("does not repeatedly broadcast a cooldown longer than the Node timer limit", async () => {
+    const poll = vi.spyOn(TelegramClient.prototype, "getUpdates");
+    const f = await fixture();
+    const coordinator = coordinatorOf(f);
+    await vi.waitFor(() => expect(poll).toHaveBeenCalled());
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    try {
+      coordinator.getTelegramClient().recordRateLimit(30 * 24 * 60 * 60);
+      const calls = f.ui.setStatus.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(10);
+      expect(f.ui.setStatus).toHaveBeenCalledTimes(calls);
+      expect(coordinator.getStatus().rateLimitUntil).toBeGreaterThan(Date.now());
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("extends cooldown without clearing unrelated errors or scheduling reconnects after shutdown", async () => {
+    const f = await fixture();
+    const coordinator = coordinatorOf(f);
+    const error = new TelegramRequestError("TELEGRAM_TIMEOUT", "Unrelated delivery timeout");
+    f.runtime.outbox.enqueue(async () => { throw error; });
+    await f.runtime.outbox.whenIdle();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    try {
+      coordinator.getTelegramClient().recordRateLimit(2);
+      await vi.advanceTimersByTimeAsync(1000);
+      coordinator.getTelegramClient().recordRateLimit(3);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.ui.setStatus.mock.calls.at(-1)?.[1]).toContain("2s");
+      await vi.advanceTimersByTimeAsync(2001);
+      expect(coordinator.getStatus().rateLimitUntil).toBeUndefined();
+      expect(f.runtime.outbox.error).toBe(error);
+      coordinator.getTelegramClient().recordRateLimit(10);
+      await f.runtime.onSessionShutdown(f.ctx);
+      const calls = f.ui.setStatus.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(11000);
+      expect(f.ui.setStatus).toHaveBeenCalledTimes(calls);
+      expect(f.runtime.hasActiveTransport()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("cancels a feedback rate-limit wait promptly on shutdown", async () => {

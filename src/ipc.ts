@@ -222,6 +222,7 @@ export class IpcFollowerClient {
 
   private updateStatus(status: TransportStatus): void {
     if (!status || !["starting", "online", "retrying", "error", "conflict"].includes(status.polling) ||
+        (status.rateLimitUntil !== undefined && (!Number.isSafeInteger(status.rateLimitUntil) || status.rateLimitUntil <= 0)) ||
         [status.error, status.feedbackError, status.commandMenuError, status.interactionError].some(error => error !== undefined && (!error || typeof error.code !== "string" || typeof error.message !== "string"))) {
       throw new Error("Invalid IPC transport status");
     }
@@ -279,7 +280,16 @@ export class IpcFollowerClient {
               const pending = msg.callId ? this.pendingCalls.get(msg.callId) : undefined;
               if (pending && msg.callId) {
                 if (msg.ok) pending.resolve(msg.type === "call_telegram_ack" ? msg.result : undefined);
-                else pending.reject(new Error(msg.error ?? "IPC request rejected"));
+                else {
+                  const error = new Error(msg.error ?? "IPC request rejected");
+                  if (msg.type === "call_telegram_ack") {
+                    if ((msg.code !== undefined && typeof msg.code !== "string") ||
+                        (msg.retryAfter !== undefined && (!Number.isSafeInteger(msg.retryAfter) || msg.retryAfter <= 0))) throw new Error("Invalid IPC error response");
+                    if (msg.code !== undefined) Object.assign(error, { code: msg.code });
+                    if (msg.retryAfter !== undefined) Object.assign(error, { retryAfter: msg.retryAfter });
+                  }
+                  pending.reject(error);
+                }
               }
             } else if (msg.type === "inbound" || msg.type === "abort") {
               // Do not block parsing later acknowledgements while Pi handles an input.

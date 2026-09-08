@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MuxRuntime } from "../src/runtime.js";
 import { LeaderCoordinator } from "../src/coordinator.js";
 import { saveConfig } from "../src/config.js";
-import { IpcError } from "../src/ipc.js";
+import { encodeFrame, IpcError } from "../src/ipc.js";
 import { TelegramApiError, TelegramClient } from "../src/telegram.js";
 import { runtimeFixture, testConfig } from "./helpers.js";
 
@@ -24,6 +24,28 @@ describe("forum topic lifecycle", () => {
     for (const f of fixtures.reverse()) await f.runtime.onSessionShutdown({ reason: "reload" }, f.ctx);
     fixtures.length = 0;
     await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("keeps a terminal IPC failure visible while a rate-limited reopen is pending", async () => {
+    const leader = await runtimeFixture(dir, "host", 10);
+    fixtures.push(leader);
+    const originalFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).endsWith("/reopenForumTopic")) return originalFetch(input, init);
+      return new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 1 } }), { status: 429 });
+    });
+    const follower = await runtimeFixture(dir, "pending-error", 50, "resume");
+    fixtures.push(follower);
+    const coordinator = (leader.runtime as any).coordinator;
+    const socket = [...coordinator.connections.entries()].find(([, state]: any) => state.runtimeId === follower.runtime.runtimeId)![0] as any;
+    const malformed = encodeFrame({ type: "ping" });
+    malformed.fill(0x7b, 4);
+    socket.write(malformed);
+    await vi.waitFor(() => expect(follower.runtime.hasActiveTransport()).toBe(false));
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    expect((follower.runtime as any).connectionError.code).toBe("IPC_PROTOCOL_ERROR");
+    expect(follower.runtime.getIsReconnecting()).toBe(false);
+    expect(follower.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: error");
   });
 
   describe.each(["leader", "follower"])("%s", role => {
@@ -124,6 +146,218 @@ describe("forum topic lifecycle", () => {
           expect(api.mock.calls.filter(([method]) => method === "reopenForumTopic")).toHaveLength(2);
         }
       } finally { release(); await manualRecovery; }
+    });
+
+    it.each(["success", "another 429", "403"])("automatically finishes a rate-limited reopen: %s", async outcome => {
+      const originalFetch = globalThis.fetch;
+      const attempts: number[] = [];
+      const sent: string[] = [];
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        const method = String(input).split("/").at(-1);
+        if (method === "reopenForumTopic") {
+          attempts.push(Date.now());
+          const code = attempts.length === 1 || (outcome === "another 429" && attempts.length === 2) ? 429 : outcome === "403" ? 403 : 200;
+          return new Response(JSON.stringify(code === 200 ? { ok: true, result: true } : {
+            ok: false, error_code: code, description: code === 403 ? "Forbidden" : "Too Many Requests", parameters: { retry_after: 1 },
+          }), { status: code });
+        }
+        if (method === "sendMessage") {
+          sent.push(JSON.parse(init!.body as string).text);
+          return new Response(JSON.stringify({ ok: true, result: { message_id: 900 } }));
+        }
+        return originalFetch(input, init);
+      });
+      const f = await runtimeFixture(dir, "limited", 50, "resume");
+      fixtures.push(f);
+      expect(f.ui.setStatus.mock.calls.at(-1)?.[1]).toContain("429");
+      expect(f.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("/tg-connect"), "error");
+      const expectedAttempts = outcome === "another 429" ? 3 : 2;
+      await vi.waitFor(() => {
+        expect(attempts).toHaveLength(expectedAttempts);
+        expect(f.runtime.getIsReconnecting()).toBe(false);
+        expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", outcome === "403" ? "tg: error" : "tg: connected (imited)");
+      }, { timeout: 5000 });
+      for (let i = 1; i < attempts.length; i++) expect(attempts[i] - attempts[i - 1]).toBeGreaterThanOrEqual(1000);
+      if (outcome === "403") {
+        expect((f.runtime as any).connectionError.code).toBe("TELEGRAM_HTTP_403");
+        await new Promise(resolve => setTimeout(resolve, 1100));
+        expect(attempts).toHaveLength(expectedAttempts);
+      } else {
+        expect((f.runtime as any).connectionError).toBeNull();
+        expect((f.runtime as any).topicNeedsReopen).toBe(false);
+        vi.spyOn((f.runtime as any).markdownWorker, "render").mockImplementation(async (text: string) => [{ text }]);
+        await f.runtime.onBeforeAgentStart(f.ctx);
+        f.runtime.onTurnEnd({ role: "assistant", content: "fresh reply", stopReason: "stop" });
+        await f.runtime.onAgentSettled(f.ctx);
+        await f.runtime.outbox.whenIdle();
+        expect(sent).toEqual(["fresh reply"]);
+      }
+    });
+
+    it.each(["self", "another instance"])("retains a rate-limited reopen when %s changes auto-close settings", async origin => {
+      const originalFetch = globalThis.fetch;
+      let attempts = 0;
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).endsWith("/reopenForumTopic")) return originalFetch(input, init);
+        return ++attempts === 1
+          ? new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 2 } }), { status: 429 })
+          : new Response(JSON.stringify({ ok: true, result: true }));
+      });
+      const f = await runtimeFixture(dir, "settings-reopen", 50, "resume");
+      fixtures.push(f);
+      const owner = origin === "self" ? f : await runtimeFixture(dir, "settings-peer", 51);
+      if (owner !== f) fixtures.push(owner);
+      owner.ui.select.mockResolvedValueOnce("Auto-close topics: ON").mockResolvedValueOnce("OFF - keep topics open (faster exit)");
+      await owner.runtime.handleTgSetup(owner.ctx);
+      await vi.waitFor(() => {
+        expect(attempts).toBe(2);
+        expect((f.runtime as any).topicNeedsReopen).toBe(false);
+        expect((f.runtime as any).rateLimitReopenTarget).toBeNull();
+        expect(f.runtime.getIsReconnecting()).toBe(false);
+        expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: connected (reopen)");
+      }, { timeout: 5000 });
+    });
+
+    it("waits for an in-progress configuration reload after the reopen cooldown expires", async () => {
+      const originalFetch = globalThis.fetch;
+      let attempts = 0;
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).endsWith("/reopenForumTopic")) return originalFetch(input, init);
+        return ++attempts === 1
+          ? new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 2 } }), { status: 429 })
+          : new Response(JSON.stringify({ ok: true, result: true }));
+      });
+      const f = await runtimeFixture(dir, "reload-reopen", 50, "resume");
+      fixtures.push(f);
+      const peer = await runtimeFixture(dir, "reload-peer", 51);
+      fixtures.push(peer);
+      const coordinator = fixtures.find(item => item.runtime.getIsLeader())!.runtime as any;
+      const options = coordinator.coordinator.options;
+      const apply = options.onConfigChange;
+      let entered!: () => void;
+      let release!: () => void;
+      const changing = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      options.onConfigChange = async (config: any) => { entered(); await gate; await apply(config); };
+      peer.ui.select.mockResolvedValueOnce("Auto-close topics: ON").mockResolvedValueOnce("OFF - keep topics open (faster exit)");
+      const setup = peer.runtime.handleTgSetup(peer.ctx);
+      try {
+        await changing;
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, (f.runtime as any).rateLimitUntil - Date.now()) + 100));
+        expect(attempts).toBe(1);
+        expect((f.runtime as any).rateLimitReopenTarget).not.toBeNull();
+        expect(f.runtime.getIsReconnecting()).toBe(true);
+        await expect(f.runtime.handleInboundText("wait for recovery", f.ctx)).resolves.toMatchObject({ accepted: false, busy: true });
+        release();
+        await setup;
+        await vi.waitFor(() => {
+          expect(attempts).toBe(2);
+          expect((f.runtime as any).topicNeedsReopen).toBe(false);
+          expect((f.runtime as any).rateLimitReopenTarget).toBeNull();
+        }, { timeout: 4000 });
+      } finally { release(); await setup; options.onConfigChange = apply; }
+    });
+
+    it.each(["token", "chat"])("does not carry a rate-limited reopen into another %s", async change => {
+      const originalFetch = globalThis.fetch;
+      const calls: { url: string; chatId: number }[] = [];
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).endsWith("/reopenForumTopic")) return originalFetch(input, init);
+        calls.push({ url: String(input), chatId: JSON.parse(init!.body as string).chat_id });
+        return calls.length === 1
+          ? new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 1 } }), { status: 429 })
+          : new Response(JSON.stringify({ ok: true, result: true }));
+      });
+      const f = await runtimeFixture(dir, "changed-reopen", 50, "resume");
+      fixtures.push(f);
+      const next = { ...testConfig, autoCloseTopics: true, ...(change === "token" ? { botToken: "new-test-token" } : { chatId: -100999 }) };
+      await saveConfig(dir, next);
+      const leader = fixtures.find(item => item.runtime.getIsLeader())!.runtime as any;
+      await leader.coordinator.reloadConfig();
+      await vi.waitFor(() => expect((f.runtime as any).config.botToken === next.botToken && (f.runtime as any).config.chatId === next.chatId).toBe(true), { timeout: 3000 });
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      expect((f.runtime as any).rateLimitReopenTarget).toBeNull();
+      expect(calls.filter(call => call.url.includes(testConfig.botToken) && call.chatId === testConfig.chatId)).toHaveLength(1);
+    });
+
+    it("keeps a manual reopen from racing the cooldown recovery", async () => {
+      const originalFetch = globalThis.fetch;
+      let attempts = 0;
+      let release!: () => void;
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).endsWith("/reopenForumTopic")) return originalFetch(input, init);
+        if (++attempts === 1) return new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 30 } }), { status: 429 });
+        return new Promise<Response>((resolve, reject) => {
+          release = () => resolve(new Response(JSON.stringify({ ok: true, result: true })));
+          init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true });
+        });
+      });
+      const f = await runtimeFixture(dir, "manual-reopen", 50, "resume");
+      fixtures.push(f);
+      const clock = vi.spyOn(Date, "now").mockReturnValue((f.runtime as any).rateLimitUntil + 1);
+      const manual = f.runtime.handleTgConnect(f.ctx);
+      try {
+        await vi.waitFor(() => expect(attempts).toBe(2));
+        expect(f.runtime.getIsReconnecting()).toBe(true);
+        f.runtime.updateStatusBar();
+        await f.runtime.handleTgConnect(f.ctx);
+        expect(attempts).toBe(2);
+        release();
+        await manual;
+        expect((f.runtime as any).rateLimitReopenTarget).toBeNull();
+        expect(f.runtime.getIsReconnecting()).toBe(false);
+      } finally { release?.(); await manual; clock.mockRestore(); }
+    });
+
+    it.each(["disconnect", "shutdown"])("does not retry a rate-limited reopen after %s", async action => {
+      const originalFetch = globalThis.fetch;
+      let attempts = 0;
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).endsWith("/reopenForumTopic")) return originalFetch(input, init);
+        attempts++;
+        return new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 1 } }), { status: 429 });
+      });
+      const f = await runtimeFixture(dir, "cancelled", 50, "resume");
+      fixtures.push(f);
+      if (action === "shutdown") await f.runtime.onSessionShutdown({ reason: "reload" }, f.ctx);
+      else f.runtime.handleTgDisconnect(f.ctx);
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      expect(attempts).toBe(1);
+      expect((f.runtime as any).rateLimitReopenTarget).toBeNull();
+      expect(f.runtime.getIsReconnecting()).toBe(false);
+      expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", action === "shutdown" ? undefined : "tg: disconnected");
+    });
+
+    it.each(["complete", "disconnect", "shutdown"])("serializes an automatic reopen and fences it on %s", async action => {
+      const originalFetch = globalThis.fetch;
+      let attempts = 0;
+      let release!: () => void;
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).endsWith("/reopenForumTopic")) return originalFetch(input, init);
+        if (++attempts === 1) return new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 1 } }), { status: 429 });
+        return new Promise<Response>((resolve, reject) => {
+          release = () => resolve(new Response(JSON.stringify({ ok: true, result: true })));
+          init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true });
+        });
+      });
+      const f = await runtimeFixture(dir, "pending", 50, "resume");
+      fixtures.push(f);
+      try {
+        await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 3000 });
+        expect(f.runtime.getIsReconnecting()).toBe(true);
+        await expect(f.runtime.handleInboundText("too early", f.ctx)).resolves.toMatchObject({ accepted: false, busy: true });
+        for (let i = 0; i < 3; i++) f.runtime.updateStatusBar();
+        await f.runtime.handleTgConnect(f.ctx);
+        expect(attempts).toBe(2);
+        const pending = (f.runtime as any).rateLimitReopenTask;
+        if (action === "disconnect") f.runtime.handleTgDisconnect(f.ctx);
+        if (action === "shutdown") await f.runtime.onSessionShutdown({ reason: "reload" }, f.ctx);
+        release();
+        await pending;
+        await vi.waitFor(() => expect(f.runtime.getIsReconnecting()).toBe(false));
+        expect(attempts).toBe(2);
+        expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", action === "complete" ? "tg: connected (ending)" : action === "disconnect" ? "tg: disconnected" : undefined);
+      } finally { release?.(); }
     });
 
     it("reports a reopen failure and retries it through tg-connect", async () => {

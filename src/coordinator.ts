@@ -48,6 +48,7 @@ export class LeaderCoordinator {
   private offset?: number;
   private botUsername?: string;
   private inputModeRevision = 0;
+  private rateLimitTimer?: NodeJS.Timeout;
   private status: TransportStatus = { polling: "starting" };
   public readonly feedback: BoundedOutbox;
   private pollController: AbortController | null = null;
@@ -63,6 +64,7 @@ export class LeaderCoordinator {
 
   constructor(private config: MuxConfig, private readonly agentDir: string, client?: TelegramClient, private readonly options: CoordinatorOptions = {}) {
     this.client = client ?? new TelegramClient({ botToken: config.botToken });
+    this.client.onRateLimit = until => this.pauseForRateLimit(until);
     this.inputModeRevision = config.inputModeRevision ?? 0;
     this.configuration = configFingerprint(config);
     this.feedback = new BoundedOutbox(error => this.publishStatus({ ...this.status, feedbackError: this.describeError(error) }));
@@ -73,6 +75,30 @@ export class LeaderCoordinator {
   public isConflict(): boolean { return this.status.polling === "conflict"; }
   // Poll failure does not release the Leader lock or IPC listener.
   public isRunning(): boolean { return this.running; }
+  public isReloading(): boolean { return this.reloading !== null; }
+
+  private pauseForRateLimit(until: number): void {
+    if (!this.running) return;
+    clearTimeout(this.rateLimitTimer);
+    // Discard obsolete feedback; never replay a rejected send after cooling down.
+    if (!this.feedback.error || (this.feedback.error as { code?: string }).code === "TELEGRAM_HTTP_429") this.feedback.reset();
+    this.publishStatus({ ...this.status, rateLimitUntil: until });
+    this.rateLimitTimer = setTimeout(() => {
+      this.rateLimitTimer = undefined;
+      if (!this.running) return;
+      if (this.client.isRateLimited()) {
+        this.pauseForRateLimit(Date.now() + this.client.getRemainingPauseMs());
+        return;
+      }
+      if ((this.feedback.error as { code?: string } | null)?.code === "TELEGRAM_HTTP_429") this.feedback.reset();
+      const status = { ...this.status, rateLimitUntil: undefined };
+      for (const key of ["error", "feedbackError", "commandMenuError", "interactionError"] as const) {
+        if (status[key]?.code === "TELEGRAM_HTTP_429") delete status[key];
+      }
+      this.publishStatus(status);
+    }, Math.min(2_147_483_647, Math.max(1, until - Date.now())));
+    this.rateLimitTimer.unref();
+  }
 
   private describeError(error: unknown): { code: string; message: string } {
     const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "MUX_OPERATION_FAILED";
@@ -336,7 +362,10 @@ export class LeaderCoordinator {
         } catch (err) {
           // RPC boundary: report the failure unless a prior reset frame already
           // cancelled this connection's work and its response stream is closing.
-          if (!socket.destroyed && !socket.writableEnded) socket.write(encodeFrame({ type: "call_telegram_ack", callId: msg.callId, ok: false, error: err instanceof Error ? err.message : "IPC request failed" }));
+          if (!socket.destroyed && !socket.writableEnded) {
+            const failure = this.describeError(err);
+            socket.write(encodeFrame({ type: "call_telegram_ack", callId: msg.callId, ok: false, error: failure.message, code: failure.code, retryAfter: err instanceof TelegramApiError ? err.retryAfter : undefined }));
+          }
         }
       } else throw new Error("Unexpected IPC message");
     } finally {
@@ -404,7 +433,7 @@ export class LeaderCoordinator {
   private startPolling(): void {
     const controller = new AbortController();
     this.pollController = controller;
-    this.publishStatus({ polling: "starting" });
+    this.publishStatus({ polling: "starting", rateLimitUntil: this.status.rateLimitUntil });
     this.pollingTask = this.poll(controller.signal).catch(error => {
       // Poll supervisor boundary: shutdown/reload cancellation is expected. Every
       // other failure becomes a persistent, broadcast error state; no silent retry.
@@ -557,21 +586,9 @@ export class LeaderCoordinator {
   }
 
   private async deliverFeedback<T>(client: TelegramClient, signal: AbortSignal, route: RouteEntry, generation: number, send: () => Promise<T>): Promise<T | undefined> {
-    for (;;) {
-      signal.throwIfAborted();
-      const pauseMs = client.getRemainingPauseMs();
-      if (pauseMs > 0) await delay(pauseMs, undefined, { signal });
-      signal.throwIfAborted();
-      if (!this.running || this.reloading || this.client !== client || this.routes.get(route.threadId) !== route || route.generation !== generation) return undefined;
-      try {
-        return await send();
-      } catch (error) {
-        // Retry only a single, definitively rejected request, never the settings action or
-        // a whole multi-request job. The job boundary reports ambiguous failures without replay.
-        if (!(error instanceof RateLimitError)) throw error;
-        await delay(Math.max(1, error.retryAfter ?? 1) * 1000, undefined, { signal });
-      }
-    }
+    signal.throwIfAborted();
+    if (!this.running || this.reloading || this.client !== client || this.routes.get(route.threadId) !== route || route.generation !== generation || client.isRateLimited()) return undefined;
+    return send();
   }
 
   public getInputMode(): BusyInputMode {
@@ -695,7 +712,7 @@ export class LeaderCoordinator {
       }
       this.pollController?.abort();
       this.feedback.reset();
-      this.client.abortAll();
+      this.client.abortAll("reload");
       this.settlePending();
       await this.pollingTask;
       if (!this.running) throw new Error("Coordinator stopped during configuration update");
@@ -708,7 +725,8 @@ export class LeaderCoordinator {
         state.registration = undefined;
         if (socket !== requester) this.resetFollowerConnection(socket, state);
       }
-      if (this.config.botToken !== config.botToken) this.offset = undefined;
+      const sameToken = this.config.botToken === config.botToken;
+      if (!sameToken) this.offset = undefined;
       // A mode save can finish while the old poller drains. For the same
       // connection, retain that newer commit instead of reinstalling the snapshot.
       if (configFingerprint(this.config, "connection") === configFingerprint(config, "connection") &&
@@ -719,7 +737,14 @@ export class LeaderCoordinator {
       this.config = config;
       this.inputModeRevision = config.inputModeRevision ?? 0;
       this.configuration = configFingerprint(config);
+      clearTimeout(this.rateLimitTimer);
+      this.rateLimitTimer = undefined;
+      const remainingPause = this.client.getRemainingPauseMs();
+      this.client.onRateLimit = undefined;
       this.client = client;
+      this.client.onRateLimit = until => this.pauseForRateLimit(until);
+      if (sameToken && remainingPause > 0) this.client.recordRateLimit(remainingPause / 1000);
+      else this.status = { ...this.status, rateLimitUntil: undefined };
       this.botUsername = undefined;
       await this.options.onConfigChange?.(config);
       this.startPolling();
@@ -730,6 +755,9 @@ export class LeaderCoordinator {
   public stop(): Promise<void> {
     if (this.stopping) return this.stopping;
     this.running = false;
+    clearTimeout(this.rateLimitTimer);
+    this.rateLimitTimer = undefined;
+    this.client.onRateLimit = undefined;
     this.pollController?.abort();
     this.feedback.reset();
     this.client.abortAll();

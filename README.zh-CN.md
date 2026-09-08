@@ -120,6 +120,7 @@ pi -e /path/to/pi-telegram-mux/extensions/index.ts
 | `tg: connected (…)` | 当前会话已连接话题 |
 | `tg: disconnected` | 已手动断开同步 |
 | `tg: offline` / `tg: reconnecting` | 离线或正在重连 |
+| `tg: 429 · …` | 共享限流冷却；期间输出丢弃不补发，到期自动恢复同步 |
 | `tg: conflict (409)` | 其他程序正在使用同一个 Bot 接收消息 |
 | `tg: error` | 连接或同步异常，运行 `/tg-status` 查看原因 |
 

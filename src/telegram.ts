@@ -12,6 +12,8 @@ import type {
 const DEFAULT_API_BASE = "https://api.telegram.org";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024; // 5MB
+const RELOAD_ABORT = Symbol("Telegram configuration reload");
+const REQUEST_TIMEOUT = Symbol("Telegram request timeout");
 
 export class TelegramApiError extends Error {
   readonly code: string;
@@ -70,10 +72,11 @@ export class TelegramClient {
   private readonly apiBase: string;
   private readonly defaultTimeoutMs: number;
   private pauseUntilMs = 0;
+  public onRateLimit?: (until: number) => void;
   private readonly requests = new Set<AbortController>();
 
-  public abortAll(): void {
-    for (const controller of this.requests) controller.abort();
+  public abortAll(reason?: "reload"): void {
+    for (const controller of this.requests) controller.abort(reason === "reload" ? RELOAD_ABORT : undefined);
   }
 
   constructor(options: TelegramClientOptions) {
@@ -112,6 +115,7 @@ export class TelegramClient {
   public recordRateLimit(retryAfterSeconds: number): void {
     const deadline = Date.now() + Math.max(1, retryAfterSeconds) * 1000;
     this.pauseUntilMs = Math.max(this.pauseUntilMs, deadline);
+    this.onRateLimit?.(this.pauseUntilMs);
   }
 
   /**
@@ -134,8 +138,8 @@ export class TelegramClient {
 
     const controller = new AbortController();
     this.requests.add(controller);
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeout);
+    const requestSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal;
+    const timer = setTimeout(() => controller.abort(REQUEST_TIMEOUT), timeout);
 
     try {
       const response = await fetch(url, {
@@ -145,7 +149,7 @@ export class TelegramClient {
           Accept: "application/json",
         },
         body: params ? JSON.stringify(params) : undefined,
-        signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
+        signal: requestSignal,
         redirect: "error",
       });
 
@@ -205,7 +209,10 @@ export class TelegramClient {
       // message text. Unclassified errors remain fatal to the polling supervisor.
       const failure = err as { code?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
       const identifier = failure?.cause?.code ?? failure?.code;
-      const code = timedOut ? "TELEGRAM_TIMEOUT" : controller.signal.aborted || signal?.aborted ? "TELEGRAM_ABORTED"
+      // The combined signal retains the first cancellation cause, even if another
+      // cancellation source fires before fetch finishes unwinding.
+      const timedOut = requestSignal.aborted && requestSignal.reason === REQUEST_TIMEOUT;
+      const code = timedOut ? "TELEGRAM_TIMEOUT" : requestSignal.aborted ? requestSignal.reason === RELOAD_ABORT ? "TELEGRAM_RELOADING" : "TELEGRAM_ABORTED"
         : typeof identifier === "string" ? identifier : "TELEGRAM_REQUEST_FAILED";
       let detail: string;
       if (timedOut) {
@@ -220,12 +227,14 @@ export class TelegramClient {
         detail = "network unreachable";
       } else if (code === "TELEGRAM_ABORTED") {
         detail = "request aborted";
+      } else if (code === "TELEGRAM_RELOADING") {
+        detail = "request cancelled for configuration reload";
       } else {
         const raw = typeof failure?.cause?.message === "string" ? failure.cause.message
           : err instanceof Error ? err.message : String(err);
         detail = this.redact(raw);
       }
-      const message = timedOut || code === "ECONNRESET" || code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "TELEGRAM_ABORTED"
+      const message = timedOut || code === "ECONNRESET" || code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "TELEGRAM_ABORTED" || code === "TELEGRAM_RELOADING"
         ? `Telegram ${detail} (${method})`
         : `Telegram request failed (${method}): ${detail}`;
       throw new TelegramRequestError(code, message, err);

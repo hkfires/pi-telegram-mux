@@ -8,6 +8,7 @@ import { LeaderCoordinator } from "../src/coordinator.js";
 import * as configModule from "../src/config.js";
 import { encodeFrame, FrameParser, IpcFollowerClient, tryAcquireLeaderLock } from "../src/ipc.js";
 import { IPC_PROTOCOL_VERSION, type IpcMessage, type OutputTarget } from "../src/types.js";
+import { RateLimitError, TelegramApiError } from "../src/telegram.js";
 import { testConfig, telegramUpdate } from "./helpers.js";
 
 const target: OutputTarget = { sessionId: "session", threadId: 50, generation: 1 };
@@ -95,6 +96,39 @@ describe("IPC protocol regressions", () => {
     await expect(coordinator.callTelegram(method, params, "owner", target)).rejects.toThrow("fenced");
     expect(api).not.toHaveBeenCalled();
     await expect(owner.callTelegram(method, params, target)).resolves.toBe(true);
+  });
+
+  it.each([new RateLimitError(2), new TelegramApiError("Forbidden", 403)])("preserves RPC error metadata for %s", async error => {
+    const f = await connect();
+    await f.register({ runtimeId: "follower", ...target });
+    vi.spyOn(coordinator, "callTelegram").mockRejectedValueOnce(error);
+    await expect(f.callTelegram("sendMessage", { text: "test" }, target)).rejects.toMatchObject({
+      message: error.message, code: error.code, ...(error.retryAfter === undefined ? {} : { retryAfter: error.retryAfter }),
+    });
+    expect(f.isConnected()).toBe(true);
+  });
+
+  it.each([
+    { error: "Legacy rejection" },
+    { error: "Bad code", code: 429 },
+    { error: "Bad delay", code: "TELEGRAM_HTTP_429", retryAfter: -1 },
+    { error: "Fractional delay", code: "TELEGRAM_HTTP_429", retryAfter: 1.5 },
+  ])("handles legacy or malformed RPC error metadata: $error", async payload => {
+    const f = await connect();
+    await f.register({ runtimeId: "follower", ...target });
+    const handle = (coordinator as any).handleFrame.bind(coordinator);
+    vi.spyOn(coordinator as any, "handleFrame").mockImplementation(async (socket: any, state: any, msg: any) => {
+      if (msg.type !== "call_telegram") return handle(socket, state, msg);
+      socket.write(encodeFrame({ type: "call_telegram_ack", callId: msg.callId, ok: false, ...payload } as any));
+    });
+    const request = f.callTelegram("sendMessage", { text: "test" }, target);
+    if (!("code" in payload)) {
+      await expect(request).rejects.toThrow("Legacy rejection");
+      expect(f.isConnected()).toBe(true);
+    } else {
+      await expect(request).rejects.toThrow();
+      expect(f.getStatus().error?.code).toBe("IPC_PROTOCOL_ERROR");
+    }
   });
 
   it("parses a fragmented ACK exactly once and continues to the next update", async () => {

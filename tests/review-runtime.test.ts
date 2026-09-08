@@ -494,7 +494,8 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     f.runtime.onMessageStart({ role: "user", content: "prompt" }, f.ctx);
     f.runtime.onMessageEnd({ role: "assistant", content: "answer", stopReason: "stop" });
     await f.runtime.onAgentSettled(f.ctx);
-    await vi.waitFor(() => expect(texts).toHaveLength(1));
+    // Initial delivery includes starting the Markdown worker, before FIFO assertions.
+    await vi.waitFor(() => expect(texts).toHaveLength(1), { timeout: 5000 });
     const queued = f.runtime.outbox.size;
     await f.runtime.handleTgConnect(f.ctx);
     expect(signal?.aborted).toBe(false);
@@ -563,7 +564,8 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     const prompt = "x".repeat(5000);
     await f.runtime.onBeforeAgentStart({ prompt }, f.ctx);
     f.runtime.onMessageStart({ role: "user", content: prompt }, f.ctx);
-    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1));
+    // Match other first-render waits; the cancellation checks start at the send gate.
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1), { timeout: 5000 });
     let cancelDialog!: () => void;
     f.ui.input.mockReturnValueOnce(new Promise(resolve => { cancelDialog = () => resolve(undefined); }));
     f.ui.select.mockResolvedValueOnce("Connection settings");

@@ -121,6 +121,8 @@ export class MuxRuntime {
   private currentThreadId: number | null = null;
   private registeredTarget: OutputTarget | null = null;
   private topicNeedsReopen = false;
+  private rateLimitReopenTarget: { sessionId: string; threadId: number; botToken: string; chatId: number } | null = null;
+  private rateLimitReopenTask: Promise<boolean> | null = null;
   private lastValidThreadId: number | null = null;
   private isLeader = false;
   private isReconnecting = false;
@@ -133,6 +135,8 @@ export class MuxRuntime {
   private setupTask: Promise<void> | null = null;
   private reconnectTimer?: NodeJS.Timeout;
   private lastConnectionError = "";
+  private rateLimitUntil = 0;
+  private rateLimitTimer?: NodeJS.Timeout;
   private lastTransportError = "";
   private lastCommandMenuError = "";
   private lastInteractionError = "";
@@ -155,6 +159,13 @@ export class MuxRuntime {
 
   constructor(private readonly pi: ExtensionAPI, private readonly agentDir: string) {
     this.outbox = new BoundedOutbox(error => {
+      const failure = error as Error & { code?: string; retryAfter?: number };
+      // An RPC rejection may arrive without a cooldown broadcast (for example
+      // while joining during reload). Keep recovery bounded by its retry_after.
+      if (failure.code === "TELEGRAM_HTTP_429" && Number.isSafeInteger(failure.retryAfter) && failure.retryAfter! > 0) {
+        if (this.rateLimitUntil <= Date.now()) this.rateLimitUntil = Date.now() + failure.retryAfter! * 1000;
+        if (this.currentRun) this.currentRun.suppressed = true;
+      }
       this.activeCtx?.ui?.notify(`Telegram sync paused: ${error.message}`, "error");
       this.updateStatusBar();
     });
@@ -169,13 +180,60 @@ export class MuxRuntime {
     return Boolean(ctx && pendingModelChanges.has(JSON.stringify([this.agentDir, ctx.sessionManager.getSessionId()])));
   }
   public getIsLeader(): boolean { return this.isLeader; }
-  public getIsReconnecting(): boolean { return this.isReconnecting || this.recovering; }
+  public getIsReconnecting(): boolean {
+    return this.isReconnecting || this.recovering || this.rateLimitReopenTask !== null ||
+      (this.rateLimitReopenTarget !== null && this.rateLimitUntil <= Date.now() && this.hasActiveTransport());
+  }
   public getGeneration(): number { return this.generation; }
   public hasActiveTransport(): boolean { return Boolean(this.coordinator?.isRunning() || this.followerClient?.isConnected()); }
 
   public updateStatusBar(explicitCtx?: ExtensionContext): void {
     const ctx = explicitCtx ?? this.activeCtx;
+    const pendingReopen = this.rateLimitReopenTarget;
+    if (pendingReopen && (this.bindingState !== "bound" || pendingReopen.sessionId !== ctx?.sessionManager.getSessionId() ||
+        pendingReopen.threadId !== this.currentThreadId || pendingReopen.botToken !== this.config?.botToken || pendingReopen.chatId !== this.config?.chatId)) {
+      this.rateLimitReopenTarget = null;
+    }
+    const until = (this.coordinator?.getStatus() ?? this.followerClient?.getStatus())?.rateLimitUntil ?? 0;
+    if (until > Date.now() && until !== this.rateLimitUntil) {
+      this.rateLimitUntil = until;
+      if (this.currentRun) this.currentRun.suppressed = true;
+      // Failed and pending output is dropped, not replayed after the cooldown.
+      if (!this.outbox.error || (this.outbox.error as { code?: string }).code === "TELEGRAM_HTTP_429") this.outbox.reset();
+    }
+    clearTimeout(this.rateLimitTimer);
+    this.rateLimitTimer = undefined;
+    const remaining = Math.max(0, this.rateLimitUntil - Date.now());
+    if (this.active && remaining > 0) {
+      this.rateLimitTimer = setTimeout(() => this.updateStatusBar(), Math.min(1000, remaining));
+      this.rateLimitTimer.unref();
+    } else if (this.rateLimitUntil) {
+      this.rateLimitUntil = 0;
+      if ((this.outbox.error as { code?: string } | null)?.code === "TELEGRAM_HTTP_429") this.outbox.reset();
+    }
+    if (this.active && ctx && remaining === 0 && !this.configuring && !this.recovering && !this.setupTask && !this.rateLimitReopenTask &&
+        this.bindingState === "bound" && this.topicNeedsReopen && this.registeredTarget && this.isTargetCurrent(this.registeredTarget, ctx) &&
+        this.hasActiveTransport() && !this.coordinator?.isReloading() && this.rateLimitReopenTarget) {
+      const version = this.transportVersion;
+      const generation = this.generation;
+      const reopening = this.reopenTopic(ctx).catch(error => {
+        if (this.active && version === this.transportVersion && generation === this.generation) {
+          this.rateLimitReopenTarget = null;
+          this.connectionFailed(error, ctx);
+        }
+        return false;
+      }).finally(() => {
+        if (this.rateLimitReopenTask !== reopening) return;
+        this.rateLimitReopenTask = null;
+        if (this.active) this.updateStatusBar();
+      });
+      this.rateLimitReopenTask = reopening;
+    }
     if (typeof ctx?.ui?.setStatus !== "function") return;
+    if (remaining > 0) {
+      ctx.ui.setStatus(TG_STATUS_KEY, formatStatus(`tg: 429 · ${Math.ceil(remaining / 1000)}s`, "muted", ctx.ui.theme));
+      return;
+    }
     const sessionId = ctx.sessionManager?.getSessionId?.();
     const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
     const menuNotice = status?.commandMenuError ? formatTransportNotice(status.commandMenuError) : "";
@@ -202,11 +260,18 @@ export class MuxRuntime {
   }
 
   public clearStatusBar(explicitCtx?: ExtensionContext): void {
+    clearTimeout(this.rateLimitTimer);
+    this.rateLimitTimer = undefined;
     const ctx = explicitCtx ?? this.activeCtx;
     ctx?.ui?.setStatus?.(TG_STATUS_KEY, undefined);
   }
 
   private applyConfig(config: MuxConfig, ctx: ExtensionContext): void {
+    if (this.config?.botToken !== config.botToken) {
+      this.rateLimitUntil = 0;
+      clearTimeout(this.rateLimitTimer);
+      this.rateLimitTimer = undefined;
+    }
     this.invalidateRun();
     this.config = config;
     this.inputModeRevision = config.inputModeRevision ?? 0;
@@ -403,6 +468,7 @@ export class MuxRuntime {
 
   private async stopTransport(): Promise<void> {
     this.transportVersion++;
+    this.rateLimitReopenTask = null;
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     this.followerClient?.close();
@@ -471,6 +537,7 @@ export class MuxRuntime {
   }
 
   public async handleInboundText(text: string, ctx: ExtensionContext, messageId?: number, explicitMode?: BusyInputMode): Promise<InboundResult> {
+    if (this.rateLimitUntil > Date.now()) return { accepted: false, busy: true };
     if (!this.active || this.configuring || this.getIsReconnecting() || this.bindingState !== "bound") return Promise.resolve({ accepted: false, busy: true });
     if (this.outbox.error) return Promise.resolve({ accepted: false, busy: false, statusReply: "Telegram sync is paused. Please check errors on your computer and run /tg-connect to retry." });
     const trimmed = text.trim();
@@ -801,12 +868,11 @@ export class MuxRuntime {
     }
     const config = await loadConfig(this.agentDir);
     if (!this.active || version !== this.transportVersion) return;
-    this.config = config;
-    if (this.config) {
-      this.applyConfig(this.config, ctx);
+    if (config) {
+      this.applyConfig(config, ctx);
       try { await this.setupTransport(ctx); }
       catch (error) { this.connectionFailed(error, ctx); }
-    }
+    } else this.config = null;
     if (this.active && version === this.transportVersion) {
       this.updateStatusBar(ctx);
       if (this.bindingState === "bound" && (event?.reason === "startup" || event?.reason === "resume" || event?.reason === "reload")) {
@@ -830,6 +896,11 @@ export class MuxRuntime {
       await this.callTelegram("reopenForumTopic", { chat_id: config.chatId, message_thread_id: target.threadId }, target, controller.signal);
     } catch (error) {
       if (!this.isTargetCurrent(target, ctx) || version !== this.transportVersion) return false;
+      if ((error as { code?: string } | null)?.code === "TELEGRAM_RELOADING" && this.rateLimitReopenTarget) {
+        // Reload cancels this request, not the pending operation. Its stable
+        // ownership is checked again before retrying after the transport is ready.
+        return false;
+      }
       // Match the specific Telegram response, whose text is also preserved over IPC.
       if (error instanceof Error && /^(?:Bad Request: )?(?:TOPIC_ID_INVALID|message thread not found)$/i.test(error.message)) {
         if (appendBindingEntry(this.pi, ctx, config.chatId, null, "topic-missing")) {
@@ -839,6 +910,7 @@ export class MuxRuntime {
           this.currentThreadId = null;
           this.lastValidThreadId = null;
           this.topicNeedsReopen = false;
+          this.rateLimitReopenTarget = null;
           this.connectionError = null;
           ctx.ui?.notify(TOPIC_MISSING_NOTICE, "warning");
           this.updateStatusBar(ctx);
@@ -849,6 +921,19 @@ export class MuxRuntime {
       // Telegram returns this error when the topic is already open, including through IPC.
       if (!(error instanceof Error && /^(?:Bad Request: )?TOPIC_NOT_MODIFIED$/i.test(error.message))) {
         this.connectionError = error instanceof Error ? error : new Error("Telegram topic reopen failed", { cause: error });
+        const failure = this.connectionError as Error & { code?: string; retryAfter?: number };
+        if (failure.code === "TELEGRAM_HTTP_429") {
+          // Reopening is idempotent. Keep the pending operation until its cooldown
+          // expires, including when only an IPC rejection supplied retry_after.
+          const retryAfter = Number.isSafeInteger(failure.retryAfter) && failure.retryAfter! > 0 ? failure.retryAfter! : 5;
+          // Configuration reloads can clear diagnostics and change route generations
+          // without completing this operation. Retain its stable ownership separately.
+          this.rateLimitReopenTarget = { sessionId: target.sessionId, threadId: target.threadId, botToken: config.botToken, chatId: config.chatId };
+          this.rateLimitUntil = Math.max(this.rateLimitUntil, Date.now() + retryAfter * 1000);
+          this.updateStatusBar(ctx);
+          return false;
+        }
+        this.rateLimitReopenTarget = null;
         ctx.ui?.notify(`Telegram topic reopen failed: ${this.connectionError.message}; please check and run /tg-connect to retry.`, "error");
         this.updateStatusBar(ctx);
         return false;
@@ -858,6 +943,7 @@ export class MuxRuntime {
     }
     if (!this.isTargetCurrent(target, ctx) || version !== this.transportVersion) return false;
     this.topicNeedsReopen = false;
+    this.rateLimitReopenTarget = null;
     this.connectionError = null;
     this.updateStatusBar(ctx);
     return true;
@@ -890,7 +976,7 @@ export class MuxRuntime {
     const run: MirrorRun = {
       sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, ctx,
       target: null, origin: origin?.consumed ? undefined : origin, promptMessageIds,
-      suppressed: this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
+      suppressed: this.rateLimitUntil > Date.now() || this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
       firstUserMessage: true, text: "", settled, settle,
     };
     this.currentRun = run;
@@ -1126,6 +1212,7 @@ export class MuxRuntime {
 
   private invalidateRun(): void {
     this.generation++;
+    this.rateLimitReopenTask = null;
     this.currentRun?.settle();
     this.currentRun = null;
     this.queuedInputs.clear();
@@ -1241,6 +1328,7 @@ export class MuxRuntime {
     const cleanup = this.cleanupRunReactions();
     // Fence inputs and cancel queued output synchronously, retaining the last acknowledged route only for closure.
     this.active = false;
+    this.rateLimitReopenTarget = null;
     this.invalidateRun();
     // Do not await an uncancellable provider/model-select hook here. The process-wide
     // barrier fences input and session replacement after reload until it really settles.
@@ -1283,12 +1371,13 @@ export class MuxRuntime {
     if (ctx.mode !== "tui" || !this.active) return;
     this.activeCtx = ctx;
     if (!this.config) { ctx.ui?.notify("Please run /tg-setup first.", "warning"); return; }
-    if (this.configuring || this.recovering || this.createInFlight) { ctx.ui?.notify("Telegram configuration, connection, or topic creation is in progress. Please try again later.", "warning"); return; }
+    if (this.rateLimitUntil > Date.now()) { this.updateStatusBar(ctx); return; }
+    if (this.configuring || this.recovering || this.rateLimitReopenTask || this.createInFlight) { ctx.ui?.notify("Telegram configuration, connection, or topic creation is in progress. Please try again later.", "warning"); return; }
     try {
       const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
       // Keep new runs out of the old transport for the entire recovery command,
       // including the interval after stopTransport clears its reconnect timer state.
-      this.recovering = Boolean(this.outbox.error || status?.error || status?.feedbackError || !this.hasActiveTransport());
+      this.recovering = Boolean(this.outbox.error || status?.error || status?.feedbackError || this.rateLimitReopenTarget || !this.hasActiveTransport());
       if (this.recovering) this.updateStatusBar(ctx);
       if (this.outbox.error || status?.error || status?.feedbackError) {
         // Reset the failed dependency chain, including unfinished Pi runs, before
@@ -1354,6 +1443,7 @@ export class MuxRuntime {
     this.unregisterRoute(ctx);
     this.bindingState = "disconnected";
     this.currentThreadId = null;
+    if (this.topicNeedsReopen && (this.connectionError as { code?: string } | null)?.code === "TELEGRAM_HTTP_429") this.connectionError = null;
     this.updateStatusBar(ctx);
     ctx.ui?.notify("Disconnected from Telegram topic.", "info");
   }

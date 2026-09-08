@@ -65,6 +65,7 @@ export interface InboundResult {
 }
 
 export interface TransportStatus {
+  rateLimitUntil?: number;
   polling: "starting" | "online" | "retrying" | "error" | "conflict";
   error?: { code: string; message: string };
   feedbackError?: { code: string; message: string };
@@ -179,6 +180,6 @@ export type IpcMessage =
   | { type: "reload_config"; callId: string }
   | { type: "call_telegram"; callId: string; method: string; params: Record<string, unknown>; target?: OutputTarget }
   | { type: "cancel_telegram"; callId: string }
-  | { type: "call_telegram_ack"; callId: string; ok: boolean; result?: unknown; error?: string; retryAfter?: number }
+  | { type: "call_telegram_ack"; callId: string; ok: boolean; result?: unknown; error?: string; code?: string; retryAfter?: number }
   | { type: "ping" }
   | { type: "pong" };
