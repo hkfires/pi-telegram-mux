@@ -312,12 +312,12 @@ describe("Telegram session settings commands", () => {
     expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("PI_MODEL_AUTH_UNAVAILABLE"), "error");
     expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("PI_MODEL_CHANGE_FAILED"), "error");
     f.runtime.handleTgStatus(f.ctx);
-    expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Settings error: PI_MODEL_CHANGE_FAILED"), "info");
+    expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Settings Error: PI_MODEL_CHANGE_FAILED"), "info");
     expect(JSON.stringify(f.ui.notify.mock.calls)).not.toContain("SECRET_TOKEN");
     expect(f.runtime.getIsIdle()).toBe(true);
     await f.runtime.handleInboundText("/model other/two", f.ctx);
     f.runtime.handleTgStatus(f.ctx);
-    expect(f.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Settings error: none"), "info");
+    expect(f.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Settings Error: None"), "info");
   });
 
   it("records credential-safe diagnostics when a model change fails after the Telegram deadline", async () => {
@@ -1222,11 +1222,6 @@ describe("Telegram session settings commands", () => {
   it("allows /inputmode command while Pi is busy", async () => {
     const f = await fixture();
     vi.mocked(f.ctx.isIdle).mockReturnValue(false);
-    expect((await f.runtime.handleInboundText("/thinking high", f.ctx)).busy).toBe(false);
-    expect(f.settings.setThinkingLevel).toHaveBeenCalledWith("high");
-    expect((await f.runtime.handleInboundText("/model other/two", f.ctx)).busy).toBe(false);
-    expect(f.settings.setModel).toHaveBeenCalledWith(f.models[1]);
-
     const result = await f.runtime.handleInboundText("/inputmode", f.ctx);
     expect(result.busy).toBe(false);
     expect(result.statusReply).toContain("Busy input mode");
@@ -1661,7 +1656,29 @@ describe("Telegram session settings commands", () => {
     expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("preserves active-run prompt mirroring and reply delivery after changing input mode while busy", async () => {
+  it.each([
+    {
+      name: "input mode",
+      apply: async (f: Awaited<ReturnType<typeof fixture>>) => {
+        const modeChange = await f.runtime.handleInboundText("/inputmode steer", f.ctx);
+        expect(modeChange.statusReply).toContain("Steering");
+      },
+      expectedAnswer: "answer after mode change",
+    },
+    {
+      name: "model and thinking",
+      apply: async (f: Awaited<ReturnType<typeof fixture>>) => {
+        const thinkingChange = await f.runtime.handleInboundText("/thinking high", f.ctx);
+        expect(thinkingChange.busy).toBe(false);
+        expect(f.settings.setThinkingLevel).toHaveBeenCalledWith("high");
+
+        const modelChange = await f.runtime.handleInboundText("/model other/two", f.ctx);
+        expect(modelChange.busy).toBe(false);
+        expect(f.settings.setModel).toHaveBeenCalledWith(f.models[1]);
+      },
+      expectedAnswer: "answer after model change",
+    },
+  ])("preserves active-run prompt mirroring and reply delivery after changing $name while busy", async ({ apply, expectedAnswer }) => {
     const f = await fixture();
     const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
     vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (method, params) => {
@@ -1672,17 +1689,14 @@ describe("Telegram session settings commands", () => {
     f.runtime.onMessageStart({ role: "user", content: "active task" }, f.ctx);
     await f.runtime.outbox.whenIdle();
 
-    // Mode is changed mid-run
-    const modeChange = await f.runtime.handleInboundText("/inputmode steer", f.ctx);
-    expect(modeChange.statusReply).toContain("Steering");
+    await apply(f);
 
-    // Next turn completes
-    f.runtime.onTurnEnd({ role: "assistant", content: "answer after mode change", stopReason: "stop" });
+    f.runtime.onTurnEnd({ role: "assistant", content: expectedAnswer, stopReason: "stop" });
     await f.runtime.onAgentSettled(f.ctx);
     await f.runtime.outbox.whenIdle();
 
     const sentTexts = calls.filter(c => c.method === "sendMessage").map(c => c.params.text);
-    expect(sentTexts).toContain("answer after mode change");
+    expect(sentTexts).toContain(expectedAnswer);
   });
 
   it.each([
@@ -2016,34 +2030,5 @@ describe("Telegram session settings commands", () => {
       const checkFollower = await follower.runtime.handleInboundText("/inputmode", follower.ctx);
       expect(checkFollower.statusReply).toContain("Follow-up");
     });
-  });
-
-  it("preserves active-run prompt mirroring and reply delivery after changing model and thinking while busy", async () => {
-    const f = await fixture();
-    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
-    vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (method, params) => {
-      calls.push({ method, params });
-      return { message_id: 888 } as any;
-    });
-    await f.runtime.onBeforeAgentStart({ prompt: "active task" }, f.ctx);
-    f.runtime.onMessageStart({ role: "user", content: "active task" }, f.ctx);
-    await f.runtime.outbox.whenIdle();
-
-    // Model and thinking changed mid-run
-    const thinkingChange = await f.runtime.handleInboundText("/thinking high", f.ctx);
-    expect(thinkingChange.busy).toBe(false);
-    expect(f.settings.setThinkingLevel).toHaveBeenCalledWith("high");
-
-    const modelChange = await f.runtime.handleInboundText("/model other/two", f.ctx);
-    expect(modelChange.busy).toBe(false);
-    expect(f.settings.setModel).toHaveBeenCalledWith(f.models[1]);
-
-    // Next turn completes
-    f.runtime.onTurnEnd({ role: "assistant", content: "answer after model change", stopReason: "stop" });
-    await f.runtime.onAgentSettled(f.ctx);
-    await f.runtime.outbox.whenIdle();
-
-    const sentTexts = calls.filter(c => c.method === "sendMessage").map(c => c.params.text);
-    expect(sentTexts).toContain("answer after model change");
   });
 });

@@ -5,6 +5,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { getRuntimeDir, replaceFile } from "./config.js";
+import { getProcessIdentity } from "./process-identity.js";
 import { IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundResult, type IpcMessage, type LeaderLockData, type OutputTarget, type RuntimeRegistration, type TransportStatus } from "./types.js";
 
 const MAX_FRAME_BYTES = 1024 * 1024;
@@ -16,14 +17,18 @@ export class IpcError extends Error {
 
 /**
  * Lamport's bakery mutex for the short metadata transaction. An empty claim means
- * "choosing a ticket". Unique PID/nonce filenames allow dead-process reclamation
- * without ever deleting a successor's claim. Live claims NEVER expire: a paused
+ * "choosing a ticket". Start identities detect reused PIDs; unique claim filenames
+ * prevent reclamation from deleting a successor's claim. Live claims NEVER expire: a paused
  * process may delay election, but cannot resume into somebody else's critical section.
  */
 async function acquireElectionMutex(runtimeDir: string): Promise<() => Promise<void>> {
   const dir = path.join(runtimeDir, "election");
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const id = `${process.pid}-${crypto.randomUUID()}.json`;
+  const identity = await getProcessIdentity(process.pid);
+  // Include identity before publishing even an empty choosing claim. The hex
+  // component is still recognized as a contender by older bakery-lock readers.
+  const id = `${process.pid}-${identity ? `${identity}-` : ""}${crypto.randomUUID()}.json`;
+  const identities = new Map<string, Promise<string | undefined>>();
   const claim = path.join(dir, id);
   const temporary = `${claim}.tmp`;
   await fs.writeFile(claim, "", { flag: "wx", mode: 0o600 });
@@ -47,7 +52,20 @@ async function acquireElectionMutex(runtimeDir: string): Promise<() => Promise<v
         if (file === id || !/^\d+-[\da-f-]+\.json$/.test(file)) continue;
         const otherPath = path.join(dir, file);
         const pid = Number(file.slice(0, file.indexOf("-")));
-        if (!isProcessAlive(pid)) {
+        const ownerIdentity = /^\d+-([a-f\d]{64})-[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}\.json$/i.exec(file)?.[1];
+        let alive = isProcessAlive(pid);
+        if (alive && ownerIdentity) {
+          // Cache by claim, not PID: a replacement process may join while we wait.
+          let reading = identities.get(file);
+          if (!reading) {
+            reading = pid === process.pid ? Promise.resolve(identity) : getProcessIdentity(pid);
+            identities.set(file, reading);
+          }
+          const currentIdentity = await reading;
+          if (currentIdentity !== undefined && currentIdentity !== ownerIdentity) alive = false;
+        }
+        // Unknown identities and legacy live-PID claims remain protected.
+        if (!alive) {
           await fs.rm(otherPath, { force: true });
           await fs.rm(`${otherPath}.tmp`, { force: true });
           continue;

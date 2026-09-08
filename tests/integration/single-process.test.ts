@@ -9,6 +9,7 @@ import type { MuxConfig, TelegramForumTopic, TelegramMessage } from "../../src/t
 
 describe("Single Process Integration", () => {
   let tempDir: string;
+  const activeRuntimes: { runtime: MuxRuntime; ctx: any }[] = [];
   const mockConfig: MuxConfig = {
     version: 1,
     botToken: "token-single-process-test",
@@ -21,8 +22,49 @@ describe("Single Process Integration", () => {
     await saveConfig(tempDir, mockConfig);
   });
 
-  afterEach(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+  async function cleanup() {
+    const errors: unknown[] = [];
+    // Finish every teardown attempt, then fail the test with all original errors.
+    for (const { runtime, ctx } of activeRuntimes.splice(0).reverse()) {
+      try { await runtime.onSessionShutdown(ctx); }
+      catch (error) { errors.push(error); }
+    }
+    try { await fs.rm(tempDir, { recursive: true, force: true }); }
+    catch (error) { errors.push(error); }
+    if (errors.length > 0) throw new AggregateError(errors, "Single-process integration cleanup failed");
+  }
+
+  afterEach(cleanup);
+
+  function createRuntime(pi: any, ctx: any) {
+    const runtime = new MuxRuntime(pi, tempDir);
+    activeRuntimes.push({ runtime, ctx });
+    return runtime;
+  }
+
+  it("reports every shutdown failure after cleaning the remaining runtimes and directory", async () => {
+    const order: string[] = [];
+    const first = createRuntime({}, {});
+    const second = createRuntime({}, {});
+    const third = createRuntime({}, {});
+    const syncFailure = Object.assign(new Error("Shutdown failed"), { code: "TEST_SHUTDOWN_SYNC" });
+    const asyncFailure = Object.assign(new Error("Shutdown failed"), { code: "TEST_SHUTDOWN_ASYNC" });
+    vi.spyOn(first, "onSessionShutdown").mockImplementationOnce(async () => { order.push("first"); });
+    vi.spyOn(second, "onSessionShutdown").mockImplementationOnce(() => {
+      order.push("second");
+      throw syncFailure;
+    });
+    vi.spyOn(third, "onSessionShutdown").mockImplementationOnce(async () => {
+      order.push("third");
+      throw asyncFailure;
+    });
+
+    const cleaning = cleanup();
+    await expect(cleaning).rejects.toBeInstanceOf(AggregateError);
+    await expect(cleaning).rejects.toMatchObject({ errors: [asyncFailure, syncFailure] });
+    expect(order).toEqual(["third", "second", "first"]);
+    expect(activeRuntimes).toEqual([]);
+    await expect(fs.access(tempDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("completes full first-turn auto-binding flow", async () => {
@@ -48,7 +90,7 @@ describe("Single Process Integration", () => {
       },
     } as any;
 
-    const runtime = new MuxRuntime(mockPi, tempDir);
+    const runtime = createRuntime(mockPi, mockCtx);
 
     // 1. session_start on blank session
     await runtime.onSessionStart(mockCtx);
@@ -111,9 +153,6 @@ describe("Single Process Integration", () => {
     expect(sendCall).toBeDefined();
     expect(sendCall?.params.message_thread_id).toBe(301);
     expect(sendCall?.params.text).toBe("Hello from Pi! This is the first assistant output.");
-
-    // Clean up
-    await runtime.onSessionShutdown(mockCtx);
   });
 
   it("handles disconnect and reconnect", async () => {
@@ -139,7 +178,7 @@ describe("Single Process Integration", () => {
       },
     } as any;
 
-    const runtime = new MuxRuntime(mockPi, tempDir);
+    const runtime = createRuntime(mockPi, mockCtx);
 
     // Pre-bind session to thread 77
     sessionEntries.push({
@@ -166,8 +205,6 @@ describe("Single Process Integration", () => {
     await runtime.handleTgConnect(mockCtx);
     expect(runtime.getBindingState()).toBe("bound");
     expect(runtime.getCurrentThreadId()).toBe(77);
-
-    await runtime.onSessionShutdown(mockCtx);
   });
 
   it("creates the topic and mirrors admitted prompts on the background queue for a blank session", async () => {
@@ -191,7 +228,7 @@ describe("Single Process Integration", () => {
       ui: { notify: vi.fn() },
     } as any;
 
-    const runtime = new MuxRuntime(mockPi, tempDir);
+    const runtime = createRuntime(mockPi, mockCtx);
 
     const telegramCalls: { method: string; params: any }[] = [];
     vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params) => {
@@ -234,7 +271,5 @@ describe("Single Process Integration", () => {
     const assistantCalls = telegramCalls.filter((c) => c.method === "sendMessage");
     expect(assistantCalls.length).toBe(2);
     expect(assistantCalls[1].params.text).toBe("Reply to immediate start");
-
-    await runtime.onSessionShutdown(mockCtx);
   });
 });

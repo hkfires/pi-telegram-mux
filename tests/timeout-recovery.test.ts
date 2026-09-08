@@ -113,7 +113,7 @@ describe("transient Telegram failures across two runtimes", () => {
       expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", `tg: connected (${f.ctx.sessionManager.getSessionId().slice(-6)})`);
       expect(f.ui.setStatus).not.toHaveBeenCalledWith("tg", "tg: error");
       f.runtime.handleTgStatus(f.ctx);
-      expect(f.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Interaction warning: Telegram command feedback"), "info");
+      expect(f.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Menu / Reply Warning: Telegram command feedback"), "info");
     }
     expect(requests.map(request => request.message_thread_id)).toEqual([50, 51]);
     // Later independent feedback also works for the topic whose reply timed out.

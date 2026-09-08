@@ -25,11 +25,11 @@ it.each(["transformed", "config", "follow-up", "length-follow-up", "reconnect", 
     let stderr = "";
     const messages: unknown[] = [];
     const setupReplies = [
-      { method: "select", title: "Telegram settings", value: "Connection settings" },
+      { method: "select", title: "Telegram Settings", value: "Connection Settings" },
       { method: "input", title: "Bot Token:", value: testConfig.botToken },
       { method: "input", title: "Forum Supergroup Chat ID:", value: "-100999" },
       { method: "input", title: "Allowed User ID:", value: "999" },
-      { method: "select", title: "Telegram settings", cancelled: true },
+      { method: "select", title: "Telegram Settings", cancelled: true },
     ];
     let setupReplyIndex = 0;
     child.stderr!.setEncoding("utf8");

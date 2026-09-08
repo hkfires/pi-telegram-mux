@@ -12,6 +12,115 @@ import {
 import { MuxRuntime, formatTransportNotice } from "../src/runtime.js";
 import type { MuxConfig } from "../src/types.js";
 
+describe("formatTransportNotice", () => {
+  it.each([
+    {
+      name: "formats request timeout without redundant prefixes",
+      input: { code: "TELEGRAM_TIMEOUT", message: "Telegram request timed out (getUpdates)" },
+      expected: "Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]",
+    },
+    {
+      name: "normalizes aborted message into timed out and appends code",
+      input: { code: "TELEGRAM_TIMEOUT", message: "Telegram request failed (getUpdates): This operation was aborted" },
+      expected: "Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]",
+    },
+    {
+      name: "formats connection reset cleanly",
+      input: { code: "ECONNRESET", message: "Telegram connection reset (getUpdates)" },
+      expected: "Telegram connection reset (getUpdates) [ECONNRESET]",
+    },
+    {
+      name: "formats network unreachable cleanly",
+      input: { code: "ENOTFOUND", message: "Telegram network unreachable (getUpdates)" },
+      expected: "Telegram network unreachable (getUpdates) [ENOTFOUND]",
+    },
+    {
+      name: "formats general errors with Telegram prefix and code tag",
+      input: { code: "IPC_PROTOCOL_ERROR", message: "Invalid IPC response; restart all mux processes" },
+      expected: "Telegram: Invalid IPC response; restart all mux processes [IPC_PROTOCOL_ERROR]",
+    },
+    {
+      name: "does not duplicate error code if already present",
+      input: { code: "TELEGRAM_TIMEOUT", message: "Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]" },
+      expected: "Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]",
+    },
+  ])("$name", ({ input, expected }) => {
+    expect(formatTransportNotice(input)).toBe(expected);
+  });
+});
+
+describe("render helpers", () => {
+  it("extracts text from assistant string content", () => {
+    const msg = { role: "assistant", content: "Hello from assistant" };
+    expect(extractAssistantText(msg)).toBe("Hello from assistant");
+  });
+
+  it("extracts text from assistant parts array", () => {
+    const msg = {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Part 1. " },
+        { type: "tool_use", name: "bash" },
+        { type: "text", text: "Part 2." },
+      ],
+    };
+    expect(extractAssistantText(msg)).toBe("Part 1. Part 2.");
+  });
+
+  it("extracts text from user string content and parts", () => {
+    const msg1 = { role: "user", content: "Hello from user" };
+    expect(extractUserText(msg1)).toBe("Hello from user");
+
+    const msg2 = {
+      role: "user",
+      content: [{ type: "text", text: "Part A. " }, { type: "text", text: "Part B." }],
+    };
+    expect(extractUserText(msg2)).toBe("Part A. Part B.");
+
+    expect(extractUserText({ role: "assistant", content: "hi" })).toBe("");
+  });
+
+  it("finds last user prompt from session entries", () => {
+    const entries = [
+      { type: "message", message: { role: "user", content: "First prompt" } },
+      { type: "message", message: { role: "assistant", content: "First answer" } },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "Second prompt" }] } },
+    ];
+    expect(findLastUserPrompt(entries)).toBe("Second prompt");
+  });
+
+  it("splits long text without exceeding maximum length", () => {
+    const longText = "a".repeat(10000);
+    const chunks = splitTelegramMessage(longText, 4096);
+    expect(chunks.length).toBe(3);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(4096);
+    }
+    expect(chunks.join("")).toBe(longText);
+  });
+
+  it("splits on newlines when possible", () => {
+    const p1 = "First line.\n";
+    const p2 = "Second line.\n";
+    const p3 = "Third line.";
+    const text = p1 + p2 + p3;
+    const chunks = splitTelegramMessage(text, 20);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.join("")).toBe(text);
+  });
+
+  it("preserves emojis and surrogate pairs across chunk boundaries", () => {
+    // 4095 chars + 1 emoji (2 code units)
+    const prefix = "a".repeat(4095);
+    const emoji = "🚀"; // \uD83D\uDE80
+    const text = prefix + emoji + "suffix";
+    const chunks = splitTelegramMessage(text, 4096);
+    // Emoji should not be cut in half
+    expect(chunks[0].length).toBeLessThanOrEqual(4096);
+    expect(chunks.join("")).toBe(text);
+  });
+});
+
 describe("runtime module", () => {
   let tempDir: string;
   const runtimes: { runtime: MuxRuntime; ctx: any }[] = [];
@@ -37,128 +146,6 @@ describe("runtime module", () => {
     for (const { runtime, ctx } of runtimes.splice(0)) await runtime.onSessionShutdown(ctx);
     vi.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true });
-  });
-
-  describe("formatTransportNotice", () => {
-    it("formats request timeout without redundant prefixes", () => {
-      const notice = formatTransportNotice({
-        code: "TELEGRAM_TIMEOUT",
-        message: "Telegram request timed out (getUpdates)",
-      });
-      expect(notice).toBe("Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]");
-    });
-
-    it("normalizes aborted message into timed out and appends code", () => {
-      const notice = formatTransportNotice({
-        code: "TELEGRAM_TIMEOUT",
-        message: "Telegram request failed (getUpdates): This operation was aborted",
-      });
-      expect(notice).toBe("Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]");
-    });
-
-    it("formats connection reset cleanly", () => {
-      const notice = formatTransportNotice({
-        code: "ECONNRESET",
-        message: "Telegram connection reset (getUpdates)",
-      });
-      expect(notice).toBe("Telegram connection reset (getUpdates) [ECONNRESET]");
-    });
-
-    it("formats network unreachable cleanly", () => {
-      const notice = formatTransportNotice({
-        code: "ENOTFOUND",
-        message: "Telegram network unreachable (getUpdates)",
-      });
-      expect(notice).toBe("Telegram network unreachable (getUpdates) [ENOTFOUND]");
-    });
-
-    it("formats general errors with Telegram prefix and code tag", () => {
-      const notice = formatTransportNotice({
-        code: "IPC_PROTOCOL_ERROR",
-        message: "Invalid IPC response; restart all mux processes",
-      });
-      expect(notice).toBe("Telegram: Invalid IPC response; restart all mux processes [IPC_PROTOCOL_ERROR]");
-    });
-
-    it("does not duplicate error code if already present", () => {
-      const notice = formatTransportNotice({
-        code: "TELEGRAM_TIMEOUT",
-        message: "Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]",
-      });
-      expect(notice).toBe("Telegram request timed out (getUpdates) [TELEGRAM_TIMEOUT]");
-    });
-  });
-
-  describe("render helpers", () => {
-    it("extracts text from assistant string content", () => {
-      const msg = { role: "assistant", content: "Hello from assistant" };
-      expect(extractAssistantText(msg)).toBe("Hello from assistant");
-    });
-
-    it("extracts text from assistant parts array", () => {
-      const msg = {
-        role: "assistant",
-        content: [
-          { type: "text", text: "Part 1. " },
-          { type: "tool_use", name: "bash" },
-          { type: "text", text: "Part 2." },
-        ],
-      };
-      expect(extractAssistantText(msg)).toBe("Part 1. Part 2.");
-    });
-
-    it("extracts text from user string content and parts", () => {
-      const msg1 = { role: "user", content: "Hello from user" };
-      expect(extractUserText(msg1)).toBe("Hello from user");
-
-      const msg2 = {
-        role: "user",
-        content: [{ type: "text", text: "Part A. " }, { type: "text", text: "Part B." }],
-      };
-      expect(extractUserText(msg2)).toBe("Part A. Part B.");
-
-      expect(extractUserText({ role: "assistant", content: "hi" })).toBe("");
-    });
-
-    it("finds last user prompt from session entries", () => {
-      const entries = [
-        { type: "message", message: { role: "user", content: "First prompt" } },
-        { type: "message", message: { role: "assistant", content: "First answer" } },
-        { type: "message", message: { role: "user", content: [{ type: "text", text: "Second prompt" }] } },
-      ];
-      expect(findLastUserPrompt(entries)).toBe("Second prompt");
-    });
-
-    it("splits long text without exceeding maximum length", () => {
-      const longText = "a".repeat(10000);
-      const chunks = splitTelegramMessage(longText, 4096);
-      expect(chunks.length).toBe(3);
-      for (const chunk of chunks) {
-        expect(chunk.length).toBeLessThanOrEqual(4096);
-      }
-      expect(chunks.join("")).toBe(longText);
-    });
-
-    it("splits on newlines when possible", () => {
-      const p1 = "First line.\n";
-      const p2 = "Second line.\n";
-      const p3 = "Third line.";
-      const text = p1 + p2 + p3;
-      const chunks = splitTelegramMessage(text, 20);
-      expect(chunks.length).toBeGreaterThan(1);
-      expect(chunks.join("")).toBe(text);
-    });
-
-    it("preserves emojis and surrogate pairs across chunk boundaries", () => {
-      // 4095 chars + 1 emoji (2 code units)
-      const prefix = "a".repeat(4095);
-      const emoji = "🚀"; // \uD83D\uDE80
-      const text = prefix + emoji + "suffix";
-      const chunks = splitTelegramMessage(text, 4096);
-      // Emoji should not be cut in half
-      expect(chunks[0].length).toBeLessThanOrEqual(4096);
-      expect(chunks.join("")).toBe(text);
-    });
   });
 
   describe("MuxRuntime lifecycle and admission", () => {

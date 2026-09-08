@@ -207,7 +207,7 @@ describe("forum topic lifecycle", () => {
       fixtures.push(f);
       const owner = origin === "self" ? f : await runtimeFixture(dir, "settings-peer", 51);
       if (owner !== f) fixtures.push(owner);
-      owner.ui.select.mockResolvedValueOnce("Auto-close topics: ON").mockResolvedValueOnce("OFF - keep topics open (faster exit)");
+      owner.ui.select.mockResolvedValueOnce("Auto-close Topics: On").mockResolvedValueOnce("Off - Keep topics open (faster exit)");
       await owner.runtime.handleTgSetup(owner.ctx);
       await vi.waitFor(() => {
         expect(attempts).toBe(2);
@@ -239,7 +239,7 @@ describe("forum topic lifecycle", () => {
       const changing = new Promise<void>(resolve => { entered = resolve; });
       const gate = new Promise<void>(resolve => { release = resolve; });
       options.onConfigChange = async (config: any) => { entered(); await gate; await apply(config); };
-      peer.ui.select.mockResolvedValueOnce("Auto-close topics: ON").mockResolvedValueOnce("OFF - keep topics open (faster exit)");
+      peer.ui.select.mockResolvedValueOnce("Auto-close Topics: On").mockResolvedValueOnce("Off - Keep topics open (faster exit)");
       const setup = peer.runtime.handleTgSetup(peer.ctx);
       try {
         await changing;

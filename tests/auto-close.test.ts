@@ -65,19 +65,19 @@ describe("optional automatic topic closure", () => {
       const f = await runtimeFixture(dir, "interactive");
       fixtures.push(f);
       f.ui.select.mockImplementationOnce(async (_title, options) => options[1]).mockImplementationOnce(async (title, options) => {
-        expect(title).toBe(`Auto-close topics (current: ${autoCloseTopics ? "OFF" : "ON"})`);
-        expect(options).toEqual(["OFF - keep topics open (faster exit)", "ON - close topics (may wait up to 3 seconds)"]);
+        expect(title).toBe(`Auto-close Topics (Current: ${autoCloseTopics ? "Off" : "On"})`);
+        expect(options).toEqual(["Off - Keep topics open (faster exit)", "On - Close topics (may wait up to 3 seconds)"]);
         return options[autoCloseTopics ? 1 : 0];
       });
       await f.runtime.handleTgSetup(f.ctx);
       expect(f.ui.select).toHaveBeenCalledTimes(3);
-      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram settings", ["Connection settings", `Auto-close topics: ${autoCloseTopics ? "ON" : "OFF"}`]);
+      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", `Auto-close Topics: ${autoCloseTopics ? "On" : "Off"}`]);
       expect(f.ui.input).not.toHaveBeenCalled();
       expect(TelegramClient.prototype.getChat).not.toHaveBeenCalled();
       expect(TelegramClient.prototype.getChatMember).not.toHaveBeenCalled();
       expect(await loadConfig(dir)).toEqual({ ...testConfig, autoCloseTopics });
       f.runtime.handleTgStatus(f.ctx);
-      expect(f.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining(`Auto-close topics: ${autoCloseTopics ? "ON" : "OFF"}`), "info");
+      expect(f.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining(`Auto-close Topics: ${autoCloseTopics ? "On" : "Off"}`), "info");
     });
 
     it("leaves configuration untouched when the auto-close selection is cancelled", async () => {
@@ -87,7 +87,7 @@ describe("optional automatic topic closure", () => {
       f.ui.select.mockImplementationOnce(async (_title, options) => options[1]).mockResolvedValueOnce(undefined);
       await f.runtime.handleTgSetup(f.ctx);
       expect(f.ui.select).toHaveBeenCalledTimes(3);
-      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram settings", ["Connection settings", "Auto-close topics: OFF"]);
+      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: Off"]);
       expect(await fs.readFile(getConfigPath(dir), "utf-8")).toBe(original);
       expect(TelegramClient.prototype.getChat).not.toHaveBeenCalled();
       expect(f.ui.input).not.toHaveBeenCalled();
@@ -102,13 +102,13 @@ describe("optional automatic topic closure", () => {
         .mockImplementationOnce(async (_title, options) => options[1])
         .mockImplementationOnce(async (_title, options) => options[0]);
       await f.runtime.handleTgSetup(f.ctx);
-      const options = ["OFF - keep topics open (faster exit)", "ON - close topics (may wait up to 3 seconds)"];
-      expect(f.ui.select.mock.calls.filter(([title]) => title.startsWith("Auto-close topics (current:"))).toEqual([
-        ["Auto-close topics (current: OFF)", options],
-        ["Auto-close topics (current: ON)", options],
+      const options = ["Off - Keep topics open (faster exit)", "On - Close topics (may wait up to 3 seconds)"];
+      expect(f.ui.select.mock.calls.filter(([title]) => title.startsWith("Auto-close Topics (Current:"))).toEqual([
+        ["Auto-close Topics (Current: Off)", options],
+        ["Auto-close Topics (Current: On)", options],
       ]);
       expect((await loadConfig(dir))?.autoCloseTopics).toBe(false);
-      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram settings", ["Connection settings", "Auto-close topics: OFF"]);
+      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: Off"]);
     });
 
     describe.each(["leader", "follower"])("configured by the %s", role => {
@@ -129,7 +129,7 @@ describe("optional automatic topic closure", () => {
             expect(current.runtime.hasActiveTransport()).toBe(true);
             expect(current.runtime.getIsReconnecting()).toBe(false);
             current.runtime.handleTgStatus(current.ctx);
-            expect(current.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining(`Auto-close topics: ${autoCloseTopics ? "ON" : "OFF"}`), "info");
+            expect(current.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining(`Auto-close Topics: ${autoCloseTopics ? "On" : "Off"}`), "info");
           }
         }, { timeout: 2500 });
         const api = vi.spyOn(TelegramClient.prototype, "callApi");

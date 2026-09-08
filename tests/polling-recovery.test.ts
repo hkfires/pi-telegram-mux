@@ -120,7 +120,7 @@ describe("polling recovery ownership and unconfigured synchronization", () => {
       const start = vi.spyOn(LeaderCoordinator.prototype, "start");
       if (outcome === "validation failure") {
         vi.spyOn(TelegramClient.prototype, "getMe").mockRejectedValueOnce(new TelegramApiError("Simulated setup validation failure", 401));
-        f.ui.select.mockResolvedValueOnce("Connection settings");
+        f.ui.select.mockResolvedValueOnce("Connection Settings");
         f.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce(String(testConfig.allowedUserId));
       }
 

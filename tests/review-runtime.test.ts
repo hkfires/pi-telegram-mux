@@ -229,7 +229,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     const admission = f.runtime.handleInboundText("original", f.ctx);
     if (changed) {
       setupValidation();
-      f.ui.select.mockResolvedValueOnce("Connection settings");
+      f.ui.select.mockResolvedValueOnce("Connection Settings");
       f.ui.input.mockResolvedValueOnce(testConfig.botToken).mockResolvedValueOnce("-100999").mockResolvedValueOnce("999");
       await f.runtime.handleTgSetup(f.ctx);
     }
@@ -521,7 +521,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
       let answerDialog!: (value: string | undefined) => void;
       f.ui.input.mockReturnValueOnce(new Promise(resolve => { answerDialog = resolve; }))
         .mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce(String(testConfig.allowedUserId));
-      f.ui.select.mockResolvedValueOnce("Connection settings");
+      f.ui.select.mockResolvedValueOnce("Connection Settings");
       if (outcome === "validation failure") vi.spyOn(TelegramClient.prototype, "getMe").mockRejectedValueOnce(new Error("Simulated validation failure"));
       await f.runtime.onBeforeAgentStart({ prompt: "prompt" }, f.ctx);
       f.runtime.onMessageStart({ role: "user", content: "prompt" }, f.ctx);
@@ -568,7 +568,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1), { timeout: 5000 });
     let cancelDialog!: () => void;
     f.ui.input.mockReturnValueOnce(new Promise(resolve => { cancelDialog = () => resolve(undefined); }));
-    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.select.mockResolvedValueOnce("Connection Settings");
     const setup = f.runtime.handleTgSetup(f.ctx);
     try {
       firstChunk.resolve();
@@ -600,7 +600,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     f.runtime.onMessageStart({ role: "user", content: "first" }, f.ctx);
     let cancelDialog!: () => void;
     f.ui.input.mockReturnValueOnce(new Promise(resolve => { cancelDialog = () => resolve(undefined); }));
-    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.select.mockResolvedValueOnce("Connection Settings");
     const setup = f.runtime.handleTgSetup(f.ctx);
     try {
       sessionFile = path.join(dir, "review.jsonl");
@@ -636,7 +636,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     let answerDialog!: (value: string | undefined) => void;
     f.ui.input.mockReturnValueOnce(new Promise(resolve => { answerDialog = resolve; }))
       .mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce("999");
-    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.select.mockResolvedValueOnce("Connection Settings");
     setupValidation();
     await f.runtime.onBeforeAgentStart({ prompt: "old prompt" }, f.ctx);
     f.runtime.onMessageStart({ role: "user", content: "old prompt" }, f.ctx);
@@ -688,7 +688,8 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     f.runtime.onMessageStart({ role: "user", content: "old prompt" }, f.ctx);
     f.runtime.onMessageEnd({ role: "assistant", content: "old answer", stopReason: "stop" });
     await f.runtime.onAgentSettled(f.ctx);
-    await vi.waitFor(() => expect(texts).toHaveLength(1));
+    // Initial delivery starts the Markdown worker before cancellation is exercised.
+    await vi.waitFor(() => expect(texts).toHaveLength(1), { timeout: 5000 });
     f.runtime.handleTgDisconnect(f.ctx);
     await f.runtime.handleTgConnect(f.ctx);
     await f.runtime.onBeforeAgentStart(f.ctx);

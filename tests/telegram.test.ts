@@ -190,118 +190,60 @@ describe("telegram client module", () => {
     expect(isRecoverableTelegramError(error)).toBe(true);
   });
 
-  it("validates bot and chat permissions", async () => {
-    const client = new TelegramClient({
-      botToken: mockToken,
-      apiBase: mockApiBase,
-    });
-
-    nextHandler = (req, res) => {
-      const url = req.url || "";
-      const chunks: Buffer[] = [];
-      req.on("data", (c) => chunks.push(c));
-      req.on("end", () => {
-        const bodyStr = Buffer.concat(chunks).toString("utf-8");
-        const parsed = bodyStr ? JSON.parse(bodyStr) : {};
-        res.writeHead(200, { "Content-Type": "application/json" });
-
-        if (url.includes("/getMe")) {
-          res.end(JSON.stringify({ ok: true, result: { id: 10, is_bot: true, first_name: "B", username: "fixture_bot" } }));
-        } else if (url.includes("/getChatMember")) {
-          if (parsed.user_id === 10) {
-            // bot member
-            res.end(
-              JSON.stringify({
-                ok: true,
-                result: { status: "administrator", can_manage_topics: true },
-              })
-            );
-          } else {
-            // allowed user member
-            res.end(JSON.stringify({ ok: true, result: { status: "member" } }));
-          }
-        } else if (url.includes("/getChat")) {
-          res.end(
-            JSON.stringify({
-              ok: true,
-              result: { id: -100, type: "supergroup", is_forum: true, title: "Super Forum" },
-            })
-          );
-        }
+  describe("validateBotAndChat", () => {
+    it.each([
+      {
+        name: "validates bot and chat permissions",
+        chat: { id: -100, type: "supergroup", is_forum: true, title: "Super Forum" },
+        botMember: { status: "administrator", can_manage_topics: true },
+        expectedError: undefined,
+      },
+      {
+        name: "fails validateBotAndChat if chat is a supergroup but not a forum",
+        chat: { id: -100, type: "supergroup", is_forum: false },
+        botMember: { status: "administrator", can_manage_topics: true },
+        expectedError: "not a Forum Supergroup",
+      },
+      {
+        name: "fails validateBotAndChat if bot lacks can_manage_topics permission",
+        chat: { id: -100, type: "supergroup", is_forum: true, title: "Super Forum" },
+        botMember: { status: "administrator", can_manage_topics: false },
+        expectedError: "topic management permissions",
+      },
+    ])("$name", async ({ chat, botMember, expectedError }) => {
+      const client = new TelegramClient({
+        botToken: mockToken,
+        apiBase: mockApiBase,
       });
-    };
 
-    const res = await validateBotAndChat(client, -100, 20);
-    expect(res.botUser.id).toBe(10);
-    expect(res.chat.is_forum).toBe(true);
-  });
+      nextHandler = (req, res) => {
+        const url = req.url || "";
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          const bodyStr = Buffer.concat(chunks).toString("utf-8");
+          const parsed = bodyStr ? JSON.parse(bodyStr) : {};
+          res.writeHead(200, { "Content-Type": "application/json" });
 
-  it("fails validateBotAndChat if chat is a supergroup but not a forum", async () => {
-    const client = new TelegramClient({
-      botToken: mockToken,
-      apiBase: mockApiBase,
-    });
+          if (url.includes("/getMe")) {
+            res.end(JSON.stringify({ ok: true, result: { id: 10, is_bot: true, first_name: "B", username: "fixture_bot" } }));
+          } else if (url.includes("/getChatMember")) {
+            const result = parsed.user_id === 10 ? botMember : { status: "member" };
+            res.end(JSON.stringify({ ok: true, result }));
+          } else if (url.includes("/getChat")) {
+            res.end(JSON.stringify({ ok: true, result: chat }));
+          }
+        });
+      };
 
-    nextHandler = (req, res) => {
-      const url = req.url || "";
-      res.writeHead(200, { "Content-Type": "application/json" });
-
-      if (url.includes("getMe")) {
-        res.end(JSON.stringify({ ok: true, result: { id: 10, is_bot: true, first_name: "B", username: "fixture_bot" } }));
-      } else if (url.includes("getChat")) {
-        res.end(
-          JSON.stringify({
-            ok: true,
-            result: { id: -100, type: "supergroup", is_forum: false },
-          })
-        );
+      if (expectedError) {
+        await expect(validateBotAndChat(client, -100, 20)).rejects.toThrow(expectedError);
+      } else {
+        const res = await validateBotAndChat(client, -100, 20);
+        expect(res.botUser.id).toBe(10);
+        expect(res.chat.is_forum).toBe(true);
       }
-    };
-
-    await expect(validateBotAndChat(client, -100, 20)).rejects.toThrow("not a Forum Supergroup");
-  });
-
-  it("fails validateBotAndChat if bot lacks can_manage_topics permission", async () => {
-    const client = new TelegramClient({
-      botToken: mockToken,
-      apiBase: mockApiBase,
     });
-
-    nextHandler = (req, res) => {
-      const url = req.url || "";
-      const chunks: Buffer[] = [];
-      req.on("data", (c) => chunks.push(c));
-      req.on("end", () => {
-        const bodyStr = Buffer.concat(chunks).toString("utf-8");
-        const parsed = bodyStr ? JSON.parse(bodyStr) : {};
-        res.writeHead(200, { "Content-Type": "application/json" });
-
-        if (url.includes("/getMe")) {
-          res.end(JSON.stringify({ ok: true, result: { id: 10, is_bot: true, first_name: "B", username: "fixture_bot" } }));
-        } else if (url.includes("/getChatMember")) {
-          if (parsed.user_id === 10) {
-            // bot member without can_manage_topics
-            res.end(
-              JSON.stringify({
-                ok: true,
-                result: { status: "administrator", can_manage_topics: false },
-              })
-            );
-          } else {
-            res.end(JSON.stringify({ ok: true, result: { status: "creator" } }));
-          }
-        } else if (url.includes("/getChat")) {
-          res.end(
-            JSON.stringify({
-              ok: true,
-              result: { id: -100, type: "supergroup", is_forum: true, title: "Super Forum" },
-            })
-          );
-        }
-      });
-    };
-
-    await expect(validateBotAndChat(client, -100, 20)).rejects.toThrow("topic management permissions");
   });
 
   it("calls closeForumTopic successfully", async () => {

@@ -1363,7 +1363,24 @@ export class MuxRuntime {
     this.activeCtx = ctx;
     const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
     const failure = this.connectionError?.message ?? status?.error?.message ?? status?.feedbackError?.message ?? this.outbox.error?.message;
-    ctx.ui?.notify(`[Telegram Mux Status]\nConfig: ${this.config ? "configured" : "missing"}\nRole: ${this.isLeader ? "Leader" : this.followerClient ? "Follower" : "None"}\nSession ID: ${ctx.sessionManager.getSessionId()?.slice(-6)}\nBinding: ${this.bindingState}\nThread ID: ${this.currentThreadId ?? "none"}\nAuto-close topics: ${this.config?.autoCloseTopics ? "ON" : "OFF"}\nBusy input mode: ${this.config?.inputMode ?? "followUp"}\nRuntime: ${this.getIsIdle() && ctx.isIdle() ? "idle" : "busy"}\nPolling: ${status?.polling ?? "offline"}\nPending sync: ${this.outbox.size}\nError: ${failure ?? "none"}\nSettings error: ${this.settingsFailure ?? "none"}\nInteraction warning: ${status?.interactionError?.message ?? "none"}`, "info");
+    const binding = { unbound: "Unbound", disconnected: "Disconnected", bound: "Bound", "topic-missing": "Topic missing", "create-unknown": "Creation unknown" }[this.bindingState];
+    const polling = status ? { starting: "Starting", online: "Online", retrying: "Retrying", error: "Error", conflict: "Conflict" }[status.polling] : "Offline";
+    ctx.ui?.notify([
+      "[Telegram Mux Status]",
+      `Config: ${this.config ? "Configured" : "Missing"}`,
+      `Role: ${this.isLeader ? "Leader" : this.followerClient ? "Follower" : "None"}`,
+      `Session ID: ${ctx.sessionManager.getSessionId()?.slice(-6) ?? "None"}`,
+      `Binding: ${binding}`,
+      `Thread ID: ${this.currentThreadId ?? "None"}`,
+      `Auto-close Topics: ${this.config?.autoCloseTopics ? "On" : "Off"}`,
+      `Busy Input Mode: ${this.config?.inputMode === "steer" ? "Steering" : "Follow-up"}`,
+      `Runtime: ${this.getIsIdle() && ctx.isIdle() ? "Idle" : "Busy"}`,
+      `Polling: ${polling}`,
+      `Pending Sync: ${this.outbox.size}`,
+      `Connection / Sync Error: ${failure ?? "None"}`,
+      `Settings Error: ${this.settingsFailure ?? "None"}`,
+      `Menu / Reply Warning: ${status?.interactionError?.message ?? "None"}`,
+    ].join("\n"), "info");
     this.updateStatusBar(ctx);
   }
 
@@ -1462,9 +1479,9 @@ export class MuxRuntime {
         saved = false;
         this.configuring = true;
         try {
-          const connectionOption = "Connection settings";
-          const autoCloseOption = `Auto-close topics: ${this.config?.autoCloseTopics ? "ON" : "OFF"}`;
-          const setting = await ctx.ui.select("Telegram settings", [connectionOption, autoCloseOption]);
+          const connectionOption = "Connection Settings";
+          const autoCloseOption = `Auto-close Topics: ${this.config?.autoCloseTopics ? "On" : "Off"}`;
+          const setting = await ctx.ui.select("Telegram Settings", [connectionOption, autoCloseOption]);
           if (setting === undefined || !this.active) return;
           let changes: Partial<MuxConfig>;
           if (setting === connectionOption) {
@@ -1486,18 +1503,15 @@ export class MuxRuntime {
               ctx.ui.notify("Configure the Telegram connection first.", "warning");
               continue;
             }
-            const options = ["OFF - keep topics open (faster exit)", "ON - close topics (may wait up to 3 seconds)"];
-            const selected = await ctx.ui.select(`Auto-close topics (current: ${this.config.autoCloseTopics ? "ON" : "OFF"})`, options);
+            const options = ["Off - Keep topics open (faster exit)", "On - Close topics (may wait up to 3 seconds)"];
+            const selected = await ctx.ui.select(`Auto-close Topics (Current: ${this.config.autoCloseTopics ? "On" : "Off"})`, options);
             if (selected === undefined) continue;
             changes = { autoCloseTopics: selected === options[1] };
           } else return;
           if (!this.active) return;
-          // Merge only the selected setting into the latest saved configuration so
-          // changes made by another instance while the dialog was open are retained.
-          const config = await loadConfig(this.agentDir, changes);
-          if (!this.active) return;
-          if (!config) throw new Error("Telegram configuration missing");
-          await saveConfig(this.agentDir, config);
+          // Read and merge selected fields under the persistence lock, including
+          // changes committed by another instance while this save was waiting.
+          const config = await saveConfig(this.agentDir, { updates: changes });
           saved = true;
           this.invalidateRun();
           if (this.coordinator) {

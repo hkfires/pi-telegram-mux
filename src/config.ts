@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { getProcessIdentity } from "./process-identity.js";
 import type { MuxConfig } from "./types.js";
 
 /**
@@ -134,6 +135,7 @@ export async function loadConfig(agentDir: string, updates?: Partial<MuxConfig>)
       if (updates.version === undefined) merged.version = 1;
       if (updates.autoCloseTopics === undefined && typeof merged.autoCloseTopics !== "boolean") merged.autoCloseTopics = false;
       if (updates.inputMode === undefined && merged.inputMode !== "followUp" && merged.inputMode !== "steer") delete merged.inputMode;
+      if (updates.inputModeRevision === undefined && (!Number.isSafeInteger(merged.inputModeRevision) || (merged.inputModeRevision ?? 0) <= 0)) delete merged.inputModeRevision;
     }
     data = merged;
   }
@@ -164,7 +166,11 @@ function isProcessAlive(pid: number): boolean {
 async function acquireConfigMutex(agentDir: string): Promise<() => Promise<void>> {
   const dir = path.join(getConfigDir(agentDir), "config-mutex");
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const id = `${process.pid}-${randomUUID()}.json`;
+  const identity = await getProcessIdentity(process.pid);
+  // Identity belongs in the filename so even an empty choosing claim is identifiable.
+  // The hexadecimal component also remains visible to older bakery-lock readers.
+  const id = `${process.pid}-${identity ? `${identity}-` : ""}${randomUUID()}.json`;
+  const identities = new Map<string, Promise<string | undefined>>();
   const claim = path.join(dir, id);
   const temporary = `${claim}.tmp`;
   await fs.writeFile(claim, "", { flag: "wx", mode: 0o600 });
@@ -203,7 +209,21 @@ async function acquireConfigMutex(agentDir: string): Promise<() => Promise<void>
         if (file === id || !/^\d+-[\da-f-]+\.json$/.test(file)) continue;
         const otherPath = path.join(dir, file);
         const pid = Number(file.slice(0, file.indexOf("-")));
-        if (!isProcessAlive(pid)) {
+        const ownerIdentity = /^\d+-([a-f\d]{64})-[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}\.json$/i.exec(file)?.[1];
+        let alive = isProcessAlive(pid);
+        if (alive && ownerIdentity) {
+          // A reused PID can create a new claim while this acquisition is waiting.
+          // Cache by claim so it cannot inherit a previous owner's lookup result.
+          let reading = identities.get(file);
+          if (!reading) {
+            reading = pid === process.pid ? Promise.resolve(identity) : getProcessIdentity(pid);
+            identities.set(file, reading);
+          }
+          const currentIdentity = await reading;
+          if (currentIdentity !== undefined && currentIdentity !== ownerIdentity) alive = false;
+        }
+        // Legacy claims have no start identity: a live PID must remain protected.
+        if (!alive) {
           await fs.rm(otherPath, { force: true });
           await fs.rm(`${otherPath}.tmp`, { force: true });
           continue;
@@ -243,8 +263,9 @@ export async function withConfigLock<T>(agentDir: string, action: () => Promise<
 
 /**
  * Save config to disk in a secure manner (directory 0700, file 0600).
+ * Settings callers supply only selected updates, merged from disk under the lock.
  */
-export async function saveConfig(agentDir: string, config: MuxConfig, options?: {
+export async function saveConfig(agentDir: string, input: MuxConfig | { updates: Partial<MuxConfig> }, options?: {
   expectedBase?: MuxConfig;
   onChecked?: () => Promise<void> | void;
   modeUpdate?: boolean;
@@ -254,6 +275,8 @@ export async function saveConfig(agentDir: string, config: MuxConfig, options?: 
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const configPath = getConfigPath(agentDir);
   return withConfigLock(agentDir, async () => {
+    const config = "updates" in input ? await loadConfig(agentDir, input.updates) : input;
+    if (!config) throw new Error("Telegram configuration missing during settings update");
     let currentConfig: MuxConfig | null = null;
     try {
       const currentDisk = await fs.readFile(configPath, "utf-8");
@@ -275,7 +298,7 @@ export async function saveConfig(agentDir: string, config: MuxConfig, options?: 
         }
       }
     } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT" && options?.expectedBase) throw err;
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT" || options?.expectedBase) throw err;
     }
     if (options?.onChecked) {
       await options.onChecked();
@@ -324,21 +347,17 @@ export async function saveConfig(agentDir: string, config: MuxConfig, options?: 
     try {
       await fs.writeFile(temporaryPath, json, { encoding: "utf-8", mode: 0o600, flag: "wx" });
       if (options?.expectedBase) {
-        try {
-          const currentDisk = await fs.readFile(configPath, "utf-8");
-          const recheckConfig = validateConfig(JSON.parse(currentDisk));
-          const recheckAutoClose = recheckConfig.autoCloseTopics ?? false;
-          const expectedAutoClose = options.expectedBase.autoCloseTopics ?? false;
-          if (
-            recheckConfig.chatId !== options.expectedBase.chatId ||
-            recheckConfig.botToken !== options.expectedBase.botToken ||
-            recheckConfig.allowedUserId !== options.expectedBase.allowedUserId ||
-            recheckAutoClose !== expectedAutoClose
-          ) {
-            throw new Error("Connection configuration was modified concurrently on disk");
-          }
-        } catch (err: unknown) {
-          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        const currentDisk = await fs.readFile(configPath, "utf-8");
+        const recheckConfig = validateConfig(JSON.parse(currentDisk));
+        const recheckAutoClose = recheckConfig.autoCloseTopics ?? false;
+        const expectedAutoClose = options.expectedBase.autoCloseTopics ?? false;
+        if (
+          recheckConfig.chatId !== options.expectedBase.chatId ||
+          recheckConfig.botToken !== options.expectedBase.botToken ||
+          recheckConfig.allowedUserId !== options.expectedBase.allowedUserId ||
+          recheckAutoClose !== expectedAutoClose
+        ) {
+          throw new Error("Connection configuration was modified concurrently on disk");
         }
       }
       await replaceFile(temporaryPath, configPath);

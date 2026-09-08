@@ -6,6 +6,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { saveConfig } from "../../src/config.js";
+import { getProcessIdentity } from "../../src/process-identity.js";
 import { testConfig } from "../helpers.js";
 
 interface State { type: string; leader: boolean; transport: boolean; polling: boolean; }
@@ -95,6 +96,8 @@ describe("real multi-process election and crash recovery", () => {
     const startedA = message(a.child, "started");
     a.child.send("start");
     await publishing;
+    const claims = await fs.readdir(path.join(dir, "pi-telegram-mux", "runtime", "election"));
+    expect(claims.some(file => new RegExp(`^${a.child.pid}-[a-f\\d]{64}-`).test(file))).toBe(true);
     const startedB = message(b.child, "started");
     b.child.send("start");
     await new Promise(resolve => setTimeout(resolve, 6000));
@@ -165,6 +168,21 @@ describe("real multi-process election and crash recovery", () => {
     const current = JSON.parse(await fs.readFile(path.join(runtimeDir, "leader.json"), "utf-8"));
     expect(current.pid).not.toBe(process.pid);
     expect(current.capability).not.toBe("retired-instance");
+  }, 20_000);
+
+  it("reclaims an identified choosing claim from a previous instance of a still-live unrelated PID", async () => {
+    const dir = path.join(root, "reused-election-pid");
+    const claimsDir = path.join(dir, "pi-telegram-mux", "runtime", "election");
+    await fs.mkdir(claimsDir, { recursive: true });
+    const identity = await getProcessIdentity(process.pid);
+    expect(identity).toMatch(/^[a-f\d]{64}$/);
+    const previousIdentity = identity === "a".repeat(64) ? "b".repeat(64) : "a".repeat(64);
+    // Child contenders query this real parent PID; only the old claim is simulated.
+    const staleClaim = path.join(claimsDir, `${process.pid}-${previousIdentity}-00000000-0000-0000-0000-000000000001.json`);
+    await fs.writeFile(staleClaim, "");
+    await startGroup(dir);
+    await expect(fs.access(staleClaim)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readdir(claimsDir)).toEqual([]);
   }, 20_000);
 
   it("preserves a suspended Leader without requiring an IPC response and reconnects after it resumes", async () => {

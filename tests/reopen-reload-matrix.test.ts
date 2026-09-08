@@ -92,9 +92,9 @@ describe("reopen ownership across configuration interleavings", () => {
       // Polling may still be processing an input while reload cancels HTTP work.
       (coordinator as any).pollingTask = (coordinator as any).pollingTask.then(async () => { entered(); await gate; });
     }
-    if (change === "same") actor.ui.select.mockResolvedValueOnce("Auto-close topics: ON").mockResolvedValueOnce("OFF - keep topics open (faster exit)");
+    if (change === "same") actor.ui.select.mockResolvedValueOnce("Auto-close Topics: On").mockResolvedValueOnce("Off - Keep topics open (faster exit)");
     else {
-      actor.ui.select.mockResolvedValueOnce("Connection settings");
+      actor.ui.select.mockResolvedValueOnce("Connection Settings");
       actor.ui.input.mockResolvedValueOnce(change === "token" ? "replacement-token" : testConfig.botToken)
         .mockResolvedValueOnce(String(change === "chat" ? -100999 : testConfig.chatId)).mockResolvedValueOnce(String(testConfig.allowedUserId));
     }

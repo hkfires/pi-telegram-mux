@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getConfigPath, loadConfig, saveConfig } from "../src/config.js";
+import * as configModule from "../src/config.js";
 import activateExtension from "../src/index.js";
 import { MuxRuntime } from "../src/runtime.js";
 import { TelegramClient } from "../src/telegram.js";
@@ -10,7 +11,7 @@ import { runtimeFixture, testConfig } from "./helpers.js";
 
 type Fixture = Awaited<ReturnType<typeof runtimeFixture>>;
 
-describe("Telegram settings menu", () => {
+describe("Telegram Settings menu", () => {
   let dir: string;
   const fixtures: Fixture[] = [];
   beforeEach(async () => {
@@ -29,11 +30,11 @@ describe("Telegram settings menu", () => {
     await saveConfig(dir, { ...testConfig, autoCloseTopics });
     const f = await runtimeFixture(dir, "connection");
     fixtures.push(f);
-    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.select.mockResolvedValueOnce("Connection Settings");
     f.ui.input.mockResolvedValueOnce("new-bot-token").mockResolvedValueOnce("-100999").mockResolvedValueOnce("999");
     await f.runtime.handleTgSetup(f.ctx);
     expect(f.ui.select).toHaveBeenCalledTimes(2);
-    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram settings", ["Connection settings", `Auto-close topics: ${autoCloseTopics ? "ON" : "OFF"}`]);
+    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", `Auto-close Topics: ${autoCloseTopics ? "On" : "Off"}`]);
     expect(f.ui.input).toHaveBeenCalledTimes(3);
     expect(TelegramClient.prototype.getChat).toHaveBeenCalledWith(-100999);
     expect(TelegramClient.prototype.getChatMember).toHaveBeenCalledWith(-100999, 999);
@@ -51,7 +52,7 @@ describe("Telegram settings menu", () => {
     const f = await runtimeFixture(dir, "cancelled");
     fixtures.push(f);
     const original = await fs.readFile(getConfigPath(dir), "utf-8");
-    f.ui.select.mockResolvedValueOnce(stage === "menu" ? undefined : "Connection settings");
+    f.ui.select.mockResolvedValueOnce(stage === "menu" ? undefined : "Connection Settings");
     for (const input of inputs) f.ui.input.mockResolvedValueOnce(input);
     await f.runtime.handleTgSetup(f.ctx);
     expect(f.ui.select).toHaveBeenCalledTimes(stage === "menu" ? 1 : 2);
@@ -62,7 +63,7 @@ describe("Telegram settings menu", () => {
     expect(f.runtime.outbox.error).toBeNull();
   });
 
-  it.each(["Connection settings", "Auto-close topics: OFF"])("handles %s before a connection is configured", async setting => {
+  it.each(["Connection Settings", "Auto-close Topics: Off"])("handles %s before a connection is configured", async setting => {
     const f = await runtimeFixture(dir, "unconfigured", null);
     fixtures.push(f);
     await f.runtime.onSessionShutdown({ reason: "reload" }, f.ctx);
@@ -72,7 +73,7 @@ describe("Telegram settings menu", () => {
     f.ui.input.mockResolvedValueOnce(testConfig.botToken)
       .mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce(String(testConfig.allowedUserId));
     await f.runtime.handleTgSetup(f.ctx);
-    if (setting === "Connection settings") {
+    if (setting === "Connection Settings") {
       expect(await loadConfig(dir)).toEqual({ ...testConfig, autoCloseTopics: false });
       expect(f.runtime.hasActiveTransport()).toBe(true);
     } else {
@@ -97,10 +98,44 @@ describe("Telegram settings menu", () => {
     expect(TelegramClient.prototype.getChat).not.toHaveBeenCalled();
   });
 
+  it.each(["auto-close", "connection"])("preserves unrelated settings saved after %s setup reaches persistence", async setting => {
+    const f = await runtimeFixture(dir, "overlapping-setup");
+    fixtures.push(f);
+    const replacement = { botToken: "replacement-token", chatId: -100999, allowedUserId: 999 };
+    if (setting === "auto-close") {
+      f.ui.select.mockImplementationOnce(async (_title, options) => options[1])
+        .mockImplementationOnce(async (_title, options) => options[1]);
+    } else {
+      f.ui.select.mockResolvedValueOnce("Connection Settings");
+      f.ui.input.mockResolvedValueOnce(replacement.botToken)
+        .mockResolvedValueOnce(String(replacement.chatId)).mockResolvedValueOnce(String(replacement.allowedUserId));
+    }
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const save = configModule.saveConfig;
+    vi.spyOn(configModule, "saveConfig").mockImplementationOnce(async (...args) => {
+      enter();
+      await gate;
+      return save(...args);
+    });
+    const setup = f.runtime.handleTgSetup(f.ctx);
+    try {
+      await entered;
+      await save(dir, setting === "auto-close" ? { ...testConfig, ...replacement } : { ...testConfig, autoCloseTopics: true });
+      release();
+      await setup;
+      expect(await loadConfig(dir)).toEqual({ ...testConfig, ...replacement, autoCloseTopics: true });
+      expect(f.ui.notify).toHaveBeenCalledWith("Telegram configuration saved and applied.", "info");
+      expect(f.runtime.hasActiveTransport()).toBe(true);
+    } finally { release(); await setup; }
+  });
+
   it("preserves an auto-close change made while the connection is being verified", async () => {
     const f = await runtimeFixture(dir, "connection");
     fixtures.push(f);
-    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.select.mockResolvedValueOnce("Connection Settings");
     f.ui.input.mockResolvedValueOnce("new-bot-token").mockResolvedValueOnce("-100999").mockResolvedValueOnce("999");
     vi.mocked(TelegramClient.prototype.getChat).mockImplementationOnce(async id => {
       await saveConfig(dir, { ...testConfig, autoCloseTopics: true });
@@ -113,6 +148,10 @@ describe("Telegram settings menu", () => {
   it.each([
     { name: "malformed JSON", content: "{", autoCloseTopics: false },
     { name: "invalid Chat ID", content: JSON.stringify({ ...testConfig, chatId: "bad", autoCloseTopics: true }), autoCloseTopics: true },
+    ...[0, null, "2"].map(inputModeRevision => ({
+      name: `invalid input-mode revision ${JSON.stringify(inputModeRevision)}`,
+      content: JSON.stringify({ ...testConfig, inputModeRevision }), autoCloseTopics: false,
+    })),
   ])("repairs $name through connection settings after startup fails", async ({ content, autoCloseTopics }) => {
     const f = await runtimeFixture(dir, "repair", null);
     fixtures.push(f);
@@ -121,21 +160,21 @@ describe("Telegram settings menu", () => {
     const runtime = new MuxRuntime(f.pi as any, dir);
     fixtures.push({ ...f, runtime });
     await expect(runtime.onSessionStart(f.ctx)).rejects.toThrow();
-    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.select.mockResolvedValueOnce("Connection Settings");
     f.ui.input.mockResolvedValueOnce(testConfig.botToken)
       .mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce(String(testConfig.allowedUserId));
     await runtime.handleTgSetup(f.ctx);
     expect(await loadConfig(dir)).toEqual({ ...testConfig, autoCloseTopics });
     expect(runtime.hasActiveTransport()).toBe(true);
     expect(f.ui.notify).toHaveBeenCalledWith("Telegram configuration saved and applied.", "info");
-    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram settings", ["Connection settings", `Auto-close topics: ${autoCloseTopics ? "ON" : "OFF"}`]);
+    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", `Auto-close Topics: ${autoCloseTopics ? "On" : "Off"}`]);
   });
 
   it.each(["cancel", "invalid input", "Telegram validation failure"])("does not replace malformed configuration after %s", async outcome => {
     const f = await runtimeFixture(dir, "failed-repair");
     fixtures.push(f);
     await fs.writeFile(getConfigPath(dir), "{");
-    f.ui.select.mockResolvedValueOnce("Connection settings");
+    f.ui.select.mockResolvedValueOnce("Connection Settings");
     if (outcome !== "cancel") {
       f.ui.input.mockResolvedValueOnce(testConfig.botToken)
         .mockResolvedValueOnce(outcome === "invalid input" ? "bad-id" : String(testConfig.chatId))
@@ -165,9 +204,9 @@ describe("Telegram settings menu", () => {
     fixtures.push(f);
     f.ui.input.mockResolvedValueOnce("new-bot-token")
       .mockResolvedValueOnce(String(testConfig.chatId)).mockResolvedValueOnce(String(testConfig.allowedUserId));
-    f.ui.select.mockResolvedValueOnce("Connection settings")
+    f.ui.select.mockResolvedValueOnce("Connection Settings")
       .mockImplementationOnce(async (title, options) => {
-        expect(title).toBe("Telegram settings");
+        expect(title).toBe("Telegram Settings");
         expect((await loadConfig(dir))?.botToken).toBe("new-bot-token");
         return options[1];
       })
@@ -175,7 +214,7 @@ describe("Telegram settings menu", () => {
     await f.runtime.handleTgSetup(f.ctx);
     expect(await loadConfig(dir)).toEqual({ ...testConfig, botToken: "new-bot-token", autoCloseTopics: true });
     expect(f.ui.select).toHaveBeenCalledTimes(4);
-    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram settings", ["Connection settings", "Auto-close topics: ON"]);
+    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: On"]);
     expect(f.ui.notify.mock.calls.filter(([text]) => text === "Telegram configuration saved and applied.")).toHaveLength(2);
     expect(TelegramClient.prototype.getChat).toHaveBeenCalledTimes(1);
     expect(f.runtime.hasActiveTransport()).toBe(true);
@@ -186,14 +225,14 @@ describe("Telegram settings menu", () => {
     const f = await runtimeFixture(dir, "cancel-then-edit");
     fixtures.push(f);
     f.ui.input.mockResolvedValueOnce("discarded-token").mockResolvedValueOnce(undefined);
-    f.ui.select.mockResolvedValueOnce("Connection settings")
+    f.ui.select.mockResolvedValueOnce("Connection Settings")
       .mockImplementationOnce(async (_title, options) => options[1])
       .mockImplementationOnce(async (_title, options) => options[1]);
     await f.runtime.handleTgSetup(f.ctx);
     expect(await loadConfig(dir)).toEqual({ ...testConfig, autoCloseTopics: true });
     expect(f.ui.input).toHaveBeenCalledTimes(2);
     expect(f.ui.select).toHaveBeenCalledTimes(4);
-    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram settings", ["Connection settings", "Auto-close topics: ON"]);
+    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: On"]);
     expect(TelegramClient.prototype.getChat).not.toHaveBeenCalled();
   });
 
@@ -202,13 +241,13 @@ describe("Telegram settings menu", () => {
     fixtures.push(f);
     f.ui.select.mockImplementationOnce(async (_title, options) => options[1])
       .mockImplementationOnce(async (_title, options) => options[1])
-      .mockResolvedValueOnce("Connection settings");
+      .mockResolvedValueOnce("Connection Settings");
     f.ui.input.mockResolvedValueOnce("discarded-token").mockResolvedValueOnce("invalid-chat-id").mockResolvedValueOnce("999");
     await f.runtime.handleTgSetup(f.ctx);
     expect(await loadConfig(dir)).toEqual({ ...testConfig, autoCloseTopics: true });
     expect(f.ui.notify).toHaveBeenCalledWith(expect.stringContaining("configuration validation failed: Invalid config: chatId"), "error");
     expect(f.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("could not confirm updates"), "error");
-    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram settings", ["Connection settings", "Auto-close topics: ON"]);
+    expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: On"]);
     expect(f.runtime.hasActiveTransport()).toBe(true);
   });
 
@@ -224,7 +263,7 @@ describe("Telegram settings menu", () => {
     try {
       await vi.waitFor(() => expect(leaveMenu).toBeDefined());
       expect(finished).toBe(false);
-      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram settings", ["Connection settings", "Auto-close topics: ON"]);
+      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: On"]);
       await expect(f.runtime.handleInboundText("while configuring", f.ctx)).resolves.toMatchObject({ accepted: false, busy: true });
       await f.runtime.handleTgSetup(f.ctx);
       expect(f.ui.select).toHaveBeenCalledTimes(3);
@@ -248,7 +287,7 @@ describe("Telegram settings menu", () => {
     f.ui.select.mockReturnValueOnce(new Promise(resolve => { select = resolve; }));
     const setup = f.runtime.handleTgSetup(f.ctx);
     await f.runtime.onSessionShutdown({ reason: "reload" }, f.ctx);
-    select("Connection settings");
+    select("Connection Settings");
     await setup;
     expect(f.ui.input).not.toHaveBeenCalled();
     expect(TelegramClient.prototype.getChat).not.toHaveBeenCalled();

@@ -14,6 +14,7 @@ import {
   withConfigLock,
 } from "../src/config.js";
 import type { MuxConfig } from "../src/types.js";
+import * as processIdentity from "../src/process-identity.js";
 
 vi.mock("node:fs/promises", async importOriginal => ({ ...await importOriginal<typeof import("node:fs/promises")>() }));
 
@@ -170,6 +171,60 @@ describe("config module", () => {
       expect(JSON.parse(await fs.readFile(getConfigPath(tempDir), "utf-8"))).toEqual({ ...config, autoCloseTopics: false, inputModeRevision: 1 });
     });
 
+    it("merges selected settings after acquiring the lock without restoring a stale connection or mode", async () => {
+      const initial: MuxConfig = { version: 1, botToken: "tok", chatId: 10, allowedUserId: 1, inputMode: "followUp" };
+      await saveConfig(tempDir, initial);
+      const latest: MuxConfig = { ...initial, botToken: "new-tok", chatId: 20, allowedUserId: 2, inputMode: "steer", inputModeRevision: 2 };
+      let enter!: () => void;
+      let release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const holding = withConfigLock(tempDir, async () => {
+        enter();
+        await gate;
+        await fs.writeFile(getConfigPath(tempDir), JSON.stringify(latest));
+      });
+      await entered;
+      const updating = saveConfig(tempDir, { updates: { autoCloseTopics: true } });
+      try {
+        await vi.waitFor(async () => {
+          expect((await fs.readdir(path.join(getConfigDir(tempDir), "config-mutex"))).filter(file => file.endsWith(".json"))).toHaveLength(2);
+        });
+        release();
+        await holding;
+        expect(await updating).toEqual({ ...latest, autoCloseTopics: true });
+        expect(await loadConfig(tempDir)).toEqual({ ...latest, autoCloseTopics: true });
+      } finally { release(); await holding; await updating.catch(() => {}); }
+    });
+
+    it("merges connection updates without resetting current preferences", async () => {
+      const initial = { version: 1, botToken: "tok", chatId: 10, allowedUserId: 1, autoCloseTopics: true, inputMode: "steer", inputModeRevision: 5 } as const;
+      await saveConfig(tempDir, initial);
+      const connection = { botToken: "new-tok", chatId: 20, allowedUserId: 2 };
+      expect(await saveConfig(tempDir, { updates: connection })).toEqual({ ...initial, ...connection });
+      expect(await loadConfig(tempDir)).toEqual({ ...initial, ...connection });
+    });
+
+    it("does not create missing configuration from a preference update", async () => {
+      await expect(saveConfig(tempDir, { updates: { autoCloseTopics: true } })).rejects.toThrow();
+      await expect(fs.access(getConfigPath(tempDir))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readdir(path.join(getConfigDir(tempDir), "config-mutex"))).toEqual([]);
+    });
+
+    it.each(["EACCES", "EIO"])("does not overwrite configuration when reading a settings update fails with %s", async code => {
+      await saveConfig(tempDir, { version: 1, botToken: "tok", chatId: 10, allowedUserId: 1 });
+      const configPath = getConfigPath(tempDir);
+      const read = fs.readFile;
+      const before = await read(configPath, "utf8");
+      vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+        if (String(args[0]) === configPath) throw Object.assign(new Error("Read failed"), { code });
+        return read(...args);
+      });
+      await expect(saveConfig(tempDir, { updates: { autoCloseTopics: true } })).rejects.toMatchObject({ code });
+      expect(await read(configPath, "utf8")).toBe(before);
+      expect(await fs.readdir(path.join(getConfigDir(tempDir), "config-mutex"))).toEqual([]);
+    });
+
     it("allocates one reconciliation revision for concurrent observers of a manual edit", async () => {
       const config: MuxConfig = { version: 1, botToken: "tok", chatId: 10, allowedUserId: 1, inputMode: "followUp" };
       const initial = await saveConfig(tempDir, config);
@@ -196,6 +251,92 @@ describe("config module", () => {
 
       const disk = await loadConfig(tempDir);
       expect(disk?.chatId).toBe(99);
+    });
+
+    it.each(["EACCES", "EPERM", "EIO"])("does not overwrite a newer mode after a configuration read fails with %s", async code => {
+      const initial: MuxConfig = { version: 1, botToken: "tok", chatId: 10, allowedUserId: 1, inputMode: "followUp" };
+      await saveConfig(tempDir, initial);
+      const stale = (await loadConfig(tempDir, { autoCloseTopics: true }))!;
+      await saveConfig(tempDir, { ...stale, inputMode: "steer" }, { modeUpdate: true });
+      const configPath = getConfigPath(tempDir);
+      const before = await fs.readFile(configPath, "utf8");
+      const read = fs.readFile;
+      let injected = false;
+      vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+        if (!injected && String(args[0]) === configPath) {
+          injected = true;
+          throw Object.assign(new Error("Simulated configuration read failure"), { code });
+        }
+        return read(...args);
+      });
+      await expect(saveConfig(tempDir, stale)).rejects.toMatchObject({ code });
+      expect(await read(configPath, "utf8")).toBe(before);
+    });
+
+    it.each(["before check", "after check"])("rejects removal of the expected configuration %s", async phase => {
+      const base = await saveConfig(tempDir, { version: 1, botToken: "tok", chatId: 10, allowedUserId: 1 });
+      const configPath = getConfigPath(tempDir);
+      if (phase === "before check") await fs.rm(configPath);
+      await expect(saveConfig(tempDir, { ...base, inputMode: "steer" }, {
+        expectedBase: base, modeUpdate: true,
+        onChecked: phase === "after check" ? () => fs.rm(configPath) : undefined,
+      })).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.access(configPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await fs.readdir(getConfigDir(tempDir))).filter(file => file.endsWith(".tmp"))).toEqual([]);
+      expect(await fs.readdir(path.join(getConfigDir(tempDir), "config-mutex"))).toEqual([]);
+    });
+
+    it.each(["choosing", "waiting"])("reclaims a %s claim after its PID has been reused", async phase => {
+      const identity = await processIdentity.getProcessIdentity(process.pid);
+      expect(identity).toMatch(/^[a-f\d]{64}$/);
+      const previousIdentity = identity === "a".repeat(64) ? "b".repeat(64) : "a".repeat(64);
+      const mutexDir = path.join(getConfigDir(tempDir), "config-mutex");
+      await fs.mkdir(mutexDir, { recursive: true });
+      const claim = path.join(mutexDir, `${process.pid}-${previousIdentity}-00000000-0000-0000-0000-000000000001.json`);
+      await fs.writeFile(claim, phase === "choosing" ? "" : "7");
+      const action = vi.fn();
+      await withConfigLock(tempDir, action);
+      expect(action).toHaveBeenCalledTimes(1);
+      expect(await fs.readdir(mutexDir)).toEqual([]);
+    });
+
+    it("retains an identified live holder until it releases the critical section", async () => {
+      let enter!: () => void;
+      let release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const holding = withConfigLock(tempDir, async () => { enter(); await gate; });
+      await entered;
+      const mutexDir = path.join(getConfigDir(tempDir), "config-mutex");
+      const [owner] = await fs.readdir(mutexDir);
+      expect(owner).toMatch(/^\d+-[a-f\d]{64}-/);
+      const action = vi.fn();
+      const waiting = withConfigLock(tempDir, action);
+      try {
+        await vi.waitFor(async () => expect((await fs.readdir(mutexDir)).filter(file => file.endsWith(".json"))).toHaveLength(2));
+        expect(action).not.toHaveBeenCalled();
+      } finally { release(); await holding; await waiting; }
+      expect(action).toHaveBeenCalledTimes(1);
+      expect(await fs.readdir(mutexDir)).toEqual([]);
+    });
+
+    it("does not reclaim a live PID when its process identity cannot be queried", async () => {
+      const mutexDir = path.join(getConfigDir(tempDir), "config-mutex");
+      await fs.mkdir(mutexDir, { recursive: true });
+      const holder = path.join(mutexDir, `${process.ppid}-${"a".repeat(64)}-00000000-0000-0000-0000-000000000001.json`);
+      await fs.writeFile(holder, "1");
+      const query = processIdentity.getProcessIdentity;
+      vi.spyOn(processIdentity, "getProcessIdentity").mockImplementation(pid => pid === process.ppid ? Promise.resolve(undefined) : query(pid));
+      let now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      const read = fs.readFile;
+      let reads = 0;
+      vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+        if (String(args[0]) === holder && ++reads > 1) now += 10001;
+        return read(...args);
+      });
+      await expect(withConfigLock(tempDir, async () => {})).rejects.toThrow("waiting for a live process");
+      expect(await fs.readdir(mutexDir)).toEqual([path.basename(holder)]);
     });
 
     it("serializes simultaneous saveConfig calls without corrupting configuration", async () => {
@@ -410,6 +551,21 @@ describe("config module", () => {
       expect(await fs.readFile(getConfigPath(tempDir), "utf-8")).toBe(content);
     });
 
+    it.each([0, -1, null, "2", 1.5, Number.MAX_SAFE_INTEGER + 1])("repairs an invalid stored input-mode revision only with a complete connection update: %j", async inputModeRevision => {
+      const stored = { version: 1, botToken: "tok", chatId: 10, allowedUserId: 1, inputMode: "steer", inputModeRevision };
+      await fs.mkdir(getConfigDir(tempDir), { recursive: true });
+      const content = JSON.stringify(stored);
+      await fs.writeFile(getConfigPath(tempDir), content);
+      await expect(loadConfig(tempDir)).rejects.toThrow("inputModeRevision must be a positive safe integer");
+      await expect(saveConfig(tempDir, { updates: { autoCloseTopics: true } })).rejects.toThrow("inputModeRevision must be a positive safe integer");
+      expect(await fs.readFile(getConfigPath(tempDir), "utf8")).toBe(content);
+      const connection = { botToken: "new-tok", chatId: 20, allowedUserId: 2 };
+      expect(await loadConfig(tempDir, connection)).toEqual({ version: 1, ...connection, autoCloseTopics: false, inputMode: "steer" });
+      const repaired = await saveConfig(tempDir, { updates: connection });
+      expect(repaired).toEqual({ version: 1, ...connection, autoCloseTopics: false, inputMode: "steer", inputModeRevision: 1 });
+      expect(await loadConfig(tempDir)).toEqual(repaired);
+    });
+
     it("merges a preference update before validating that saved field", async () => {
       const connection = { version: 1, botToken: "x", chatId: 1, allowedUserId: 1 };
       await fs.mkdir(getConfigDir(tempDir), { recursive: true });
@@ -418,10 +574,16 @@ describe("config module", () => {
       await expect(loadConfig(tempDir)).rejects.toThrow("autoCloseTopics must be a boolean");
     });
 
-    it.each([{ autoCloseTopics: "ON" }, { autoCloseTopics: null }, { version: 2 }])("rejects explicitly supplied invalid updates: %j", async invalid => {
+    it.each([
+      { autoCloseTopics: "ON" }, { autoCloseTopics: null }, { version: 2 },
+      { inputModeRevision: 0 }, { inputModeRevision: null }, { inputModeRevision: "2" },
+      { inputModeRevision: 1.5 }, { inputModeRevision: Number.MAX_SAFE_INTEGER + 1 },
+    ])("rejects explicitly supplied invalid updates: %j", async invalid => {
       const connection = { botToken: "x", chatId: 1, allowedUserId: 1 };
       await saveConfig(tempDir, { version: 1, ...connection });
-      await expect(loadConfig(tempDir, { ...connection, ...invalid } as unknown as Partial<MuxConfig>)).rejects.toThrow("Invalid config");
+      const updates = { ...connection, ...invalid } as unknown as Partial<MuxConfig>;
+      await expect(loadConfig(tempDir, updates)).rejects.toThrow("Invalid config");
+      await expect(saveConfig(tempDir, { updates })).rejects.toThrow("Invalid config");
     });
 
     it.each([{ autoCloseTopics: true }, { botToken: "replacement-token" }])("does not rebuild malformed JSON from an incomplete update: %j", async updates => {
