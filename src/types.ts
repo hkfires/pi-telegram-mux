@@ -4,6 +4,8 @@
 
 export const BINDING_CUSTOM_TYPE = "pi-telegram-mux.binding";
 
+export type BusyInputMode = "followUp" | "steer";
+
 /**
  * Global configuration stored in {agentDir}/pi-telegram-mux/config.json
  */
@@ -13,6 +15,8 @@ export interface MuxConfig {
   chatId: number; // numeric ID of Forum Supergroup
   allowedUserId: number; // numeric Telegram user ID
   autoCloseTopics?: boolean; // Close topics when leaving a session; defaults to false.
+  inputMode?: BusyInputMode; // How messages sent while Pi is working should be handled; defaults to "followUp".
+  inputModeRevision?: number; // Monotonic revision of the global input mode setting.
 }
 
 /**
@@ -56,6 +60,8 @@ export interface InboundResult {
   busy: boolean;
   statusReply?: string;
   menu?: Array<Array<{ text: string; command: string }>>;
+  inputMode?: BusyInputMode;
+  inputModeRevision?: number;
 }
 
 export interface TransportStatus {
@@ -66,7 +72,7 @@ export interface TransportStatus {
   interactionError?: { code: string; message: string };
 }
 
-export const IPC_PROTOCOL_VERSION = 4;
+export const IPC_PROTOCOL_VERSION = 5;
 
 /**
  * Leader lock metadata stored in {agentDir}/pi-telegram-mux/runtime/leader.json
@@ -158,14 +164,15 @@ export interface TelegramApiResponse<T> {
  */
 export type IpcMessage =
   | { type: "auth"; protocolVersion: number; capability: string; runtimeId: string }
-  | { type: "auth_ack"; protocolVersion: number; epoch: number; configFingerprint: string; status: TransportStatus }
+  | { type: "auth_ack"; protocolVersion: number; epoch: number; configFingerprint: string; connectionFingerprint?: string; status: TransportStatus; inputMode?: BusyInputMode; inputModeRevision?: number }
+  | { type: "sync_input_mode"; mode: BusyInputMode; revision: number }
   | { type: "transport_status"; status: TransportStatus }
   | { type: "transport_reset" }
   | { type: "register"; callId?: string; registration: RuntimeRegistration }
   | { type: "register_ack"; callId?: string; ok: boolean; error?: string }
   | { type: "release"; runtimeId: string; sessionId: string }
   | { type: "release_ack"; ok: boolean }
-  | { type: "inbound"; requestId: string; messageId: number; target: OutputTarget; fromId: number; text: string }
+  | { type: "inbound"; requestId: string; messageId: number; target: OutputTarget; fromId: number; text: string; mode?: BusyInputMode }
   | ({ type: "inbound_ack"; requestId: string } & InboundResult)
   | { type: "abort"; requestId: string; target: OutputTarget }
   | { type: "abort_ack"; requestId: string; ok: boolean }

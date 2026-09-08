@@ -97,6 +97,7 @@ Send text in a topic to submit a task. These commands automatically appear in th
 | --- | --- |
 | `/model` | Choose a model using buttons, with pagination |
 | `/thinking` | Choose a thinking level using buttons |
+| `/inputmode` | Choose busy input mode (follow-up or steering) using buttons |
 | `/status` | View session status |
 | `/stop` | Stop the current task |
 
@@ -125,6 +126,10 @@ Send text in a topic to submit a task. These commands automatically appear in th
 If synchronization fails, check `/tg-status` first, resolve the reported issue, and run `/tg-connect`. To adjust credentials, run `/tg-setup`. If an operation reports "result unknown", check your Pi terminal and Telegram group before retrying.
 
 Prompts and final responses are delivered and stored within Telegram, and Pi maintains its own local session records. The extension does not store separate chat logs.
+
+## Limitations
+
+Pi 0.85's normal input API lacks queue confirmation and source tracking, so busy Follow-up and Steering inputs use the extension-message queue to avoid false receipt confirmations or mismatched status updates. They appear as Telegram messages in Pi, bypass other extensions' input transformations, and do not appear in the ordinary pending-text queue. Idle input is unaffected.
 
 ## License
 

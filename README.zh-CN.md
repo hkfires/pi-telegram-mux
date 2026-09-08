@@ -97,6 +97,7 @@ pi -e /path/to/pi-telegram-mux/extensions/index.ts
 | --- | --- |
 | `/model` | 点击按钮选择模型，支持翻页 |
 | `/thinking` | 点击按钮选择思考量 |
+| `/inputmode` | 点击按钮选择忙时输入模式（Follow-up 排队或 Steering 插入） |
 | `/status` | 查看会话状态 |
 | `/stop` | 中止当前任务 |
 
@@ -125,6 +126,10 @@ pi -e /path/to/pi-telegram-mux/extensions/index.ts
 遇到同步异常，先查看 `/tg-status`，处理提示的问题后运行 `/tg-connect`；需要修改配置时运行 `/tg-setup`。如果提示任务或话题创建“结果未知”，请先检查电脑上的会话和群内话题，再决定是否重试。
 
 提示词和回复会发送并保存在 Telegram，Pi 也会保存自身会话记录；插件不额外保存聊天副本。
+
+## 使用限制
+
+Pi 0.85 的普通输入接口缺少入队确认和来源追踪，因此忙时的 Follow-up、Steering 改用扩展消息队列，避免误报接收成功或状态错配。消息在 Pi 中显示为 Telegram 消息，不经过其他扩展的输入转换，也不出现在普通待发送文本队列中；空闲输入不受影响。
 
 ## 许可证
 

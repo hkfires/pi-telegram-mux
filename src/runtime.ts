@@ -10,16 +10,24 @@ import { BoundedOutbox } from "./outbox.js";
 import { extractAssistantText, extractUserText, splitTelegramMessage } from "./render.js";
 import { MarkdownWorker } from "./markdown-worker.js";
 import { TelegramClient, validateBotAndChat } from "./telegram.js";
-import type { BindingState, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic, TelegramMessage } from "./types.js";
+import type { BindingState, BusyInputMode, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic, TelegramMessage } from "./types.js";
 
 // Pi cannot cancel setModel(). Keep its safety barrier across extension reloads, but never
 // await it during shutdown: quitting the Pi process is the safe recovery for a hung provider.
 const modelChangesKey = Symbol.for("pi-telegram-mux.pending-model-changes.v1");
-const processState = globalThis as typeof globalThis & { [modelChangesKey]?: Map<string, Promise<boolean>> };
+const inputModeChangesKey = Symbol.for("pi-telegram-mux.pending-input-mode-changes.v1");
+const processState = globalThis as typeof globalThis & {
+  [modelChangesKey]?: Map<string, Promise<boolean>>;
+  [inputModeChangesKey]?: Map<string, Set<Promise<InboundResult>>>;
+};
 const pendingModelChanges = processState[modelChangesKey] ??= new Map<string, Promise<boolean>>();
+const pendingInputModeChanges = processState[inputModeChangesKey] ??= new Map<string, Set<Promise<InboundResult>>>();
 const SETTINGS_PENDING_NOTICE = "A Telegram model change is still pending. Wait for it to finish, or quit and restart Pi if it is stuck. /reload cannot cancel it.";
+const INPUT_MODE_PENDING_NOTICE = "The input mode configuration is still being saved. Wait for the save to finish, then use /inputmode to check the current setting.";
 
 const MAX_MIRRORED_TEXT_LENGTH = 65_536;
+const MAX_QUEUED_INPUTS = 64;
+const TELEGRAM_INPUT_TYPE = "Telegram";
 const TOPIC_MISSING_NOTICE = "Telegram topic is no longer available. A new topic will be created when you send your next prompt in Pi.";
 
 export const TG_STATUS_KEY = "tg";
@@ -136,7 +144,10 @@ export class MuxRuntime {
   private currentRun: MirrorRun | null = null;
   private cleanupTask: Promise<void> | null = null;
   private pendingInput?: Admission;
+  private readonly queuedInputs = new Map<string, { run: MirrorRun; messageId?: number }>();
   private settingsCommandInFlight = false;
+  private inputModeCommandInFlight = false;
+  private inputModeRevision = 0;
   private readonly inputOrigin = new AsyncLocalStorage<Admission>();
   public readonly outbox: BoundedOutbox;
   private readonly markdownWorker = new MarkdownWorker();
@@ -150,7 +161,8 @@ export class MuxRuntime {
 
   public getBindingState(): BindingState { return this.bindingState; }
   public getCurrentThreadId(): number | null { return this.currentThreadId; }
-  public getIsIdle(): boolean { return this.isIdle && !this.pendingInput && !this.settingsCommandInFlight && !this.hasPendingModelChange(); }
+  public getInputModeRevision(): number { return Math.max(this.inputModeRevision, this.coordinator?.getInputModeRevision() ?? 0); }
+  public getIsIdle(): boolean { return this.isIdle && !this.pendingInput && !this.settingsCommandInFlight && !this.inputModeCommandInFlight && !this.hasPendingModelChange(); }
 
   private hasPendingModelChange(ctx: ExtensionContext | null = this.activeCtx): boolean {
     return Boolean(ctx && pendingModelChanges.has(JSON.stringify([this.agentDir, ctx.sessionManager.getSessionId()])));
@@ -196,6 +208,7 @@ export class MuxRuntime {
   private applyConfig(config: MuxConfig, ctx: ExtensionContext): void {
     this.invalidateRun();
     this.config = config;
+    this.inputModeRevision = config.inputModeRevision ?? 0;
     this.connectionError = null;
     const resolved = resolveBindingState(ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId(), config.chatId);
     const uncertain = this.unknownCreates.has(`${ctx.sessionManager.getSessionId()}:${config.chatId}`);
@@ -223,8 +236,15 @@ export class MuxRuntime {
       for (let attempt = 0; attempt < 3; attempt++) {
         const config = await loadConfig(this.agentDir);
         if (!this.active || version !== this.transportVersion || !config) return;
-        if (JSON.stringify(config) !== JSON.stringify(this.config)) this.applyConfig(config, ctx);
-        const candidate = new LeaderCoordinator(config, this.agentDir, undefined, {
+        if (!this.config || configFingerprint(config, "connection") !== configFingerprint(this.config, "connection")) {
+          this.applyConfig(config, ctx);
+        } else if ((config.inputModeRevision ?? 0) >= this.getInputModeRevision()) {
+          // A preference change during disconnection must not invalidate a run.
+          this.config.inputMode = config.inputMode;
+          this.config.inputModeRevision = config.inputModeRevision;
+          this.inputModeRevision = config.inputModeRevision ?? 0;
+        }
+        const candidate = new LeaderCoordinator(this.config ?? config, this.agentDir, undefined, {
           onConfigChange: async next => {
             if (this.active && version === this.transportVersion) {
               this.applyConfig(next, ctx);
@@ -242,11 +262,33 @@ export class MuxRuntime {
           } else {
             await candidate.stop();
             const client = new IpcFollowerClient(result.port, result.capability, this.runtimeId);
+            let modeConflict: { mode: BusyInputMode; revision: number } | undefined;
             this.followerClient = client;
             client.setStatusHandler(() => { if (this.active && version === this.transportVersion) this.updateStatusBar(ctx); });
+            client.setInputModeHandler((mode, revision) => {
+              if ((mode !== "followUp" && mode !== "steer") || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) return;
+              if (revision === this.getInputModeRevision() && mode !== (this.config?.inputMode ?? "followUp")) {
+                modeConflict = { mode, revision };
+              }
+              if (revision <= this.getInputModeRevision()) return;
+              modeConflict = undefined;
+              this.inputModeRevision = revision;
+              if (this.config) {
+                this.config.inputMode = mode;
+                this.config.inputModeRevision = revision;
+              }
+              if (this.currentRun?.config) {
+                this.currentRun.config.inputMode = mode;
+                this.currentRun.config.inputModeRevision = revision;
+              }
+              if (this.pendingInput?.config) {
+                this.pendingInput.config.inputMode = mode;
+                this.pendingInput.config.inputModeRevision = revision;
+              }
+            });
             client.setInboundHandler(msg => {
               if (!this.isTargetCurrent(msg.target, ctx) || msg.fromId !== this.config?.allowedUserId) return Promise.resolve({ accepted: false, busy: true });
-              return this.handleInboundText(msg.text, ctx, msg.messageId);
+              return this.handleInboundText(msg.text, ctx, msg.messageId, msg.mode);
             });
             client.setAbortHandler(target => {
               if (!this.isTargetCurrent(target, ctx) || !ctx.abort) return false;
@@ -269,7 +311,11 @@ export class MuxRuntime {
             if (!this.active || version !== this.transportVersion) { client.close(); return; }
             if (!client.isConnected() || this.followerClient !== client) throw new IpcError("IPC_CLOSED", "IPC reset during authentication");
             this.isLeader = false;
-            if (client.getConfigFingerprint() !== configFingerprint(config)) {
+            // Modes synchronize independently of the connection. Older peers
+            // without a connection fingerprint retain full reconciliation.
+            const connectionFingerprint = client.getConfigFingerprint("connection");
+            const syncMode = Boolean(connectionFingerprint) && (this.getInputModeRevision() > 0 || modeConflict !== undefined);
+            if ((syncMode ? connectionFingerprint : client.getConfigFingerprint()) !== configFingerprint(config, syncMode ? "connection" : "all")) {
               // A disconnected setup or manual config edit must also update the existing
               // Leader before this Runtime can claim a route or submit a business request.
               await client.register({ runtimeId: this.runtimeId, sessionId: ctx.sessionManager.getSessionId(), threadId: null, generation: this.generation });
@@ -277,6 +323,26 @@ export class MuxRuntime {
               client.close();
               if (this.followerClient === client) this.followerClient = null;
               continue;
+            }
+            if (syncMode && this.config) {
+              if (modeConflict) {
+                // A manual edit can change the mode without changing its revision.
+                // Allocate a revision for the latest disk value, never the cached one.
+                const reconciled = await saveConfig(this.agentDir, this.config, { expectedBase: this.config, reconcileInputMode: modeConflict });
+                if (!this.active || version !== this.transportVersion) return;
+                // A retry timer may already have joined this setup task while the
+                // save was pending. Reject it so connection supervision retries again.
+                if (this.followerClient !== client || !client.isConnected()) throw new IpcError("IPC_CLOSED", "IPC disconnected during input mode reconciliation");
+                const revision = reconciled.inputModeRevision ?? 0;
+                if (revision >= this.getInputModeRevision()) {
+                  this.config.inputMode = reconciled.inputMode;
+                  this.config.inputModeRevision = reconciled.inputModeRevision;
+                  this.inputModeRevision = revision;
+                }
+              }
+              // Disk may have advanced before its writer notified the Leader.
+              // Equal or older revisions are ignored by the receiving coordinator.
+              if (this.getInputModeRevision() > 0) client.send({ type: "sync_input_mode", mode: this.config.inputMode ?? "followUp", revision: this.getInputModeRevision() });
             }
           }
           const registered = await this.registerRoute(ctx);
@@ -361,7 +427,7 @@ export class MuxRuntime {
       const target: OutputTarget = { sessionId, threadId, generation: this.generation };
       const ok = this.coordinator.registerLocalRoute({
         ...target, runtimeId: this.runtimeId,
-        dispatchInbound: (text, messageId) => this.isTargetCurrent(target, ctx) ? this.handleInboundText(text, ctx, messageId) : Promise.resolve({ accepted: false, busy: true }),
+        dispatchInbound: (text, messageId) => this.isTargetCurrent(target, ctx) ? this.handleInboundText(text, ctx, messageId, this.coordinator?.getInputMode() ?? this.config?.inputMode ?? "followUp") : Promise.resolve({ accepted: false, busy: true }),
         abortRun: () => { if (!this.isTargetCurrent(target, ctx) || !ctx.abort) return false; ctx.abort(); return true; },
       });
       if (!ok) ctx.ui?.notify("This topic is already occupied by another Pi instance. Please close duplicate sessions before reconnecting.", "warning");
@@ -399,41 +465,91 @@ export class MuxRuntime {
     throw new Error("No active transport to Telegram Leader");
   }
 
-  public handleInboundText(text: string, ctx: ExtensionContext, messageId?: number): Promise<InboundResult> {
-    if (!this.active || this.configuring || this.getIsReconnecting() || this.bindingState !== "bound" || !this.getIsIdle() || !ctx.isIdle()) return Promise.resolve({ accepted: false, busy: true });
+  public async handleInboundText(text: string, ctx: ExtensionContext, messageId?: number, explicitMode?: BusyInputMode): Promise<InboundResult> {
+    if (!this.active || this.configuring || this.getIsReconnecting() || this.bindingState !== "bound") return Promise.resolve({ accepted: false, busy: true });
     if (this.outbox.error) return Promise.resolve({ accepted: false, busy: false, statusReply: "Telegram sync is paused. Please check errors on your computer and run /tg-connect to retry." });
-    if (!text.trim() || text.length > 4096) return Promise.resolve({ accepted: false, busy: true });
-    const settingsCommand = /^\/(model|thinking)(?:@[a-z\d_]+)?(?:\s+([\s\S]*))?$/i.exec(text.trim());
+    const trimmed = text.trim();
+    if (!trimmed || trimmed.length > 4096) return Promise.resolve({ accepted: false, busy: true });
+    const settingsCommand = /^\/(model|thinking|inputmode)(?:@[a-z\d_]+)?(?:\s+([\s\S]*))?$/i.exec(trimmed);
     if (settingsCommand) {
+      const commandName = settingsCommand[1].toLowerCase();
+      const commandArgs = settingsCommand[2]?.trim() ?? "";
+      if (this.settingsCommandInFlight || this.inputModeCommandInFlight || this.hasPendingModelChange(ctx) ||
+        (commandName !== "inputmode" && this.pendingInput)) {
+        return Promise.resolve({ accepted: false, busy: true });
+      }
       const reference = crypto.randomUUID();
-      const task = this.handleSettingsCommand(settingsCommand[1].toLowerCase(), settingsCommand[2]?.trim() ?? "", ctx, reference);
+      const task = this.handleSettingsCommand(commandName, commandArgs, ctx, reference);
+      if (commandName === "inputmode") {
+        const pending = pendingInputModeChanges.get(this.agentDir) ?? new Set<Promise<InboundResult>>();
+        pendingInputModeChanges.set(this.agentDir, pending);
+        pending.add(task);
+        const clear = () => {
+          pending.delete(task);
+          if (!pending.size && pendingInputModeChanges.get(this.agentDir) === pending) pendingInputModeChanges.delete(this.agentDir);
+        };
+        void task.then(clear, clear);
+      }
       let timer: NodeJS.Timeout;
       const deadline = new Promise<InboundResult>(resolve => {
-        timer = setTimeout(() => resolve({ accepted: false, busy: false, statusReply: `Settings update result unknown (reference ${reference}). Do not resend automatically. ${SETTINGS_PENDING_NOTICE}` }), 2000);
+        const notice = commandName === "inputmode" ? INPUT_MODE_PENDING_NOTICE : SETTINGS_PENDING_NOTICE;
+        timer = setTimeout(() => resolve({ accepted: false, busy: false, statusReply: `Settings update result unknown (reference ${reference}). Do not resend automatically. ${notice}` }), 2000);
       });
       // A slow provider or model-select hook must not block the bot-wide poller.
       // Keep the settings reservation until the actual operation settles, even on timeout.
       return Promise.race([task, deadline]).finally(() => clearTimeout(timer));
     }
-    // Reserve admission synchronously. Pi's void return is not an execution ACK.
-    return new Promise(resolve => {
-      const timer = setTimeout(() => {
-        // An ACK deadline cannot cancel Pi's asynchronous input hooks. Keep the
-        // reservation until a real admission event, even after reporting uncertainty.
-        this.finishInput({ accepted: false, busy: false, statusReply: "Task admission result unknown. Mobile input has been paused; please check local session and do not resend automatically. If unconfirmed, restart this Pi instance." }, false);
-      }, 2000);
-      const admission: Admission = { sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, consumed: false, messageId, resolve, timer };
-      this.pendingInput = admission;
-      // Async context survives Pi's awaited input transformations. Neither origin
-      // nor authority is inferred from mutable prompt text or a global pending slot.
-      try { this.inputOrigin.run(admission, () => this.pi.sendUserMessage(text, { expandPromptTemplates: false })); }
-      catch (error) {
-        // The public void API can reject synchronously (e.g. stale session API).
-        // Translate that rejection at the inbound boundary, never claim acceptance.
-        this.finishInput({ accepted: false, busy: false, statusReply: "Pi rejected the task. Please check local errors." });
-        ctx.ui?.notify(`Telegram input failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    if (this.settingsCommandInFlight || this.inputModeCommandInFlight || this.hasPendingModelChange(ctx) || this.pendingInput) {
+      return Promise.resolve({ accepted: false, busy: true });
+    }
+    if (this.isIdle && ctx.isIdle()) {
+      // Reserve admission synchronously. Pi's void return is not an execution ACK.
+      return new Promise(resolve => {
+        const timer = setTimeout(() => {
+          // An ACK deadline cannot cancel Pi's asynchronous input hooks. Keep the
+          // reservation until a real admission event, even after reporting uncertainty.
+          this.finishInput({ accepted: false, busy: false, statusReply: "Task admission result unknown. Mobile input has been paused; please check local session and do not resend automatically. If unconfirmed, restart this Pi instance." }, false);
+        }, 2000);
+        const admission: Admission = { sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, consumed: false, messageId, resolve, timer };
+        this.pendingInput = admission;
+        // Async context survives Pi's awaited input transformations. Neither origin
+        // nor authority is inferred from mutable prompt text or a global pending slot.
+        try { this.inputOrigin.run(admission, () => this.pi.sendUserMessage(trimmed, { expandPromptTemplates: false })); }
+        catch (error) {
+          // The public void API can reject synchronously (e.g. stale session API).
+          // Translate that rejection at the inbound boundary, never claim acceptance.
+          this.finishInput({ accepted: false, busy: false, statusReply: "Pi rejected the task. Please check local errors." });
+          ctx.ui?.notify(`Telegram input failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        }
+      });
+    }
+    if (this.currentRun !== null && !this.isIdle && !ctx.isIdle()) {
+      if (this.queuedInputs.size >= MAX_QUEUED_INPUTS) return { accepted: false, busy: true };
+      const mode: BusyInputMode = explicitMode ?? this.config?.inputMode ?? "followUp";
+      const deliveryId = crypto.randomUUID();
+      this.queuedInputs.set(deliveryId, { run: this.currentRun, messageId });
+      try {
+        // In Pi 0.85 an active run queues custom messages synchronously, before
+        // any await. Keep the idle check and send together: sendUserMessage's
+        // asynchronous input hooks can otherwise race the end of the run.
+        // Public custom-message details survive queue delivery without changing
+        // model-visible text or guessing provenance from transformed input.
+        this.pi.sendMessage({
+          customType: TELEGRAM_INPUT_TYPE,
+          content: trimmed,
+          display: true,
+          details: { runtimeId: this.runtimeId, deliveryId },
+        }, { triggerTurn: true, deliverAs: mode });
+        const statusReply = mode === "steer"
+          ? "↗ Steering: Request received for delivery after the current tool turn finishes."
+          : "↪ Follow-up: Request received for delivery after the current task finishes.";
+        return { accepted: true, busy: false, statusReply };
+      } catch (error) {
+        this.queuedInputs.delete(deliveryId);
+        return { accepted: false, busy: false, statusReply: "Pi rejected the task. Please check local errors." };
       }
-    });
+    }
+    return Promise.resolve({ accepted: false, busy: true });
   }
 
   private reportSettingsFailure(code: string, reference: string, cause?: unknown): void {
@@ -450,15 +566,74 @@ export class MuxRuntime {
 
   private async handleSettingsCommand(command: string, args: string, ctx: ExtensionContext, reference: string): Promise<InboundResult> {
     // Settings commands have their own completion path: they do not start an agent turn.
-    this.settingsCommandInFlight = true;
+    if (command === "inputmode") this.inputModeCommandInFlight = true;
+    else this.settingsCommandInFlight = true;
     const generation = this.generation;
     const sessionId = ctx.sessionManager.getSessionId();
     let reply: string;
     let menu: InboundResult["menu"];
     let accepted = true;
     let failureCode = "PI_SETTINGS_QUERY_FAILED";
+    let inputModeResult: BusyInputMode | undefined;
     try {
-      if (command === "thinking") {
+      if (command === "inputmode") {
+        failureCode = "PI_INPUT_MODE_CHANGE_FAILED";
+        const currentMode = this.coordinator?.getInputMode() ?? this.config?.inputMode ?? "followUp";
+        const normalized = args.toLowerCase().replace(/[-_]/g, "");
+        if (!args) {
+          reply = `Busy input mode: ${currentMode === "steer" ? "Steering" : "Follow-up"} (global)\nChoose how messages sent while Pi is working should be handled:`;
+          menu = [
+            [
+              { text: `${currentMode === "followUp" ? "✓ " : ""}Follow-up`, command: "/inputmode followup" },
+              { text: `${currentMode === "steer" ? "✓ " : ""}Steering`, command: "/inputmode steer" },
+            ],
+          ];
+        } else if (normalized !== "followup" && normalized !== "steer" && normalized !== "steering") {
+          accepted = false;
+          reply = "Invalid input mode. Use: /inputmode followup or /inputmode steer.";
+        } else {
+          const targetMode: BusyInputMode = normalized.startsWith("steer") ? "steer" : "followUp";
+          const freshConfig = await loadConfig(this.agentDir, { inputMode: targetMode });
+          if (!freshConfig) throw new Error("Telegram configuration missing");
+          if (!this.isConfigCompatible(freshConfig)) {
+            throw new Error("Connection configuration has changed on disk; reconnect before changing input mode");
+          }
+          const savedConfig = await saveConfig(this.agentDir, freshConfig, { expectedBase: this.config ?? undefined, modeUpdate: true });
+          const revision = savedConfig.inputModeRevision ?? 1;
+          if (revision <= this.getInputModeRevision()) {
+            const actualMode = this.coordinator?.getInputMode() ?? this.config?.inputMode ?? "followUp";
+            reply = `Input mode update was superseded by a newer setting. Current mode is ${actualMode === "steer" ? "Steering" : "Follow-up"} (global).`;
+            menu = [
+              [
+                { text: `${actualMode === "followUp" ? "✓ " : ""}Follow-up`, command: "/inputmode followup" },
+                { text: `${actualMode === "steer" ? "✓ " : ""}Steering`, command: "/inputmode steer" },
+              ],
+            ];
+            return { accepted: false, busy: false, statusReply: reply, menu, inputMode: actualMode, inputModeRevision: this.getInputModeRevision() };
+          }
+          this.inputModeRevision = revision;
+          if (this.config) {
+            this.config.inputMode = targetMode;
+            this.config.inputModeRevision = revision;
+          }
+          if (this.currentRun?.config) {
+            this.currentRun.config.inputMode = targetMode;
+            this.currentRun.config.inputModeRevision = revision;
+          }
+          if (this.pendingInput?.config) {
+            this.pendingInput.config.inputMode = targetMode;
+            this.pendingInput.config.inputModeRevision = revision;
+          }
+          if (this.coordinator) {
+            this.coordinator.updateInputMode(targetMode, undefined, revision);
+          }
+          if (this.followerClient?.isConnected()) {
+            this.followerClient.send({ type: "sync_input_mode", mode: targetMode, revision });
+          }
+          inputModeResult = targetMode;
+          reply = `Busy input mode set to ${targetMode === "steer" ? "Steering" : "Follow-up"} (global).`;
+        }
+      } else if (command === "thinking") {
         const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
         const level = levels.find(value => value === args.toLowerCase());
         if (!args) {
@@ -537,11 +712,12 @@ export class MuxRuntime {
       reply = `Settings update failed or result unknown [${failureCode}; reference ${reference}]. Check local Pi settings before retrying.`;
       menu = undefined;
     } finally {
-      this.settingsCommandInFlight = false;
+      if (command === "inputmode") this.inputModeCommandInFlight = false;
+      else this.settingsCommandInFlight = false;
     }
     // Model identifiers are provider-controlled; keep feedback within Telegram's limit.
     if (reply.length > 4000) reply = `${Array.from(reply).slice(0, 1900).join("")}\nList truncated; check the full model identifiers locally.`;
-    return { accepted, busy: false, statusReply: reply, ...(menu ? { menu } : {}) };
+    return { accepted, busy: false, statusReply: reply, ...(menu ? { menu } : {}), ...(inputModeResult ? { inputMode: inputModeResult, inputModeRevision: this.inputModeRevision } : {}) };
   }
 
   private finishInput(result: InboundResult, release = true): void {
@@ -557,10 +733,30 @@ export class MuxRuntime {
     const run = this.currentRun;
     if (!run || !message || typeof message !== "object" || !("role" in message)) return;
     if (message.role === "assistant") { run.text = ""; run.stopReason = undefined; run.replyQueued = false; return; }
-    if (message.role !== "user") return;
+    let queued: { run: MirrorRun; messageId?: number } | undefined;
+    if (message.role === "custom" && "customType" in message && message.customType === TELEGRAM_INPUT_TYPE) {
+      const details = "details" in message ? message.details : undefined;
+      if (!details || typeof details !== "object" || !("runtimeId" in details) || details.runtimeId !== this.runtimeId ||
+          !("deliveryId" in details) || typeof details.deliveryId !== "string") return;
+      queued = this.queuedInputs.get(details.deliveryId);
+      this.queuedInputs.delete(details.deliveryId);
+      // A queued input can outlive disconnect/setup. Its reply must never gain
+      // the authority of a newer run or a newly configured Telegram target.
+      if (!queued || queued.run !== run || !this.isRunCurrent(run)) { run.suppressed = true; return; }
+    } else if (message.role !== "user") return;
     run.text = "";
     run.stopReason = undefined;
     run.replyQueued = false;
+    if (queued) {
+      const messageId = queued.messageId;
+      if (typeof messageId === "number") {
+        run.promptMessageIds.push(messageId);
+        this.outbox.enqueue(async signal => {
+          if (this.isRunCurrent(run) && run.target && !signal.aborted) await this.setReaction(run.target, messageId, "👀", signal);
+        });
+      }
+      return;
+    }
     if (run.firstUserMessage) {
       run.firstUserMessage = false;
       if (run.origin) {
@@ -592,6 +788,12 @@ export class MuxRuntime {
     this.activeCtx = ctx;
     if (this.hasPendingModelChange(ctx)) ctx.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
     const version = this.transportVersion;
+    // Shutdown need not await a settings write, but a replacement runtime must
+    // read after it commits. Keep this barrier across extension module reloads.
+    while (pendingInputModeChanges.has(this.agentDir)) {
+      await Promise.allSettled([...pendingInputModeChanges.get(this.agentDir)!]);
+      if (!this.active || version !== this.transportVersion) return;
+    }
     const config = await loadConfig(this.agentDir);
     if (!this.active || version !== this.transportVersion) return;
     this.config = config;
@@ -683,7 +885,7 @@ export class MuxRuntime {
     const run: MirrorRun = {
       sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, ctx,
       target: null, origin: origin?.consumed ? undefined : origin, promptMessageIds,
-      suppressed: this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.generation !== this.generation || origin.config !== this.config || origin.sessionId !== ctx.sessionManager.getSessionId())),
+      suppressed: this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
       firstUserMessage: true, text: "", settled, settle,
     };
     this.currentRun = run;
@@ -726,11 +928,21 @@ export class MuxRuntime {
     });
   }
 
+  private isConfigCompatible(other: MuxConfig | null): boolean {
+    if (!this.config || !other) return false;
+    return this.config === other || (
+      this.config.chatId === other.chatId &&
+      this.config.botToken === other.botToken &&
+      this.config.allowedUserId === other.allowedUserId &&
+      this.config.autoCloseTopics === other.autoCloseTopics
+    );
+  }
+
   private isRunCurrent(run: MirrorRun): boolean {
     // A setup dialog pauses delivery, but existing runs must keep their captures.
     // Saving a configuration invalidates the run through its generation instead.
     return this.active && this.config !== null && this.bindingState !== "disconnected" && !run.suppressed && run.generation === this.generation &&
-      run.config === this.config && run.sessionId === run.ctx.sessionManager.getSessionId();
+      this.isConfigCompatible(run.config) && run.sessionId === run.ctx.sessionManager.getSessionId();
   }
 
   public onMessageEnd(message: unknown): void {
@@ -765,8 +977,19 @@ export class MuxRuntime {
     this.isIdle = true;
     const run = this.currentRun;
     this.currentRun = null;
+    const undelivered = [...this.queuedInputs.values()].filter(input => input.run === run);
+    this.queuedInputs.clear();
     if (!run) return;
     run.settle();
+    if (undelivered.length && this.isRunCurrent(run)) {
+      this.outbox.enqueue(async signal => {
+        if (!this.isRunCurrent(run) || !run.target || signal.aborted) return;
+        for (const input of undelivered) {
+          if (typeof input.messageId === "number") await this.setReaction(run.target, input.messageId, "😭", signal);
+        }
+        await this.sendRunText("⚠️ Some queued Telegram messages were not delivered before the task ended. Check local Pi before resending.", run, signal);
+      });
+    }
     const emoji = run.stopReason === "error" ? "😱"
       : run.stopReason === "aborted" ? "😭"
       : "💯";
@@ -900,6 +1123,7 @@ export class MuxRuntime {
     this.generation++;
     this.currentRun?.settle();
     this.currentRun = null;
+    this.queuedInputs.clear();
     this.outbox.reset();
     this.finishInput({ accepted: false, busy: false, statusReply: "Session changed; execution result unknown. Please check local status." }, false);
   }
@@ -936,16 +1160,31 @@ export class MuxRuntime {
     return task;
   }
 
-  public onInput(ctx: ExtensionContext, interactiveText?: string): { action: "handled" } | undefined {
+  public onInput(ctx: ExtensionContext, interactiveText?: string): { action: "handled" } | undefined | Promise<{ action: "handled" } | undefined> {
     // This only fences settings already in progress. Pi exposes no terminal input-preflight
     // event for downstream handled/failed inputs, so a full bidirectional lock needs SDK support.
     if (!this.settingsCommandInFlight && !this.hasPendingModelChange(ctx)) return undefined;
+    const origin = this.inputOrigin.getStore();
+    if (interactiveText === undefined && origin && !origin.consumed && this.active &&
+      origin.generation === this.generation && origin.sessionId === ctx.sessionManager.getSessionId() &&
+      this.isConfigCompatible(origin.config)) {
+      // This input passed admission before the model change began. Pi awaits input
+      // hooks, so wait for the change instead of consuming and losing the prompt.
+      // Recheck after either outcome in case another change has started meanwhile.
+      const changing = pendingModelChanges.get(JSON.stringify([this.agentDir, origin.sessionId]));
+      if (changing) return changing.then(() => this.onInput(ctx), () => this.onInput(ctx));
+      return undefined;
+    }
     if (interactiveText !== undefined) ctx.ui.setEditorText?.(interactiveText);
     ctx.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
     return { action: "handled" };
   }
 
   public onSessionBeforeSwitch(ctx: ExtensionContext): Promise<void | { cancel: true }> {
+    if (this.inputModeCommandInFlight) {
+      ctx.ui.notify(INPUT_MODE_PENDING_NOTICE, "warning");
+      return Promise.resolve({ cancel: true });
+    }
     if (this.settingsCommandInFlight || this.hasPendingModelChange(ctx)) {
       ctx.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
       return Promise.resolve({ cancel: true });
@@ -964,6 +1203,10 @@ export class MuxRuntime {
 
   public onSessionBeforeFork(ctx: ExtensionContext): Promise<void | { cancel: true }> { return this.onSessionBeforeSwitch(ctx); }
   public onSessionBeforeTree(): Promise<void | { cancel: true }> {
+    if (this.inputModeCommandInFlight) {
+      this.activeCtx?.ui.notify(INPUT_MODE_PENDING_NOTICE, "warning");
+      return Promise.resolve({ cancel: true });
+    }
     if (this.settingsCommandInFlight || this.hasPendingModelChange()) {
       this.activeCtx?.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
       return Promise.resolve({ cancel: true });
@@ -1027,7 +1270,7 @@ export class MuxRuntime {
     this.activeCtx = ctx;
     const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
     const failure = this.connectionError?.message ?? status?.error?.message ?? status?.feedbackError?.message ?? this.outbox.error?.message;
-    ctx.ui?.notify(`[Telegram Mux Status]\nConfig: ${this.config ? "configured" : "missing"}\nRole: ${this.isLeader ? "Leader" : this.followerClient ? "Follower" : "None"}\nSession ID: ${ctx.sessionManager.getSessionId()?.slice(-6)}\nBinding: ${this.bindingState}\nThread ID: ${this.currentThreadId ?? "none"}\nAuto-close topics: ${this.config?.autoCloseTopics ? "ON" : "OFF"}\nRuntime: ${this.getIsIdle() && ctx.isIdle() ? "idle" : "busy"}\nPolling: ${status?.polling ?? "offline"}\nPending sync: ${this.outbox.size}\nError: ${failure ?? "none"}\nSettings error: ${this.settingsFailure ?? "none"}\nInteraction warning: ${status?.interactionError?.message ?? "none"}`, "info");
+    ctx.ui?.notify(`[Telegram Mux Status]\nConfig: ${this.config ? "configured" : "missing"}\nRole: ${this.isLeader ? "Leader" : this.followerClient ? "Follower" : "None"}\nSession ID: ${ctx.sessionManager.getSessionId()?.slice(-6)}\nBinding: ${this.bindingState}\nThread ID: ${this.currentThreadId ?? "none"}\nAuto-close topics: ${this.config?.autoCloseTopics ? "ON" : "OFF"}\nBusy input mode: ${this.config?.inputMode ?? "followUp"}\nRuntime: ${this.getIsIdle() && ctx.isIdle() ? "idle" : "busy"}\nPolling: ${status?.polling ?? "offline"}\nPending sync: ${this.outbox.size}\nError: ${failure ?? "none"}\nSettings error: ${this.settingsFailure ?? "none"}\nInteraction warning: ${status?.interactionError?.message ?? "none"}`, "info");
     this.updateStatusBar(ctx);
   }
 

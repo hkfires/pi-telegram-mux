@@ -162,6 +162,23 @@ describe("runtime module", () => {
   });
 
   describe("MuxRuntime lifecycle and admission", () => {
+    async function busyFixture() {
+      const pi = { sendUserMessage: vi.fn(), sendMessage: vi.fn(), appendEntry: vi.fn() };
+      const entries = [{ type: "custom", customType: "pi-telegram-mux.binding", data: { version: 1, sessionId: "busy-session", chatId: mockConfig.chatId, threadId: 10 } }];
+      const ctx = {
+        mode: "tui", isIdle: vi.fn(() => false), ui: { notify: vi.fn(), setStatus: vi.fn() },
+        sessionManager: { getSessionId: () => "busy-session", getEntries: () => entries },
+      } as any;
+      const runtime = new MuxRuntime(pi as any, tempDir);
+      await runtime.onSessionStart(ctx);
+      const telegram = vi.spyOn(runtime, "callTelegram").mockResolvedValue({ message_id: 900 } as any);
+      await runtime.onBeforeAgentStart({ prompt: "initial task" }, ctx);
+      runtime.onMessageStart({ role: "user", content: "initial task" }, ctx);
+      await runtime.outbox.whenIdle();
+      telegram.mockClear();
+      return { runtime, pi, ctx, entries, telegram };
+    }
+
     it("ignores session_start in non-TUI mode", async () => {
       const mockPi = {
         on: vi.fn(),
@@ -183,7 +200,7 @@ describe("runtime module", () => {
       expect(runtime.getBindingState()).toBe("unbound");
     });
 
-    it("rejects inbound message when busy without queueing", async () => {
+    it("rejects inbound message when busy without queueing in unbound session", async () => {
       const mockPi = {
         sendUserMessage: vi.fn(),
       } as any;
@@ -205,6 +222,180 @@ describe("runtime module", () => {
       expect(result.busy).toBe(true);
       expect(result.accepted).toBe(false);
       expect(mockPi.sendUserMessage).not.toHaveBeenCalled();
+    });
+
+    it("queues inbound message when busy in bound session according to inputMode", async () => {
+      const mockPi = {
+        sendUserMessage: vi.fn(),
+        sendMessage: vi.fn(),
+      } as any;
+
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const mockCtx = {
+        mode: "tui",
+        isIdle: () => false,
+        sessionManager: {
+          getSessionId: () => "sess-1",
+          getEntries: () => [{ type: "custom", customType: "pi-telegram-mux.binding", data: { version: 1, sessionId: "sess-1", chatId: mockConfig.chatId, threadId: 10 } }],
+        },
+      } as any;
+      await runtime.onSessionStart(mockCtx);
+
+      // Simulate an active agent run
+      await runtime.onBeforeAgentStart({ prompt: "initial task" }, mockCtx);
+      expect(runtime.getIsIdle()).toBe(false);
+
+      // Inbound arrives while busy: queues via followUp by default
+      const result = await runtime.handleInboundText("hello while busy", mockCtx);
+      expect(result.busy).toBe(false);
+      expect(result.accepted).toBe(true);
+      expect(result.statusReply).toContain("Follow-up: Request received");
+      expect(mockPi.sendMessage).toHaveBeenCalledWith({
+        customType: "Telegram", content: "hello while busy", display: true,
+        details: { runtimeId: expect.any(String), deliveryId: expect.any(String) },
+      }, { triggerTurn: true, deliverAs: "followUp" });
+
+      // Switch to steer:
+      await runtime.handleInboundText("/inputmode steer", mockCtx);
+      const steerResult = await runtime.handleInboundText("hello steer", mockCtx);
+      expect(steerResult.busy).toBe(false);
+      expect(steerResult.accepted).toBe(true);
+      expect(steerResult.statusReply).toContain("Steering: Request received");
+      expect(mockPi.sendMessage).toHaveBeenCalledWith({
+        customType: "Telegram", content: "hello steer", display: true,
+        details: { runtimeId: expect.any(String), deliveryId: expect.any(String) },
+      }, { triggerTurn: true, deliverAs: "steer" });
+      expect(mockPi.sendUserMessage).not.toHaveBeenCalled();
+    });
+
+    it.each(["followUp", "steer"] as const)("queues simultaneous %s inputs synchronously without entering the user input pipeline", async mode => {
+      const f = await busyFixture();
+      const admissions = [
+        f.runtime.handleInboundText("first request", f.ctx, 101, mode),
+        f.runtime.handleInboundText("second request", f.ctx, 102, mode),
+      ];
+      // Pi's custom-message queue is populated before the async caller resumes.
+      expect(f.pi.sendMessage).toHaveBeenCalledTimes(2);
+      expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+      expect(await Promise.all(admissions)).toEqual([
+        expect.objectContaining({ accepted: true, busy: false }),
+        expect.objectContaining({ accepted: true, busy: false }),
+      ]);
+      const messages = f.pi.sendMessage.mock.calls.map(([message]) => message);
+      expect(messages.map(message => message.content)).toEqual(["first request", "second request"]);
+      expect(new Set(messages.map(message => message.details.deliveryId)).size).toBe(2);
+      for (const [message, options] of f.pi.sendMessage.mock.calls) {
+        expect(message).toMatchObject({ customType: "Telegram", display: true, details: { runtimeId: expect.any(String), deliveryId: expect.any(String) } });
+        expect(options).toEqual({ triggerTurn: true, deliverAs: mode });
+      }
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram).not.toHaveBeenCalled();
+    });
+
+    it("tracks equal-text busy inputs by delivery identity while still mirroring a local prompt", async () => {
+      const f = await busyFixture();
+      await f.runtime.handleInboundText("same text", f.ctx, 101, "followUp");
+      await f.runtime.handleInboundText("same text", f.ctx, 102, "steer");
+      const [first, second] = f.pi.sendMessage.mock.calls.map(([message]) => message);
+      f.runtime.onMessageStart({ role: "user", content: "same text" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["🧑‍💻 [Prompt]\nsame text"]);
+      f.telegram.mockClear();
+
+      // Steering can be consumed before an earlier follow-up with identical text.
+      f.runtime.onMessageStart({ ...second, role: "custom" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram.mock.calls.filter(([method]) => method === "setMessageReaction").map(([, params]) => params)).toEqual([
+        expect.objectContaining({ message_id: 102, reaction: [{ type: "emoji", emoji: "👀" }] }),
+      ]);
+      f.runtime.onMessageStart({ ...first, role: "custom" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram.mock.calls.filter(([method]) => method === "setMessageReaction").map(([, params]) => params.message_id)).toEqual([102, 101]);
+      expect(f.telegram.mock.calls.some(([method]) => method === "sendMessage")).toBe(false);
+
+      f.runtime.onTurnEnd({ role: "assistant", content: "both complete", stopReason: "stop" });
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
+      for (const messageId of [101, 102]) {
+        expect(f.telegram.mock.calls.filter(([method, params]) => method === "setMessageReaction" && params.message_id === messageId).map(([, params]) => params.reaction)).toEqual([
+          [{ type: "emoji", emoji: "👀" }], [{ type: "emoji", emoji: "💯" }],
+        ]);
+      }
+      expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["both complete"]);
+    });
+
+    it("ignores another runtime's custom message without consuming the queued Telegram origin", async () => {
+      const f = await busyFixture();
+      await f.runtime.handleInboundText("remote prompt", f.ctx, 101);
+      const [message] = f.pi.sendMessage.mock.calls[0];
+      f.runtime.onMessageStart({ ...message, role: "custom", details: { ...message.details, runtimeId: "different-runtime" } }, f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram).not.toHaveBeenCalled();
+      f.runtime.onMessageStart({ ...message, role: "custom" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram.mock.calls.filter(([method]) => method === "setMessageReaction").map(([, params]) => params.message_id)).toEqual([101]);
+    });
+
+    it.each(["Pi idle", "runtime settled"])("rejects busy input while %s leaves only one active-run signal", async state => {
+      const f = await busyFixture();
+      if (state === "Pi idle") f.ctx.isIdle.mockReturnValue(true);
+      else await f.runtime.onAgentSettled(f.ctx);
+      expect(await f.runtime.handleInboundText("late input", f.ctx, 101)).toEqual({ accepted: false, busy: true });
+      expect(f.pi.sendMessage).not.toHaveBeenCalled();
+      expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+    });
+
+    it("bounds pending delivery tracking and releases capacity after consumption or synchronous rejection", async () => {
+      const f = await busyFixture();
+      f.pi.sendMessage.mockImplementationOnce(() => { throw new Error("Queue unavailable"); });
+      expect((await f.runtime.handleInboundText("rejected input", f.ctx, 100)).accepted).toBe(false);
+      f.pi.sendMessage.mockClear();
+      for (let i = 0; i < 64; i++) expect((await f.runtime.handleInboundText(`queued ${i}`, f.ctx, 101 + i)).accepted).toBe(true);
+      expect(await f.runtime.handleInboundText("queue full", f.ctx, 200)).toEqual({ accepted: false, busy: true });
+      expect(f.pi.sendMessage).toHaveBeenCalledTimes(64);
+      const [first] = f.pi.sendMessage.mock.calls[0];
+      f.runtime.onMessageStart({ ...first, role: "custom" }, f.ctx);
+      expect((await f.runtime.handleInboundText("capacity restored", f.ctx, 201)).accepted).toBe(true);
+      expect(f.pi.sendMessage).toHaveBeenCalledTimes(65);
+    });
+
+    it("reports an undelivered queued message when a run ends and clears it before the next run", async () => {
+      const f = await busyFixture();
+      await f.runtime.handleInboundText("not consumed", f.ctx, 101);
+      f.runtime.onMessageEnd({ role: "assistant", content: "", stopReason: "aborted" });
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram.mock.calls.filter(([method, params]) => method === "setMessageReaction" && params.message_id === 101).map(([, params]) => params.reaction)).toEqual([[{ type: "emoji", emoji: "😭" }]]);
+      expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toContainEqual(expect.stringContaining("queued Telegram messages were not delivered"));
+      await f.runtime.onBeforeAgentStart({ prompt: "new task" }, f.ctx);
+      f.runtime.onMessageStart({ role: "user", content: "new task" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
+      f.telegram.mockClear();
+      f.runtime.onMessageEnd({ role: "assistant", content: "new answer", stopReason: "stop" });
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram.mock.calls.some(([method, params]) => method === "setMessageReaction" && params.message_id === 101)).toBe(false);
+      expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["new answer"]);
+    });
+
+    it("does not deliver old queued input reactions or replies into a replacement topic", async () => {
+      const f = await busyFixture();
+      await f.runtime.handleInboundText("old topic input", f.ctx, 101);
+      const [oldMessage] = f.pi.sendMessage.mock.calls[0];
+      await f.runtime.onSessionBeforeSwitch(f.ctx);
+      await f.runtime.outbox.whenIdle();
+      f.entries[0].data.threadId = 20;
+      await f.runtime.onSessionStart(f.ctx);
+      await f.runtime.onBeforeAgentStart({ prompt: "new topic input" }, f.ctx);
+      f.runtime.onMessageStart({ role: "user", content: "new topic input" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.runtime.getCurrentThreadId()).toBe(20);
+      f.telegram.mockClear();
+      f.runtime.onMessageStart({ ...oldMessage, role: "custom" }, f.ctx);
+      f.runtime.onTurnEnd({ role: "assistant", content: "old input reply", stopReason: "stop" });
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram).not.toHaveBeenCalled();
     });
 
     it("injects inbound message when idle", async () => {

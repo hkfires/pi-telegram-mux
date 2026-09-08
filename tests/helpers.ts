@@ -21,6 +21,7 @@ export async function runtimeFixture(agentDir: string, id: string, threadId: num
   let inputContext: ReturnType<typeof AsyncLocalStorage.snapshot> | undefined;
   const pi = {
     sendUserMessage: vi.fn(() => { inputContext = AsyncLocalStorage.snapshot(); }),
+    sendMessage: vi.fn(),
     appendEntry: vi.fn((customType, data) => entries.push({ type: "custom", customType, data })),
   };
   const runtime = new MuxRuntime(pi as unknown as ExtensionAPI, agentDir);

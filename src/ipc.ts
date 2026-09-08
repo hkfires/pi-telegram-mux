@@ -5,7 +5,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { getRuntimeDir, replaceFile } from "./config.js";
-import { IPC_PROTOCOL_VERSION, type InboundResult, type IpcMessage, type LeaderLockData, type OutputTarget, type RuntimeRegistration, type TransportStatus } from "./types.js";
+import { IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundResult, type IpcMessage, type LeaderLockData, type OutputTarget, type RuntimeRegistration, type TransportStatus } from "./types.js";
 
 const MAX_FRAME_BYTES = 1024 * 1024;
 const LOCK_FILE_NAME = "leader.json";
@@ -188,12 +188,13 @@ export class IpcFollowerClient {
   private socket: net.Socket | null = null;
   private connected = false;
   private configuration = "";
+  private connectionConfiguration = "";
   private status: TransportStatus = { polling: "starting" };
   private onStatusHandler?: () => void;
 
   public getStatus(): TransportStatus { return this.status; }
   public setStatusHandler(handler: () => void): void { this.onStatusHandler = handler; }
-  public getConfigFingerprint(): string { return this.configuration; }
+  public getConfigFingerprint(scope: "all" | "connection" = "all"): string { return scope === "connection" ? this.connectionConfiguration : this.configuration; }
 
   private updateStatus(status: TransportStatus): void {
     if (!status || !["starting", "online", "retrying", "error", "conflict"].includes(status.polling) ||
@@ -208,12 +209,14 @@ export class IpcFollowerClient {
   private onInboundHandler?: (msg: Extract<IpcMessage, { type: "inbound" }>) => Promise<InboundResult>;
   private onAbortHandler?: (target: OutputTarget) => boolean | Promise<boolean>;
   private onDisconnectHandler?: (reason?: IpcError) => void;
+  private onInputModeHandler?: (mode: BusyInputMode, revision?: number) => void;
 
   constructor(private readonly port: number, private readonly capability: string, private readonly runtimeId: string) {}
 
   public setInboundHandler(handler: NonNullable<IpcFollowerClient["onInboundHandler"]>): void { this.onInboundHandler = handler; }
   public setAbortHandler(handler: NonNullable<IpcFollowerClient["onAbortHandler"]>): void { this.onAbortHandler = handler; }
   public setDisconnectHandler(handler: (reason?: IpcError) => void): void { this.onDisconnectHandler = handler; }
+  public setInputModeHandler(handler: (mode: BusyInputMode, revision?: number) => void): void { this.onInputModeHandler = handler; }
 
   public async connect(timeoutMs = 5000): Promise<number> {
     if (this.closed || this.socket) throw new Error("IPC client cannot be reused");
@@ -231,10 +234,14 @@ export class IpcFollowerClient {
               clearTimeout(timeout);
               this.connected = true;
               this.configuration = msg.configFingerprint;
+              this.connectionConfiguration = msg.connectionFingerprint ?? "";
               this.updateStatus(msg.status);
+              if (msg.inputMode) this.onInputModeHandler?.(msg.inputMode, msg.inputModeRevision);
               resolve(msg.epoch);
             } else if (!this.connected) {
               throw new Error("IPC message before authentication");
+            } else if (msg.type === "sync_input_mode") {
+              this.onInputModeHandler?.(msg.mode, msg.revision);
             } else if (msg.type === "transport_status") {
               this.updateStatus(msg.status);
             } else if (msg.type === "transport_reset") {

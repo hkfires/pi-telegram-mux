@@ -5,7 +5,7 @@ import { configFingerprint, loadConfig } from "./config.js";
 import { encodeFrame, FrameParser, tryAcquireLeaderLock } from "./ipc.js";
 import { BoundedOutbox } from "./outbox.js";
 import { ConflictError, isRecoverableTelegramError, RateLimitError, TelegramApiError, TelegramClient } from "./telegram.js";
-import { IPC_PROTOCOL_VERSION, type InboundResult, type IpcMessage, type MuxConfig, type OutputTarget, type RuntimeRegistration, type TelegramUpdate, type TransportStatus } from "./types.js";
+import { IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundResult, type IpcMessage, type MuxConfig, type OutputTarget, type RuntimeRegistration, type TelegramUpdate, type TransportStatus } from "./types.js";
 
 export interface RouteEntry extends OutputTarget {
   runtimeId: string;
@@ -47,6 +47,7 @@ export class LeaderCoordinator {
   private epoch = 0;
   private offset?: number;
   private botUsername?: string;
+  private inputModeRevision = 0;
   private status: TransportStatus = { polling: "starting" };
   public readonly feedback: BoundedOutbox;
   private pollController: AbortController | null = null;
@@ -62,6 +63,7 @@ export class LeaderCoordinator {
 
   constructor(private config: MuxConfig, private readonly agentDir: string, client?: TelegramClient, private readonly options: CoordinatorOptions = {}) {
     this.client = client ?? new TelegramClient({ botToken: config.botToken });
+    this.inputModeRevision = config.inputModeRevision ?? 0;
     this.configuration = configFingerprint(config);
     this.feedback = new BoundedOutbox(error => this.publishStatus({ ...this.status, feedbackError: this.describeError(error) }));
   }
@@ -207,7 +209,7 @@ export class LeaderCoordinator {
       if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) { socket.destroy(); return; }
       state.runtimeId = msg.runtimeId;
       clearTimeout(state.authTimer);
-      socket.write(encodeFrame({ type: "auth_ack", protocolVersion: IPC_PROTOCOL_VERSION, epoch: this.epoch, configFingerprint: this.configuration, status: this.status }));
+      socket.write(encodeFrame({ type: "auth_ack", protocolVersion: IPC_PROTOCOL_VERSION, epoch: this.epoch, configFingerprint: this.configuration, connectionFingerprint: configFingerprint(this.config, "connection"), status: this.status, inputMode: this.config.inputMode ?? "followUp", inputModeRevision: this.inputModeRevision }));
       return;
     }
 
@@ -216,16 +218,32 @@ export class LeaderCoordinator {
       if (pending?.socket === socket && (msg.type === "inbound_ack" ? pending.kind === "inbound" : pending.kind === "abort")) {
         this.pending.delete(msg.requestId);
         clearTimeout(pending.timer);
-        pending.resolve(msg.type === "abort_ack" ? msg.ok === true : {
+        if (msg.type === "abort_ack") {
+          pending.resolve(msg.ok === true);
+          return;
+        }
+        const result = {
           accepted: msg.accepted === true,
           busy: msg.busy === true,
           statusReply: typeof msg.statusReply === "string" ? msg.statusReply.slice(0, 4096) : undefined,
           menu: msg.menu,
-        });
+          inputMode: msg.inputMode === "steer" || msg.inputMode === "followUp" ? msg.inputMode : undefined,
+          inputModeRevision: typeof msg.inputModeRevision === "number" ? msg.inputModeRevision : undefined,
+        };
+        if (result.inputMode) {
+          this.updateInputMode(result.inputMode, socket, result.inputModeRevision);
+        }
+        pending.resolve(result);
       }
       return;
     }
     if (msg.type === "ping") { socket.write(encodeFrame({ type: "pong" })); return; }
+    if (msg.type === "sync_input_mode") {
+      if ((msg.mode === "followUp" || msg.mode === "steer") && Number.isSafeInteger(msg.revision) && msg.revision > 0) {
+        this.updateInputMode(msg.mode, socket, msg.revision);
+      }
+      return;
+    }
     // Cancellation and release must not wait behind a reload barrier.
     if (msg.type === "cancel_telegram") {
       if (typeof msg.callId !== "string" || msg.callId.length > 128) throw new Error("Invalid cancellation ID");
@@ -287,7 +305,15 @@ export class LeaderCoordinator {
           ok = this.claimRoute({
             ...target,
             runtimeId: reg.runtimeId,
-            dispatchInbound: (text, messageId) => this.requestFollower(socket, { type: "inbound", requestId: "", messageId, target, fromId: this.config.allowedUserId, text }) as Promise<InboundResult>,
+            dispatchInbound: (text, messageId) => this.requestFollower(socket, {
+              type: "inbound",
+              requestId: "",
+              messageId,
+              target,
+              fromId: this.config.allowedUserId,
+              text,
+              mode: this.config.inputMode ?? "followUp",
+            }) as Promise<InboundResult>,
             abortRun: () => this.requestFollower(socket, { type: "abort", requestId: "", target }) as Promise<boolean>,
           }, socket);
         }
@@ -405,6 +431,7 @@ export class LeaderCoordinator {
               commands: [
                 { command: "model", description: "List or select the current session model" },
                 { command: "thinking", description: "View or change the current session thinking level" },
+                { command: "inputmode", description: "View or change busy input mode (follow-up or steering)" },
                 { command: "status", description: "Show topic connection status" },
                 { command: "stop", description: "Stop the current session run" },
               ],
@@ -459,6 +486,9 @@ export class LeaderCoordinator {
         reply = stopped ? "Abort signal sent." : "Could not confirm abort; please check local session.";
       } else {
         const result = await route.dispatchInbound(text, msg.message_id);
+        if (result.inputMode) {
+          this.updateInputMode(result.inputMode, undefined, result.inputModeRevision);
+        }
         reply = result.busy ? "Current session is busy. Please try again later." : result.statusReply;
         menu = result.busy ? undefined : result.menu;
       }
@@ -492,7 +522,7 @@ export class LeaderCoordinator {
       this.callbackAnswersInFlight++;
       void client.callApi("answerCallbackQuery", {
         callback_query_id: query.id,
-        text: valid ? "Processing…" : "Menu expired. Send /model or /thinking to open a new menu.",
+        text: valid ? "Processing…" : "Menu expired. Send /model, /thinking, or /inputmode to open a new menu.",
         show_alert: !valid,
       }, 5000, signal).catch(error => {
         if (signal?.aborted || !this.running || this.reloading || this.client !== client) return;
@@ -515,11 +545,14 @@ export class LeaderCoordinator {
     let result: InboundResult;
     try {
       result = await menu.route.dispatchInbound(command, msg.message_id);
+      if (result.inputMode) {
+        this.updateInputMode(result.inputMode, undefined, result.inputModeRevision);
+      }
     } catch (error) {
       this.publishStatus({ ...this.status, feedbackError: this.describeError(error) });
       result = { accepted: false, busy: false, statusReply: "Execution result unknown. Check local Pi; do not click again." };
     }
-    const reply = result.busy ? "The current session is busy. Send /model or /thinking again when the task finishes." : result.statusReply ?? "Operation finished. Send /model or /thinking to view settings.";
+    const reply = result.busy ? "The current session is busy. Send /model, /thinking, or /inputmode again when the task finishes." : result.statusReply ?? "Operation finished. Send /model, /thinking, or /inputmode to view settings.";
     this.enqueueSettingsFeedback(menu.route, menu.generation, reply, result.busy ? undefined : result.menu, msg.message_id);
   }
 
@@ -541,11 +574,41 @@ export class LeaderCoordinator {
     }
   }
 
+  public getInputMode(): BusyInputMode {
+    return this.config.inputMode ?? "followUp";
+  }
+
+  public getInputModeRevision(): number {
+    return this.inputModeRevision;
+  }
+
+  public updateInputMode(mode: BusyInputMode, originSocket?: net.Socket, revision?: number): void {
+    if (revision !== undefined && (!Number.isSafeInteger(revision) || revision <= 0)) return;
+    const rev = revision ?? this.inputModeRevision + 1;
+    if (rev <= this.inputModeRevision) return;
+    this.inputModeRevision = rev;
+    this.config.inputMode = mode;
+    this.config.inputModeRevision = rev;
+    this.configuration = configFingerprint(this.config);
+    this.broadcastInputMode(mode, originSocket, rev);
+  }
+
+  public broadcastInputMode(mode: BusyInputMode, originSocket?: net.Socket, revision?: number): void {
+    const rev = revision ?? this.inputModeRevision;
+    if (!Number.isSafeInteger(rev) || rev <= 0) return;
+    for (const [socket, state] of this.connections) {
+      if (socket !== originSocket && state.runtimeId && !socket.destroyed && !socket.writableEnded) {
+        if (socket.writableLength > 1024 * 1024) socket.destroy();
+        else socket.write(encodeFrame({ type: "sync_input_mode", mode, revision: rev }));
+      }
+    }
+  }
+
   private enqueueSettingsFeedback(route: RouteEntry, generation: number, text: string, menu?: InboundResult["menu"], messageId?: number): void {
     // Only bounded settings actions from an authenticated Runtime can become buttons.
     if (menu && (!Array.isArray(menu) || menu.length > 12 || menu.some(row => !Array.isArray(row) || !row.length || row.length > 3 || row.some(button =>
       !button || typeof button.text !== "string" || !button.text.trim() || button.text.length > 128 ||
-      typeof button.command !== "string" || button.command.length > 4096 || !/^\/(model|thinking)(?:\s|$)/.test(button.command))))) {
+      typeof button.command !== "string" || button.command.length > 4096 || !/^\/(model|thinking|inputmode)(?:\s|$)/.test(button.command))))) {
       this.publishStatus({ ...this.status, feedbackError: { code: "INVALID_SETTINGS_MENU", message: "Runtime returned an invalid settings menu" } });
       return;
     }
@@ -646,7 +709,15 @@ export class LeaderCoordinator {
         if (socket !== requester) this.resetFollowerConnection(socket, state);
       }
       if (this.config.botToken !== config.botToken) this.offset = undefined;
+      // A mode save can finish while the old poller drains. For the same
+      // connection, retain that newer commit instead of reinstalling the snapshot.
+      if (configFingerprint(this.config, "connection") === configFingerprint(config, "connection") &&
+          this.inputModeRevision > (config.inputModeRevision ?? 0)) {
+        config.inputMode = this.config.inputMode;
+        config.inputModeRevision = this.inputModeRevision;
+      }
       this.config = config;
+      this.inputModeRevision = config.inputModeRevision ?? 0;
       this.configuration = configFingerprint(config);
       this.client = client;
       this.botUsername = undefined;

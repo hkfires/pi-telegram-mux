@@ -60,6 +60,14 @@ export function validateConfig(data: unknown): MuxConfig {
     throw new Error("Invalid config: autoCloseTopics must be a boolean");
   }
 
+  if (obj.inputMode !== undefined && obj.inputMode !== "followUp" && obj.inputMode !== "steer") {
+    throw new Error("Invalid config: inputMode must be 'followUp' or 'steer'");
+  }
+
+  if (obj.inputModeRevision !== undefined && (!Number.isSafeInteger(obj.inputModeRevision) || (obj.inputModeRevision as number) <= 0)) {
+    throw new Error("Invalid config: inputModeRevision must be a positive safe integer");
+  }
+
   // Strictly return only MuxConfig fields to avoid extra persistence.
   return {
     version: 1,
@@ -67,12 +75,20 @@ export function validateConfig(data: unknown): MuxConfig {
     chatId: obj.chatId,
     allowedUserId: obj.allowedUserId,
     autoCloseTopics: obj.autoCloseTopics ?? false,
+    ...(obj.inputMode !== undefined ? { inputMode: obj.inputMode } : {}),
+    ...(obj.inputModeRevision !== undefined ? { inputModeRevision: obj.inputModeRevision as number } : {}),
   };
 }
 
 /** Compare effective configuration without sending the token over IPC. */
-export function configFingerprint(config: MuxConfig): string {
-  return createHash("sha256").update(JSON.stringify([config.botToken, config.chatId, config.allowedUserId, config.autoCloseTopics ?? false])).digest("hex");
+export function configFingerprint(config: MuxConfig, scope: "all" | "connection" = "all"): string {
+  return createHash("sha256").update(JSON.stringify([
+    config.botToken,
+    config.chatId,
+    config.allowedUserId,
+    config.autoCloseTopics ?? false,
+    ...(scope === "all" ? [config.inputMode ?? "followUp", config.inputModeRevision ?? 0] : []),
+  ])).digest("hex");
 }
 
 /**
@@ -117,6 +133,7 @@ export async function loadConfig(agentDir: string, updates?: Partial<MuxConfig>)
     if (canRebuild) {
       if (updates.version === undefined) merged.version = 1;
       if (updates.autoCloseTopics === undefined && typeof merged.autoCloseTopics !== "boolean") merged.autoCloseTopics = false;
+      if (updates.inputMode === undefined && merged.inputMode !== "followUp" && merged.inputMode !== "steer") delete merged.inputMode;
     }
     data = merged;
   }
@@ -134,20 +151,200 @@ export async function replaceFile(source: string, destination: string): Promise<
   }
 }
 
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: unknown) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function acquireConfigMutex(agentDir: string): Promise<() => Promise<void>> {
+  const dir = path.join(getConfigDir(agentDir), "config-mutex");
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const id = `${process.pid}-${randomUUID()}.json`;
+  const claim = path.join(dir, id);
+  const temporary = `${claim}.tmp`;
+  await fs.writeFile(claim, "", { flag: "wx", mode: 0o600 });
+  try {
+    const deadline = Date.now() + 10_000;
+    let highest = 0;
+    for (;;) {
+      highest = 0;
+      let retry = false;
+      for (const file of await fs.readdir(dir)) {
+        if (!file.endsWith(".json")) continue;
+        try {
+          const ticket = Number(await fs.readFile(path.join(dir, file), "utf-8"));
+          if (Number.isSafeInteger(ticket) && ticket > highest) highest = ticket;
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code ?? "";
+          if (code === "ENOENT") continue;
+          if (!["EPERM", "EACCES", "EBUSY"].includes(code)) throw err;
+          retry = true;
+          break;
+        }
+      }
+      if (!retry) break;
+      // Keep the empty choosing claim visible and rescan. Skipping an unreadable
+      // ticket could assign a number ahead of an existing lock owner.
+      if (Date.now() >= deadline) throw new Error("Config mutex could not read competing claims; retry later");
+      await delay(25);
+    }
+    const ticket = highest + 1;
+    if (!Number.isSafeInteger(ticket)) throw new Error("Config mutex ticket overflow");
+    await fs.writeFile(temporary, String(ticket), { flag: "wx", mode: 0o600 });
+    await replaceFile(temporary, claim);
+    for (;;) {
+      let wait = false;
+      for (const file of await fs.readdir(dir)) {
+        if (file === id || !/^\d+-[\da-f-]+\.json$/.test(file)) continue;
+        const otherPath = path.join(dir, file);
+        const pid = Number(file.slice(0, file.indexOf("-")));
+        if (!isProcessAlive(pid)) {
+          await fs.rm(otherPath, { force: true });
+          await fs.rm(`${otherPath}.tmp`, { force: true });
+          continue;
+        }
+        try {
+          const other = Number(await fs.readFile(otherPath, "utf-8"));
+          if (!Number.isSafeInteger(other) || other <= 0 || other < ticket || (other === ticket && file < id)) wait = true;
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code ?? "";
+          if (code === "ENOENT") continue;
+          if (!["EPERM", "EACCES", "EBUSY"].includes(code)) throw err;
+          wait = true;
+        }
+      }
+      if (!wait) break;
+      if (Date.now() >= deadline) throw new Error("Config mutex is waiting for a live process; retry later");
+      await delay(25);
+    }
+    return () => fs.rm(claim, { force: true });
+  } catch (err) {
+    await fs.rm(claim, { force: true });
+    throw err;
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
+/** Exclusive lock helper to serialize configuration check-and-replace transactions across processes. */
+export async function withConfigLock<T>(agentDir: string, action: () => Promise<T>): Promise<T> {
+  const release = await acquireConfigMutex(agentDir);
+  try {
+    return await action();
+  } finally {
+    await release();
+  }
+}
+
 /**
  * Save config to disk in a secure manner (directory 0700, file 0600).
  */
-export async function saveConfig(agentDir: string, config: MuxConfig): Promise<void> {
-  const validated = validateConfig(config);
+export async function saveConfig(agentDir: string, config: MuxConfig, options?: {
+  expectedBase?: MuxConfig;
+  onChecked?: () => Promise<void> | void;
+  modeUpdate?: boolean;
+  reconcileInputMode?: { mode: NonNullable<MuxConfig["inputMode"]>; revision: number };
+}): Promise<MuxConfig> {
   const dir = getConfigDir(agentDir);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const configPath = getConfigPath(agentDir);
-  const json = JSON.stringify(validated, null, 2) + "\n";
-  const temporaryPath = `${configPath}.${randomUUID()}.tmp`;
-  try {
-    await fs.writeFile(temporaryPath, json, { encoding: "utf-8", mode: 0o600, flag: "wx" });
-    await replaceFile(temporaryPath, configPath);
-  } finally {
-    await fs.rm(temporaryPath, { force: true });
-  }
+  return withConfigLock(agentDir, async () => {
+    let currentConfig: MuxConfig | null = null;
+    try {
+      const currentDisk = await fs.readFile(configPath, "utf-8");
+      try {
+        currentConfig = validateConfig(JSON.parse(currentDisk));
+      } catch (parseErr) {
+        if (options?.expectedBase) throw parseErr;
+      }
+      if (options?.expectedBase && currentConfig) {
+        const currentAutoClose = currentConfig.autoCloseTopics ?? false;
+        const expectedAutoClose = options.expectedBase.autoCloseTopics ?? false;
+        if (
+          currentConfig.chatId !== options.expectedBase.chatId ||
+          currentConfig.botToken !== options.expectedBase.botToken ||
+          currentConfig.allowedUserId !== options.expectedBase.allowedUserId ||
+          currentAutoClose !== expectedAutoClose
+        ) {
+          throw new Error("Connection configuration was modified concurrently on disk");
+        }
+      }
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT" && options?.expectedBase) throw err;
+    }
+    if (options?.onChecked) {
+      await options.onChecked();
+    }
+    let configToSave: MuxConfig = { ...config };
+    const currentMode = currentConfig?.inputMode;
+    const currentRevision = currentConfig?.inputModeRevision;
+
+    if (options?.reconcileInputMode) {
+      if (!currentConfig) throw new Error("Telegram configuration missing during input mode reconciliation");
+      const peer = options.reconcileInputMode;
+      // Read under the same lock as ordinary settings writes. A newer persisted
+      // update wins over the stale handshake that initiated reconciliation.
+      if ((currentRevision ?? 0) > peer.revision || (currentMode ?? "followUp") === peer.mode) return currentConfig;
+      configToSave = {
+        ...currentConfig,
+        inputMode: currentMode ?? "followUp",
+        inputModeRevision: Math.max(currentRevision ?? 0, peer.revision) + 1,
+      };
+    } else if (options?.modeUpdate === true) {
+      if (configToSave.inputMode !== undefined) {
+        const baseRev = currentRevision ?? 0;
+        configToSave.inputModeRevision = Math.max(baseRev + 1, (configToSave.inputModeRevision ?? 0) + 1);
+      }
+    } else if (currentConfig !== null) {
+      // Unrelated save (setup, connection settings, auto-close): preserve whatever mode and revision exist on disk
+      if (currentMode !== undefined) {
+        configToSave.inputMode = currentMode;
+      } else {
+        delete configToSave.inputMode;
+      }
+      if (currentRevision !== undefined) {
+        configToSave.inputModeRevision = currentRevision;
+      } else {
+        delete configToSave.inputModeRevision;
+      }
+    } else {
+      // First save of a new config: keep caller's mode and assign revision 1 if omitted
+      if (configToSave.inputMode !== undefined && configToSave.inputModeRevision === undefined) {
+        configToSave.inputModeRevision = 1;
+      }
+    }
+    const validated = validateConfig(configToSave);
+    const json = JSON.stringify(validated, null, 2) + "\n";
+    const temporaryPath = `${configPath}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporaryPath, json, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+      if (options?.expectedBase) {
+        try {
+          const currentDisk = await fs.readFile(configPath, "utf-8");
+          const recheckConfig = validateConfig(JSON.parse(currentDisk));
+          const recheckAutoClose = recheckConfig.autoCloseTopics ?? false;
+          const expectedAutoClose = options.expectedBase.autoCloseTopics ?? false;
+          if (
+            recheckConfig.chatId !== options.expectedBase.chatId ||
+            recheckConfig.botToken !== options.expectedBase.botToken ||
+            recheckConfig.allowedUserId !== options.expectedBase.allowedUserId ||
+            recheckAutoClose !== expectedAutoClose
+          ) {
+            throw new Error("Connection configuration was modified concurrently on disk");
+          }
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+      }
+      await replaceFile(temporaryPath, configPath);
+      return validated;
+    } finally {
+      await fs.rm(temporaryPath, { force: true });
+    }
+  });
 }

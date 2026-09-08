@@ -6,7 +6,7 @@ import { expect, it } from "vitest";
 import { saveConfig } from "../../src/config.js";
 import { testConfig } from "../helpers.js";
 
-it.each(["transformed", "config", "follow-up", "length-follow-up", "reconnect"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
+it.each(["transformed", "config", "follow-up", "length-follow-up", "reconnect", "busy-follow-up-model", "busy-steer-model", "busy-concurrent-input-gate"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-pi-lifecycle-"));
   let child: ChildProcess | undefined;
   try {
@@ -68,13 +68,33 @@ it.each(["transformed", "config", "follow-up", "length-follow-up", "reconnect"])
       });
       child!.once("error", error => { clearTimeout(timer); reject(error); });
       child!.once("exit", code => { clearTimeout(timer); reject(new Error(`Pi exited (${code}): ${stderr}`)); });
-      child!.stdin!.write(JSON.stringify({ type: "prompt", message: scenario === "follow-up" || scenario === "length-follow-up" ? "local-one" : scenario === "reconnect" ? "/review-reconnect" : "/review-inbound" }) + "\n");
+      child!.stdin!.write(JSON.stringify({ type: "prompt", message: scenario === "follow-up" || scenario === "length-follow-up" || scenario.startsWith("busy-") ? "local-one" : scenario === "reconnect" ? "/review-reconnect" : "/review-inbound" }) + "\n");
     });
     expect(result.error).toBeUndefined();
     expect(setupReplyIndex).toBe(scenario === "config" ? setupReplies.length : 0);
     expect(result.idle).toBe(true);
     expect(result.starts).toBe(1);
-    if (scenario === "follow-up" || scenario === "length-follow-up") {
+    if (scenario === "busy-concurrent-input-gate") {
+      expect(result.inputWaited).toBe(false);
+      expect(result.admitted).toHaveLength(2);
+      expect(result.admitted.every((admission: { accepted: boolean }) => admission.accepted)).toBe(true);
+      expect(result.received).toEqual(["local-one", "busy-one", "busy-two"]);
+      expect(result.modelInputs.at(-1)).toEqual(["local-one", "busy-one", "busy-two"]);
+      expect(result.texts).toEqual(["🧑‍💻 [Prompt]\nlocal-one", "answer 1", "answer 2", "answer 3"]);
+      for (const messageId of [101, 102]) {
+        expect(result.reactions).toContainEqual({ messageId, emoji: "👀" });
+        expect(result.reactions).toContainEqual({ messageId, emoji: "💯" });
+      }
+    } else if (scenario.startsWith("busy-")) {
+      expect(result.inputWaited).toBe(false);
+      expect(result.modelChanged).toBe(true);
+      expect(result.admitted.accepted).toBe(true);
+      expect(result.received).toEqual(["local-one", "remote busy prompt"]);
+      expect(result.modelInputs.at(-1)).toEqual(["local-one", "remote busy prompt"]);
+      expect(result.texts).toEqual(["🧑‍💻 [Prompt]\nlocal-one", "answer 1", "answer 2"]);
+      expect(result.reactions).toContainEqual({ messageId: 101, emoji: "👀" });
+      expect(result.reactions).toContainEqual({ messageId: 101, emoji: "💯" });
+    } else if (scenario === "follow-up" || scenario === "length-follow-up") {
       expect(result.received).toEqual(["local-one", "local-follow-up"]);
       expect(result.texts).toEqual(["🧑‍💻 [Prompt]\nlocal-one", "answer 1", "🧑‍💻 [Prompt]\nlocal-follow-up", "answer 2"]);
     } else if (scenario === "reconnect") {

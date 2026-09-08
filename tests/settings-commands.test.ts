@@ -3,7 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LeaderCoordinator } from "../src/coordinator.js";
-import { saveConfig } from "../src/config.js";
+import { getConfigDir, getConfigPath, loadConfig, saveConfig, withConfigLock } from "../src/config.js";
+import { encodeFrame, IpcFollowerClient } from "../src/ipc.js";
+import { MuxRuntime } from "../src/runtime.js";
 import { TelegramApiError, TelegramClient, TelegramDecodeError, TelegramRequestError } from "../src/telegram.js";
 import type { TelegramInlineKeyboardMarkup, TelegramUpdate } from "../src/types.js";
 import { runtimeFixture, telegramUpdate, testConfig } from "./helpers.js";
@@ -110,13 +112,91 @@ describe("Telegram session settings commands", () => {
     expect(f.settings.setModel).not.toHaveBeenCalled();
   });
 
-  it("rejects changes while Pi is busy", async () => {
+  it("allows /model and /thinking changes while Pi is busy", async () => {
     const f = await fixture();
     vi.mocked(f.ctx.isIdle).mockReturnValue(false);
-    expect((await f.runtime.handleInboundText("/thinking high", f.ctx)).busy).toBe(true);
-    expect((await f.runtime.handleInboundText("/model other/two", f.ctx)).busy).toBe(true);
-    expect(f.settings.setThinkingLevel).not.toHaveBeenCalled();
-    expect(f.settings.setModel).not.toHaveBeenCalled();
+    const thinkingResult = await f.runtime.handleInboundText("/thinking high", f.ctx);
+    expect(thinkingResult.busy).toBe(false);
+    expect(thinkingResult.accepted).toBe(true);
+    expect(thinkingResult.statusReply).toContain("Thinking: high");
+    expect(f.settings.setThinkingLevel).toHaveBeenCalledWith("high");
+
+    const modelResult = await f.runtime.handleInboundText("/model other/two", f.ctx);
+    expect(modelResult.busy).toBe(false);
+    expect(modelResult.accepted).toBe(true);
+    expect(modelResult.statusReply).toContain("Model: other/two");
+    expect(f.settings.setModel).toHaveBeenCalledWith(f.models[1]);
+  });
+
+  it.each(["/model other/two", "/thinking high"])("blocks %s until a timed-out input is actually admitted", async command => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const admission = f.runtime.handleInboundText("delayed input", f.ctx, 100);
+      expect((await f.runtime.handleInboundText(command, f.ctx)).busy).toBe(true);
+      await vi.advanceTimersByTimeAsync(2001);
+      expect(await admission).toMatchObject({ accepted: false, statusReply: expect.stringContaining("unknown") });
+      expect((await f.runtime.handleInboundText(command, f.ctx)).busy).toBe(true);
+      expect(f.settings.setModel).not.toHaveBeenCalled();
+      expect(f.settings.setThinkingLevel).not.toHaveBeenCalled();
+      expect(f.runtime.onInput(f.ctx)).toBeUndefined();
+
+      await f.inInput(() => f.runtime.onBeforeAgentStart({ prompt: "delayed input" }, f.ctx));
+      f.runtime.onMessageStart({ role: "user", content: "delayed input" }, f.ctx);
+      expect((await f.runtime.handleInboundText(command, f.ctx)).accepted).toBe(true);
+      await f.runtime.onAgentSettled(f.ctx);
+      expect(f.runtime.getIsIdle()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["followUp", "success"], ["followUp", "failure"],
+    ["steer", "success"], ["steer", "failure"],
+  ] as const)("keeps queued %s input when a later model change settles with %s", async (mode, outcome) => {
+    const f = await fixture();
+    vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({ message_id: 900 } as any);
+    await f.runtime.onBeforeAgentStart({ prompt: "initial task" }, f.ctx);
+    f.runtime.onMessageStart({ role: "user", content: "initial task" }, f.ctx);
+    vi.mocked(f.ctx.isIdle).mockReturnValue(false);
+    let finishModel!: (value: boolean) => void;
+    let rejectModel!: (error: Error) => void;
+    f.settings.setModel.mockImplementation(() => new Promise((resolve, reject) => {
+      finishModel = resolve;
+      rejectModel = reject;
+    }));
+    expect((await f.runtime.handleInboundText("queued busy prompt", f.ctx, 101, mode)).accepted).toBe(true);
+    expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(f.pi.sendMessage).toHaveBeenCalledWith({
+      customType: "Telegram", content: "queued busy prompt", display: true,
+      details: { runtimeId: expect.any(String), deliveryId: expect.any(String) },
+    }, { triggerTurn: true, deliverAs: mode });
+    const changing = f.runtime.handleInboundText("/model other/two", f.ctx);
+    try {
+      expect(f.settings.setModel).toHaveBeenCalledTimes(1);
+      expect((await f.runtime.handleInboundText("new remote prompt", f.ctx)).busy).toBe(true);
+      const setEditorText = vi.fn();
+      Object.assign(f.ctx.ui, { setEditorText });
+      expect(f.runtime.onInput(f.ctx, "new local prompt")).toEqual({ action: "handled" });
+      expect(setEditorText).toHaveBeenCalledWith("new local prompt");
+      if (outcome === "success") finishModel(true);
+      else rejectModel(new Error("Fixture model change failed"));
+      await changing;
+      const [queuedMessage] = f.pi.sendMessage.mock.calls[0];
+      f.runtime.onMessageStart({ ...queuedMessage, role: "custom" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.runtime.callTelegram).toHaveBeenCalledWith("setMessageReaction", expect.objectContaining({
+        message_id: 101, reaction: [{ type: "emoji", emoji: "👀" }],
+      }), expect.anything(), expect.anything());
+      expect(f.pi.sendMessage).toHaveBeenCalledTimes(1);
+      expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+      await f.runtime.onAgentSettled(f.ctx);
+      expect(f.runtime.getIsIdle()).toBe(true);
+    } finally {
+      finishModel(true);
+      await changing;
+    }
   });
 
   it("serializes remote settings against other inbound messages", async () => {
@@ -565,7 +645,7 @@ describe("Telegram session settings commands", () => {
     await first;
   });
 
-  it("clears buttons and explains a busy session without making a settings change", async () => {
+  it("applies settings change via button click even while Pi is busy", async () => {
     const send = vi.spyOn(TelegramClient.prototype, "sendMessage").mockResolvedValue({ message_id: 900 } as any);
     const api = vi.spyOn(TelegramClient.prototype, "callApi");
     const f = await fixture();
@@ -573,6 +653,21 @@ describe("Telegram session settings commands", () => {
     await coordinator.processUpdate(telegramUpdate(50, "/thinking"));
     await coordinator.feedback.whenIdle();
     vi.mocked(f.ctx.isIdle).mockReturnValue(false);
+    await coordinator.processUpdate(click(button(send.mock.calls[0][2]!.reply_markup!, "high")));
+    await coordinator.feedback.whenIdle();
+    expect(f.settings.setThinkingLevel).toHaveBeenCalledWith("high");
+    const edit = api.mock.calls.filter(call => call[0] === "editMessageText").at(-1)![1]!;
+    expect(edit.text).toContain("Thinking: high");
+  });
+
+  it("clears buttons and explains a busy session when settings dispatch is busy", async () => {
+    const send = vi.spyOn(TelegramClient.prototype, "sendMessage").mockResolvedValue({ message_id: 900 } as any);
+    const api = vi.spyOn(TelegramClient.prototype, "callApi");
+    const f = await fixture();
+    const coordinator = coordinatorOf(f);
+    await coordinator.processUpdate(telegramUpdate(50, "/thinking"));
+    await coordinator.feedback.whenIdle();
+    vi.spyOn(f.runtime, "handleInboundText").mockResolvedValueOnce({ accepted: false, busy: true });
     await coordinator.processUpdate(click(button(send.mock.calls[0][2]!.reply_markup!, "high")));
     await coordinator.feedback.whenIdle();
     expect(f.settings.setThinkingLevel).not.toHaveBeenCalled();
@@ -897,7 +992,7 @@ describe("Telegram session settings commands", () => {
     ]);
   });
 
-  it("registers the four commands only once for the allowed chat member", async () => {
+  it("registers the five commands only once for the allowed chat member", async () => {
     const api = vi.spyOn(TelegramClient.prototype, "callApi");
     await fixture();
     await fixture("follower", 51);
@@ -908,9 +1003,871 @@ describe("Telegram session settings commands", () => {
       commands: [
         { command: "model", description: expect.any(String) },
         { command: "thinking", description: expect.any(String) },
+        { command: "inputmode", description: expect.any(String) },
         { command: "status", description: expect.any(String) },
         { command: "stop", description: expect.any(String) },
       ],
     });
+  });
+
+  it("handles /inputmode command and switches busy input mode", async () => {
+    const f = await fixture();
+    const initial = await f.runtime.handleInboundText("/inputmode", f.ctx);
+    expect(initial.statusReply).toContain("Busy input mode: Follow-up (global)");
+    expect(initial.menu?.flat()).toEqual([
+      { text: "✓ Follow-up", command: "/inputmode followup" },
+      { text: "Steering", command: "/inputmode steer" },
+    ]);
+
+    const switched = await f.runtime.handleInboundText("/inputmode steer", f.ctx);
+    expect(switched.statusReply).toContain("Busy input mode set to Steering (global)");
+    expect(switched.menu).toBeUndefined();
+    expect(switched.inputMode).toBe("steer");
+    expect((await loadConfig(dir))?.inputMode).toBe("steer");
+
+    const updated = await f.runtime.handleInboundText("/inputmode", f.ctx);
+    expect(updated.statusReply).toContain("Busy input mode: Steering (global)");
+    expect(updated.menu?.flat()).toEqual([
+      { text: "Follow-up", command: "/inputmode followup" },
+      { text: "✓ Steering", command: "/inputmode steer" },
+    ]);
+
+    const restored = await f.runtime.handleInboundText("/inputmode followup", f.ctx);
+    expect(restored.statusReply).toContain("Busy input mode set to Follow-up (global)");
+    expect(restored.menu).toBeUndefined();
+    expect(restored.inputMode).toBe("followUp");
+    expect((await loadConfig(dir))?.inputMode).toBe("followUp");
+
+    const invalid = await f.runtime.handleInboundText("/inputmode unknown", f.ctx);
+    expect(invalid.accepted).toBe(false);
+    expect(invalid.statusReply).toContain("Invalid input mode");
+  });
+
+  it("allows /inputmode command while Pi is busy", async () => {
+    const f = await fixture();
+    vi.mocked(f.ctx.isIdle).mockReturnValue(false);
+    expect((await f.runtime.handleInboundText("/thinking high", f.ctx)).busy).toBe(false);
+    expect(f.settings.setThinkingLevel).toHaveBeenCalledWith("high");
+    expect((await f.runtime.handleInboundText("/model other/two", f.ctx)).busy).toBe(false);
+    expect(f.settings.setModel).toHaveBeenCalledWith(f.models[1]);
+
+    const result = await f.runtime.handleInboundText("/inputmode", f.ctx);
+    expect(result.busy).toBe(false);
+    expect(result.statusReply).toContain("Busy input mode");
+
+    const switched = await f.runtime.handleInboundText("/inputmode steer", f.ctx);
+    expect(switched.busy).toBe(false);
+    expect(switched.statusReply).toContain("Steering");
+    expect((await loadConfig(dir))?.inputMode).toBe("steer");
+  });
+
+  it.each(["leader", "follower"])("switches input mode via inline button click on %s", async owner => {
+    const send = vi.spyOn(TelegramClient.prototype, "sendMessage").mockResolvedValue({ message_id: 900 } as any);
+    const api = vi.spyOn(TelegramClient.prototype, "callApi");
+    const leader = await fixture();
+    const f = owner === "follower" ? await fixture("follower", 51) : leader;
+    const thread = owner === "follower" ? 51 : 50;
+    const coordinator = coordinatorOf(leader);
+
+    await coordinator.processUpdate(telegramUpdate(thread, "/inputmode"));
+    await coordinator.feedback.whenIdle();
+    const markup = send.mock.calls.at(-1)![2]!.reply_markup!;
+    expect(markup.inline_keyboard[0][0].text).toBe("✓ Follow-up");
+    const steerButton = button(markup, "Steering");
+
+    await coordinator.processUpdate(click(steerButton, thread));
+    await coordinator.feedback.whenIdle();
+
+    expect((await loadConfig(dir))?.inputMode).toBe("steer");
+    const edit = api.mock.calls.filter(call => call[0] === "editMessageText").at(-1)!;
+    expect(edit[1]).toMatchObject({ chat_id: testConfig.chatId, message_id: 900, text: expect.stringContaining("Busy input mode set to Steering") });
+  });
+
+  it("queues user prompts while Pi is busy according to input mode and skips notice when idle", async () => {
+    const f = await fixture();
+    // Idle prompt: sends directly, no statusReply
+    f.pi.sendUserMessage.mockImplementation((text: string) => {
+      void f.runtime.onBeforeAgentStart({ prompt: text }, f.ctx).then(() => f.runtime.onMessageStart({ role: "user", content: text }, f.ctx));
+    });
+    const idleAdmission = await f.runtime.handleInboundText("idle prompt", f.ctx);
+    expect(idleAdmission.accepted).toBe(true);
+    expect(idleAdmission.busy).toBe(false);
+    expect(idleAdmission.statusReply).toBeUndefined();
+    expect(f.pi.sendUserMessage).toHaveBeenCalledWith("idle prompt", { expandPromptTemplates: false });
+
+    // Now Pi is busy running a task
+    expect(f.runtime.getIsIdle()).toBe(false);
+    vi.mocked(f.ctx.isIdle).mockReturnValue(false);
+
+    // Default mode is followUp:
+    const busyFollowUp = await f.runtime.handleInboundText("follow-up prompt", f.ctx);
+    expect(busyFollowUp.accepted).toBe(true);
+    expect(busyFollowUp.busy).toBe(false);
+    expect(busyFollowUp.statusReply).toContain("Follow-up: Request received");
+    expect(f.pi.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ customType: "Telegram", content: "follow-up prompt" }), { triggerTurn: true, deliverAs: "followUp" });
+
+    // Switch mode to steer while busy:
+    await f.runtime.handleInboundText("/inputmode steer", f.ctx);
+
+    // Next busy prompt queues with steer:
+    const busySteer = await f.runtime.handleInboundText("steering prompt", f.ctx);
+    expect(busySteer.accepted).toBe(true);
+    expect(busySteer.busy).toBe(false);
+    expect(busySteer.statusReply).toContain("Steering: Request received");
+    expect(f.pi.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ customType: "Telegram", content: "steering prompt" }), { triggerTurn: true, deliverAs: "steer" });
+    expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("synchronizes global input mode across leader and follower topics in both directions", async () => {
+    const send = vi.spyOn(TelegramClient.prototype, "sendMessage").mockResolvedValue({ message_id: 900 } as any);
+    const leader = await fixture("leader", 50);
+    const follower = await fixture("follower", 51);
+    const coordinator = coordinatorOf(leader);
+    await vi.waitFor(() => expect(coordinator.getRoutes().has(51)).toBe(true));
+
+    // Initially both use followUp
+    expect(coordinator.getInputMode()).toBe("followUp");
+
+    // Follower changes mode to steer via command
+    await coordinator.processUpdate(telegramUpdate(51, "/inputmode steer"));
+    await coordinator.feedback.whenIdle();
+    expect(coordinator.getInputMode()).toBe("steer");
+
+    // Leader's local topic now displays and uses steer
+    const leaderMenu = await leader.runtime.handleInboundText("/inputmode", leader.ctx);
+    expect(leaderMenu.statusReply).toContain("Busy input mode: Steering (global)");
+    expect(leaderMenu.menu?.flat()).toEqual([
+      { text: "Follow-up", command: "/inputmode followup" },
+      { text: "✓ Steering", command: "/inputmode steer" },
+    ]);
+
+    // Leader changes mode back to followUp
+    await coordinator.processUpdate(telegramUpdate(50, "/inputmode followup"));
+    await coordinator.feedback.whenIdle();
+    expect(coordinator.getInputMode()).toBe("followUp");
+
+    // Follower's topic now displays followUp
+    await vi.waitFor(async () => {
+      const followerMenu = await follower.runtime.handleInboundText("/inputmode", follower.ctx);
+      expect(followerMenu.statusReply).toContain("Busy input mode: Follow-up (global)");
+    });
+  });
+
+  it.each([false, true])("preserves active replies when input mode changes during follower authentication (round trip: %s)", async roundTrip => {
+    const leader = await fixture("leader", 50);
+    const peer = await fixture("peer", 51);
+    const active = [leader, peer];
+    const sends = active.map(f => vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({ message_id: 900 } as any));
+    for (const f of active) {
+      await f.runtime.onBeforeAgentStart({ prompt: "running task" }, f.ctx);
+      f.runtime.onMessageStart({ role: "user", content: "running task" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
+    }
+    const generations = active.map(f => f.runtime.getGeneration());
+    const coordinator = coordinatorOf(leader);
+    const reload = vi.spyOn(coordinator, "reloadConfig");
+    let resume!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    let reached!: () => void;
+    const reachedAuth = new Promise<void>(resolve => { reached = resolve; });
+    const connect = IpcFollowerClient.prototype.connect;
+    vi.spyOn(IpcFollowerClient.prototype, "connect").mockImplementationOnce(async function (...args) {
+      reached();
+      await gate;
+      return connect.apply(this, args);
+    });
+    const joining = fixture("joining", 52);
+    try {
+      await reachedAuth;
+      expect((await leader.runtime.handleInboundText("/inputmode steer", leader.ctx)).accepted).toBe(true);
+      if (roundTrip) expect((await leader.runtime.handleInboundText("/inputmode followup", leader.ctx)).accepted).toBe(true);
+      resume();
+      const joined = await joining;
+      expect(joined.runtime.hasActiveTransport()).toBe(true);
+      expect(reload).not.toHaveBeenCalled();
+      expect(active.map(f => f.runtime.getGeneration())).toEqual(generations);
+      expect((await joined.runtime.handleInboundText("/inputmode", joined.ctx)).statusReply).toContain(roundTrip ? "Follow-up" : "Steering");
+      for (const [i, f] of active.entries()) {
+        f.runtime.onTurnEnd({ role: "assistant", content: `completed task ${i}`, stopReason: "stop" });
+        await f.runtime.onAgentSettled(f.ctx);
+        await f.runtime.outbox.whenIdle();
+        expect(sends[i].mock.calls.some(([method, params]) => method === "sendMessage" && params.text === `completed task ${i}`)).toBe(true);
+      }
+    } finally {
+      resume();
+      await joining;
+    }
+  });
+
+  it("preserves a disconnected follower's active reply when it loads a newer mode on reconnect", async () => {
+    const leader = await fixture("leader", 50);
+    const peer = await fixture("peer", 51);
+    const send = vi.spyOn(peer.runtime, "callTelegram").mockResolvedValue({ message_id: 900 } as any);
+    await peer.runtime.onBeforeAgentStart({ prompt: "running task" }, peer.ctx);
+    peer.runtime.onMessageStart({ role: "user", content: "running task" }, peer.ctx);
+    await peer.runtime.outbox.whenIdle();
+    const generation = peer.runtime.getGeneration();
+    const coordinator = coordinatorOf(leader);
+    const reload = vi.spyOn(coordinator, "reloadConfig");
+    let resume!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    const setup = peer.runtime.setupTransport.bind(peer.runtime);
+    vi.spyOn(peer.runtime, "setupTransport").mockImplementationOnce(async ctx => { await gate; return setup(ctx); });
+    const socket = [...(coordinator as any).connections.entries()].find(([, state]: any) => state.runtimeId === peer.runtime.runtimeId)![0];
+    socket.destroy();
+    try {
+      await vi.waitFor(() => expect(peer.runtime.getIsReconnecting()).toBe(true));
+      await leader.runtime.handleInboundText("/inputmode steer", leader.ctx);
+      resume();
+      await vi.waitFor(() => expect(peer.runtime.getIsReconnecting()).toBe(false), { timeout: 2500 });
+      expect(peer.runtime.getGeneration()).toBe(generation);
+      expect(reload).not.toHaveBeenCalled();
+      expect((await peer.runtime.handleInboundText("/inputmode", peer.ctx)).statusReply).toContain("Steering");
+      peer.runtime.onTurnEnd({ role: "assistant", content: "completed after reconnect", stopReason: "stop" });
+      await peer.runtime.onAgentSettled(peer.ctx);
+      await peer.runtime.outbox.whenIdle();
+      expect(send.mock.calls.some(([method, params]) => method === "sendMessage" && params.text === "completed after reconnect")).toBe(true);
+    } finally {
+      resume();
+    }
+  });
+
+  it.each([
+    ["steer", "followUp"], ["followUp", "steer"], [undefined, "steer"],
+  ] as const)("coordinates a manual mode edit from %s to %s across simultaneous joining followers", async (initial, target) => {
+    const leader = await fixture("leader", 50);
+    const peer = await fixture("peer", 51);
+    if (initial) await leader.runtime.handleInboundText(`/inputmode ${initial.toLowerCase()}`, leader.ctx);
+    const coordinator = coordinatorOf(leader);
+    const reload = vi.spyOn(coordinator, "reloadConfig");
+    const send = vi.spyOn(leader.runtime, "callTelegram").mockResolvedValue({ message_id: 900 } as any);
+    await leader.runtime.onBeforeAgentStart({ prompt: "running task" }, leader.ctx);
+    leader.runtime.onMessageStart({ role: "user", content: "running task" }, leader.ctx);
+    await leader.runtime.outbox.whenIdle();
+    const generation = leader.runtime.getGeneration();
+    const disk = (await loadConfig(dir))!;
+    await fs.writeFile(getConfigPath(dir), JSON.stringify({ ...disk, inputMode: target }));
+    const joining = await Promise.all([fixture("joining-a", 52), fixture("joining-b", 53)]);
+    await vi.waitFor(() => expect(coordinator.getInputMode()).toBe(target));
+    for (const f of [peer, ...joining]) {
+      await vi.waitFor(async () => {
+        expect((await f.runtime.handleInboundText("/inputmode", f.ctx)).statusReply).toContain(target === "steer" ? "Steering" : "Follow-up");
+      });
+    }
+    expect((await loadConfig(dir))?.inputModeRevision).toBe((disk.inputModeRevision ?? 0) + 1);
+    expect((await loadConfig(dir))?.inputMode).toBe(target);
+    expect(reload).not.toHaveBeenCalled();
+    expect(leader.runtime.getGeneration()).toBe(generation);
+    leader.runtime.onTurnEnd({ role: "assistant", content: "reply survives manual edit", stopReason: "stop" });
+    await leader.runtime.onAgentSettled(leader.ctx);
+    await leader.runtime.outbox.whenIdle();
+    expect(send.mock.calls.some(([method, params]) => method === "sendMessage" && params.text === "reply survives manual edit")).toBe(true);
+
+    const f = joining[0];
+    vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({ message_id: 901 } as any);
+    await f.runtime.onBeforeAgentStart({ prompt: "busy task" }, f.ctx);
+    f.runtime.onMessageStart({ role: "user", content: "busy task" }, f.ctx);
+    vi.mocked(f.ctx.isIdle).mockReturnValue(false);
+    await f.runtime.outbox.whenIdle();
+    await coordinator.getRoutes().get(52)!.dispatchInbound("next task", 101);
+    expect(f.pi.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({ customType: "Telegram", content: "next task" }), { triggerTurn: true, deliverAs: target });
+  });
+
+  it.each(["newer command", "manual revert"])("uses fresh disk state when reconciliation overlaps a %s", async change => {
+    const leader = await fixture("leader", 50);
+    await leader.runtime.handleInboundText("/inputmode steer", leader.ctx);
+    const disk = (await loadConfig(dir))!;
+    await fs.writeFile(getConfigPath(dir), JSON.stringify({ ...disk, inputMode: "followUp" }));
+    const coordinator = coordinatorOf(leader);
+    const reload = vi.spyOn(coordinator, "reloadConfig");
+    const configModule = await import("../src/config.js");
+    const originalSave = configModule.saveConfig;
+    let resume!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    let entered!: () => void;
+    const reachedSave = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(configModule, "saveConfig").mockImplementation(async (agentDir, config, options) => {
+      if (options?.reconcileInputMode) { entered(); await gate; }
+      return originalSave(agentDir, config, options);
+    });
+    const joining = fixture("joining", 51);
+    try {
+      await reachedSave;
+      if (change === "newer command") {
+        expect((await leader.runtime.handleInboundText("/inputmode steer", leader.ctx)).accepted).toBe(true);
+      } else {
+        await fs.writeFile(getConfigPath(dir), JSON.stringify(disk));
+      }
+      resume();
+      const f = await joining;
+      expect(f.runtime.hasActiveTransport()).toBe(true);
+      expect((await f.runtime.handleInboundText("/inputmode", f.ctx)).statusReply).toContain("Steering");
+      expect(coordinator.getInputMode()).toBe("steer");
+      expect((await loadConfig(dir))?.inputModeRevision).toBe(change === "newer command" ? 2 : 1);
+      expect((await loadConfig(dir))?.inputMode).toBe("steer");
+      expect(reload).not.toHaveBeenCalled();
+    } finally {
+      resume();
+      await joining;
+    }
+  });
+
+  it.each(["disconnect", "shutdown"])("handles %s while input mode reconciliation is waiting for the config lock", async action => {
+    const leader = await fixture("leader", 50);
+    const peer = await fixture("peer", 51);
+    await leader.runtime.handleInboundText("/inputmode steer", leader.ctx);
+    await vi.waitFor(() => expect(peer.runtime.getInputModeRevision()).toBe(1));
+    const disk = (await loadConfig(dir))!;
+    await fs.writeFile(getConfigPath(dir), JSON.stringify({ ...disk, inputMode: "followUp" }));
+    let resume!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    let entered!: () => void;
+    const lockEntered = new Promise<void>(resolve => { entered = resolve; });
+    const holding = withConfigLock(dir, async () => { entered(); await gate; });
+    await lockEntered;
+    const setup = vi.spyOn(peer.runtime, "setupTransport");
+    const coordinator = coordinatorOf(leader);
+    let shutdown: Promise<void> | undefined;
+    try {
+      (peer.runtime as any).followerClient.socket.destroy();
+      await vi.waitFor(async () => {
+        const claims = (await fs.readdir(path.join(getConfigDir(dir), "config-mutex"))).filter(file => file.endsWith(".json"));
+        expect(claims).toHaveLength(2);
+      }, { timeout: 3000 });
+      expect(setup).toHaveBeenCalledTimes(1);
+
+      if (action === "disconnect") {
+        (peer.runtime as any).followerClient.socket.destroy();
+        // The second timer reuses the setup task that is still waiting for the lock.
+        await vi.waitFor(() => expect(setup).toHaveBeenCalledTimes(2), { timeout: 2000 });
+        expect(peer.runtime.hasActiveTransport()).toBe(false);
+        resume();
+        await holding;
+        await vi.waitFor(() => {
+          expect(peer.runtime.hasActiveTransport()).toBe(true);
+          expect(peer.runtime.getIsReconnecting()).toBe(false);
+          expect(coordinator.getRoutes().has(51)).toBe(true);
+        }, { timeout: 2500 });
+        expect(setup).toHaveBeenCalledTimes(3);
+        expect((await peer.runtime.handleInboundText("/inputmode", peer.ctx)).statusReply).toContain("Follow-up");
+        expect(coordinator.getInputMode()).toBe("followUp");
+      } else {
+        shutdown = peer.runtime.onSessionShutdown(peer.ctx);
+        resume();
+        await holding;
+        await shutdown;
+        expect(peer.runtime.hasActiveTransport()).toBe(false);
+        expect((peer.runtime as any).reconnectTimer).toBeUndefined();
+        expect(setup).toHaveBeenCalledTimes(1);
+        expect(peer.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Telegram connection failed"), "error");
+      }
+    } finally {
+      resume();
+      await holding;
+      await shutdown;
+    }
+  }, 10_000);
+
+  it.each(["steer", "followUp"] as const)("preserves a concurrent %s save while reconnect drains the old poller", async mode => {
+    const f = await fixture();
+    if (mode === "followUp") await f.runtime.handleInboundText("/inputmode steer", f.ctx);
+    const coordinator = coordinatorOf(f);
+    let releaseLock!: () => void;
+    const lockGate = new Promise<void>(resolve => { releaseLock = resolve; });
+    let entered!: () => void;
+    const lockEntered = new Promise<void>(resolve => { entered = resolve; });
+    const holding = withConfigLock(dir, async () => { entered(); await lockGate; });
+    await lockEntered;
+    let releasePoller!: () => void;
+    const pollerGate = new Promise<void>(resolve => { releasePoller = resolve; });
+    // Hold the real poller's completion after cancellation, so reload has read
+    // its snapshot but has not installed it when the concurrent save finishes.
+    (coordinator as any).pollingTask = Promise.all([(coordinator as any).pollingTask, pollerGate]).then(() => {});
+    let changing: ReturnType<typeof f.runtime.handleInboundText> | undefined;
+    let reconnecting: Promise<void> | undefined;
+    try {
+      changing = f.runtime.handleInboundText(`/inputmode ${mode.toLowerCase()}`, f.ctx);
+      await vi.waitFor(async () => {
+        const claims = (await fs.readdir(path.join(getConfigDir(dir), "config-mutex"))).filter(file => file.endsWith(".json"));
+        expect(claims).toHaveLength(2);
+      });
+      (coordinator as any).publishStatus({ ...coordinator.getStatus(), feedbackError: { code: "TELEGRAM_REQUEST_FAILED", message: "Simulated delivery failure" } });
+      reconnecting = f.runtime.handleTgConnect(f.ctx);
+      await vi.waitFor(() => expect((coordinator as any).pollController.signal.aborted).toBe(true));
+      releaseLock();
+      await holding;
+      await changing;
+      const disk = (await loadConfig(dir))!;
+      expect(disk.inputMode).toBe(mode);
+      expect(coordinator.getInputModeRevision()).toBe(disk.inputModeRevision);
+      releasePoller();
+      await reconnecting;
+      expect(coordinator.getInputMode()).toBe(mode);
+      expect(coordinator.getInputModeRevision()).toBe(disk.inputModeRevision);
+      expect(f.runtime.getInputModeRevision()).toBe(disk.inputModeRevision);
+      expect((await f.runtime.handleInboundText("/inputmode", f.ctx)).statusReply).toContain(mode === "steer" ? "Steering" : "Follow-up");
+      vi.spyOn(f.runtime, "callTelegram").mockResolvedValue({ message_id: 900 } as any);
+      await f.runtime.onBeforeAgentStart({ prompt: "busy work" }, f.ctx);
+      f.runtime.onMessageStart({ role: "user", content: "busy work" }, f.ctx);
+      vi.mocked(f.ctx.isIdle).mockReturnValue(false);
+      await f.runtime.outbox.whenIdle();
+      await coordinator.getRoutes().get(50)!.dispatchInbound("next task", 101);
+      expect(f.pi.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({ customType: "Telegram", content: "next task" }), { triggerTurn: true, deliverAs: mode });
+    } finally {
+      releaseLock();
+      releasePoller();
+      await Promise.allSettled([holding, changing, reconnecting]);
+    }
+  });
+
+  it("synchronizes a newer persisted mode from a joining follower without reloading the Leader", async () => {
+    const leader = await fixture("leader", 50);
+    const coordinator = coordinatorOf(leader);
+    const reload = vi.spyOn(coordinator, "reloadConfig");
+    const generation = leader.runtime.getGeneration();
+    await saveConfig(dir, { ...testConfig, inputMode: "steer" }, { modeUpdate: true });
+    await fixture("joining", 51);
+    await vi.waitFor(() => expect(coordinator.getInputMode()).toBe("steer"));
+    expect(reload).not.toHaveBeenCalled();
+    expect(leader.runtime.getGeneration()).toBe(generation);
+  });
+
+  it.each([
+    { botToken: "updated-fixture-token" }, { chatId: -100999 },
+    { allowedUserId: 456 }, { autoCloseTopics: true },
+  ])("still reloads changed connection configuration during authentication: %j", async changes => {
+    const leader = await fixture("leader", 50);
+    await leader.runtime.handleInboundText("/inputmode steer", leader.ctx);
+    const coordinator = coordinatorOf(leader);
+    const reload = vi.spyOn(coordinator, "reloadConfig");
+    const generation = leader.runtime.getGeneration();
+    await saveConfig(dir, { ...testConfig, ...changes });
+    const follower = await fixture("joining", 51);
+    expect(follower.runtime.hasActiveTransport()).toBe(true);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(leader.runtime.getGeneration()).toBeGreaterThan(generation);
+  });
+
+  it("rolls back candidate configuration when saveConfig fails during inputmode change", async () => {
+    const f = await fixture();
+    const configModule = await import("../src/config.js");
+    const saveSpy = vi.spyOn(configModule, "saveConfig").mockRejectedValueOnce(new Error("Disk error"));
+
+    const result = await f.runtime.handleInboundText("/inputmode steer", f.ctx);
+    expect(result.accepted).toBe(false);
+    expect(result.statusReply).toContain("Settings update failed");
+    expect((await loadConfig(dir))?.inputMode ?? "followUp").toBe("followUp");
+
+    // Live mode was not changed
+    const query = await f.runtime.handleInboundText("/inputmode", f.ctx);
+    expect(query.statusReply).toContain("Busy input mode: Follow-up (global)");
+  });
+
+  it("reports a synchronous Pi queue rejection without blocking subsequent busy input", async () => {
+    const f = await fixture();
+    f.pi.sendUserMessage.mockImplementationOnce((text: string) => {
+      void f.runtime.onBeforeAgentStart({ prompt: text }, f.ctx).then(() => f.runtime.onMessageStart({ role: "user", content: text }, f.ctx));
+    });
+    await f.runtime.handleInboundText("initial task", f.ctx);
+    expect(f.runtime.getIsIdle()).toBe(false);
+    vi.mocked(f.ctx.isIdle).mockReturnValue(false);
+
+    f.pi.sendMessage.mockImplementationOnce(() => {
+      throw new Error("Compaction in progress");
+    });
+    const syncResult = await f.runtime.handleInboundText("sync failed task", f.ctx);
+    expect(syncResult.accepted).toBe(false);
+    expect(syncResult.busy).toBe(false);
+    expect(syncResult.statusReply).toContain("Pi rejected the task");
+
+    expect((await f.runtime.handleInboundText("next task", f.ctx)).accepted).toBe(true);
+    expect(f.pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves active-run prompt mirroring and reply delivery after changing input mode while busy", async () => {
+    const f = await fixture();
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (method, params) => {
+      calls.push({ method, params });
+      return { message_id: 888 } as any;
+    });
+    await f.runtime.onBeforeAgentStart({ prompt: "active task" }, f.ctx);
+    f.runtime.onMessageStart({ role: "user", content: "active task" }, f.ctx);
+    await f.runtime.outbox.whenIdle();
+
+    // Mode is changed mid-run
+    const modeChange = await f.runtime.handleInboundText("/inputmode steer", f.ctx);
+    expect(modeChange.statusReply).toContain("Steering");
+
+    // Next turn completes
+    f.runtime.onTurnEnd({ role: "assistant", content: "answer after mode change", stopReason: "stop" });
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.outbox.whenIdle();
+
+    const sentTexts = calls.filter(c => c.method === "sendMessage").map(c => c.params.text);
+    expect(sentTexts).toContain("answer after mode change");
+  });
+
+  it.each([
+    ["leader", false, false, false], ["follower", false, false, false],
+    ["leader", true, false, false], ["follower", true, false, false],
+    ["leader", false, true, false], ["leader", false, false, true],
+  ] as const)("loads the completed pending input mode save after %s replacement (failure: %s, cancelled: %s, timeout: %s)", async (owner, failure, cancelled, timeout) => {
+    // A separately evaluated module must inherit pending writes from the old one.
+    const Runtime = owner === "leader" && !failure && !cancelled
+      ? (await import("../src/runtime.js?input-mode-reload")).MuxRuntime
+      : MuxRuntime;
+    const survivor = owner === "follower" ? await fixture("survivor", 50) : undefined;
+    const previous = await fixture("previous", owner === "follower" ? 51 : 50);
+    let release!: () => void;
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const holding = withConfigLock(dir, async () => { entered(); await gate; });
+    await ready;
+    const configModule = await import("../src/config.js");
+    if (failure) {
+      const save = configModule.saveConfig;
+      vi.spyOn(configModule, "saveConfig").mockImplementationOnce((agentDir, config, options) => save(agentDir, config, {
+        ...options, onChecked: () => { throw new Error("Simulated save failure"); },
+      }));
+    }
+    const changing = previous.runtime.handleInboundText("/inputmode steer", previous.ctx);
+    const replacement = new Runtime(previous.pi as any, dir);
+    fixtures.push({ ...previous, runtime: replacement });
+    let starting: Promise<void> | undefined;
+    try {
+      await vi.waitFor(async () => {
+        expect((await fs.readdir(path.join(getConfigDir(dir), "config-mutex"))).filter(file => file.endsWith(".json"))).toHaveLength(2);
+      });
+      if (timeout) expect((await changing).statusReply).toContain("input mode configuration is still being saved");
+      expect(previous.runtime.getIsIdle()).toBe(false);
+      expect(await previous.runtime.onSessionBeforeSwitch(previous.ctx)).toEqual({ cancel: true });
+      expect(await previous.runtime.onSessionBeforeFork(previous.ctx)).toEqual({ cancel: true });
+      expect(await previous.runtime.onSessionBeforeTree()).toEqual({ cancel: true });
+      expect(previous.ui.notify).toHaveBeenCalledWith(expect.stringContaining("input mode configuration"), "warning");
+      // Reload/quit still shuts down without awaiting the blocked disk write.
+      await previous.runtime.onSessionShutdown({ reason: "reload" }, previous.ctx);
+      const load = vi.spyOn(configModule, "loadConfig");
+      starting = replacement.onSessionStart(previous.ctx);
+      expect(load).not.toHaveBeenCalled();
+      expect(replacement.hasActiveTransport()).toBe(false);
+      if (cancelled) await replacement.onSessionShutdown(previous.ctx);
+      release();
+      await Promise.all([holding, changing, starting]);
+      if (cancelled) {
+        expect(load).not.toHaveBeenCalled();
+        expect(replacement.hasActiveTransport()).toBe(false);
+        return;
+      }
+      const disk = (await loadConfig(dir))!;
+      const mode = failure ? "followUp" : "steer";
+      expect(disk.inputMode ?? "followUp").toBe(mode);
+      expect(replacement.hasActiveTransport()).toBe(true);
+      expect(replacement.getInputModeRevision()).toBe(disk.inputModeRevision ?? 0);
+      expect((await replacement.handleInboundText("/inputmode", previous.ctx)).statusReply).toContain(failure ? "Follow-up" : "Steering");
+      if (survivor) await vi.waitFor(() => expect(coordinatorOf(survivor).getInputMode()).toBe(mode));
+    } finally {
+      release();
+      await Promise.allSettled([holding, changing, starting]);
+    }
+  }, 10_000);
+
+  it("reconnects a follower after a blocked mode broadcast and restores its current setting", async () => {
+    const leader = await fixture("leader", 50);
+    const follower = await fixture("follower", 51);
+    const coordinator = coordinatorOf(leader);
+    const socket = [...(coordinator as any).connections.entries()].find(([, state]: any) => state.runtimeId === follower.runtime.runtimeId)![0];
+    Object.defineProperty(socket, "writableLength", { configurable: true, value: 1024 * 1024 + 1 });
+    expect((await leader.runtime.handleInboundText("/inputmode steer", leader.ctx)).accepted).toBe(true);
+    expect(socket.destroyed).toBe(true);
+    await vi.waitFor(() => {
+      expect(follower.runtime.hasActiveTransport()).toBe(true);
+      expect(follower.runtime.getInputModeRevision()).toBe(coordinator.getInputModeRevision());
+      expect(coordinator.getRoutes().has(51)).toBe(true);
+    }, { timeout: 3000 });
+    expect((await follower.runtime.handleInboundText("/inputmode", follower.ctx)).statusReply).toContain("Steering");
+  });
+
+  it("synchronizes follower mode to leader even when saveConfig completes after the settings deadline", async () => {
+    const leader = await fixture("leader", 50);
+    const follower = await fixture("follower", 51);
+    const coordinator = coordinatorOf(leader);
+    await vi.waitFor(() => expect(coordinator.getRoutes().has(51)).toBe(true));
+
+    // Delay saveConfig on the follower beyond the 2000ms deadline
+    let finishSave!: () => void;
+    const saveBlocked = new Promise<void>(resolve => { finishSave = resolve; });
+    const configModule = await import("../src/config.js");
+    const originalSave = configModule.saveConfig;
+    vi.spyOn(configModule, "saveConfig").mockImplementation(async (dir, config, options) => {
+      await saveBlocked;
+      return originalSave(dir, config, options);
+    });
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const changing = follower.runtime.handleInboundText("/inputmode steer", follower.ctx);
+    // Advance timers past the 2000ms deadline
+    await vi.advanceTimersByTimeAsync(2001);
+    const timedOut = await changing;
+    expect(timedOut.statusReply).toContain("unknown");
+    expect(timedOut.statusReply).toContain("input mode configuration is still being saved");
+    expect(timedOut.statusReply).not.toMatch(/model change|restart Pi|\/reload cannot/);
+    // Leader has not received the update yet
+    expect(coordinator.getInputMode()).toBe("followUp");
+
+    // Now let the save complete
+    vi.useRealTimers();
+    finishSave();
+    await vi.waitFor(() => expect(coordinator.getInputMode()).toBe("steer"));
+    const diskConfig = await loadConfig(dir);
+    expect(diskConfig?.inputMode).toBe("steer");
+    expect(diskConfig?.inputModeRevision).toBeGreaterThanOrEqual(1);
+  });
+
+  it("preserves pending-input mirroring when input mode is changed during a delayed input hook", async () => {
+    const f = await fixture();
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (method, params) => {
+      calls.push({ method, params });
+      return { message_id: 888 } as any;
+    });
+
+    // Block saveConfig so /inputmode remains in-flight during the input hook
+    let finishSave!: () => void;
+    const saveBlocked = new Promise<void>(resolve => { finishSave = resolve; });
+    const configModule = await import("../src/config.js");
+    const originalSave = configModule.saveConfig;
+    vi.spyOn(configModule, "saveConfig").mockImplementation(async (dir, config, options) => {
+      await saveBlocked;
+      return originalSave(dir, config, options);
+    });
+
+    // Submit idle message (this calls sendUserMessage and sets inputContext for f.inInput)
+    const admission = f.runtime.handleInboundText("delayed task", f.ctx, 100);
+
+    // Start inputmode change (blocked inside saveConfig)
+    const modeChange = f.runtime.handleInboundText("/inputmode steer", f.ctx);
+
+    // Verify onInput does NOT swallow the prompt while mode change is in flight
+    expect(f.runtime.onInput(f.ctx, "delayed task")).toBeUndefined();
+
+    // Now let the delayed hook execute in the captured origin context before saveConfig completes
+    await f.inInput(() => f.runtime.onBeforeAgentStart({ prompt: "delayed task" }, f.ctx));
+    f.runtime.onMessageStart({ role: "user", content: "delayed task" }, f.ctx);
+
+    // Now let saveConfig finish
+    finishSave();
+    await modeChange;
+    await admission;
+    const diskConfig = await loadConfig(dir);
+    expect(diskConfig?.inputMode).toBe("steer");
+    expect(diskConfig?.inputModeRevision).toBeGreaterThanOrEqual(1);
+
+    // Run completes
+    f.runtime.onTurnEnd({ role: "assistant", content: "reply to delayed task", stopReason: "stop" });
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.outbox.whenIdle();
+
+    const sentTexts = calls.filter(c => c.method === "sendMessage").map(c => c.params.text);
+    expect(sentTexts).toContain("reply to delayed task");
+  });
+
+  it("rejects /inputmode update when connection configuration changed on disk", async () => {
+    const f = await fixture();
+    // Simulate connection settings changed on disk (e.g. chatId changed)
+    await saveConfig(dir, { ...testConfig, chatId: -100999 });
+
+    const result = await f.runtime.handleInboundText("/inputmode steer", f.ctx);
+    expect(result.accepted).toBe(false);
+    expect(result.statusReply).toContain("Settings update failed");
+    // Live configuration on runtime was not corrupted
+    expect(f.runtime.config?.chatId).toBe(testConfig.chatId);
+  });
+
+  it("prevents an overlapping /inputmode save from overwriting newer connection settings", async () => {
+    const f = await fixture();
+    let resumeReplace!: () => void;
+    let signalReachedCheck!: () => void;
+    const replacePaused = new Promise<void>(resolve => { resumeReplace = resolve; });
+    const reachedCheck = new Promise<void>(resolve => { signalReachedCheck = resolve; });
+
+    const configModule = await import("../src/config.js");
+    const originalSave = configModule.saveConfig;
+
+    let saveCalls = 0;
+    vi.spyOn(configModule, "saveConfig").mockImplementation(async (agentDir, config, options) => {
+      saveCalls++;
+      if (saveCalls === 1) {
+        return originalSave(agentDir, config, {
+          ...options,
+          onChecked: async () => {
+            signalReachedCheck();
+            await replacePaused;
+          },
+        });
+      }
+      return originalSave(agentDir, config, options);
+    });
+
+    // Start /inputmode steer
+    const modeChange = f.runtime.handleInboundText("/inputmode steer", f.ctx);
+    // Wait deterministically for the mode save transaction to reach the check
+    await reachedCheck;
+
+    // Concurrently, newer connection settings are written directly to configPath
+    const configPath = configModule.getConfigPath(dir);
+    const updatedConnection = { ...testConfig, chatId: -100888, botToken: "brand-new-token" };
+    await fs.writeFile(configPath, JSON.stringify(updatedConnection, null, 2) + "\n");
+
+    // Now resume the paused replace
+    resumeReplace();
+    const result = await modeChange;
+
+    // The mode change must fail because connection settings changed concurrently
+    expect(result.accepted).toBe(false);
+    expect(result.statusReply).toContain("Settings update failed");
+
+    // The newer connection settings on disk must survive completely intact!
+    const diskConfig = await loadConfig(dir);
+    expect(diskConfig?.chatId).toBe(-100888);
+    expect(diskConfig?.botToken).toBe("brand-new-token");
+  });
+
+  it("rejects out-of-order stale mode synchronization frames across both leader and follower", async () => {
+    const leader = await fixture("leader", 50);
+    const follower = await fixture("follower", 51);
+    const coordinator = coordinatorOf(leader);
+    await vi.waitFor(() => expect(coordinator.getRoutes().has(51)).toBe(true));
+
+    // Update to steer with revision 2
+    coordinator.updateInputMode("steer", undefined, 2);
+    expect(coordinator.getInputMode()).toBe("steer");
+    await vi.waitFor(async () => {
+      const menu = await follower.runtime.handleInboundText("/inputmode", follower.ctx);
+      expect(menu.statusReply).toContain("Steering");
+    });
+
+    // Stale sync frame with older revision 1 arrives from peer socket
+    const socket = [...(coordinator as any).connections.entries()].find(([, state]: any) => state.runtimeId === follower.runtime.runtimeId)![0];
+    coordinator.updateInputMode("followUp", socket, 1);
+
+    // Stale frame was discarded; leader remains on steer
+    expect(coordinator.getInputMode()).toBe("steer");
+
+    // Equal revision frame (2) is also discarded
+    coordinator.updateInputMode("followUp", socket, 2);
+    expect(coordinator.getInputMode()).toBe("steer");
+
+    // Deliver stale and equal frames directly to the follower client
+    socket.write(encodeFrame({ type: "sync_input_mode", mode: "followUp", revision: 1 }));
+    socket.write(encodeFrame({ type: "sync_input_mode", mode: "followUp", revision: 2 }));
+    await new Promise(r => setTimeout(r, 40));
+
+    // Follower also remains on steer (was not downgraded by equal or older revision)
+    const followerCheck = await follower.runtime.handleInboundText("/inputmode", follower.ctx);
+    expect(followerCheck.statusReply).toContain("Steering");
+
+    // Valid newer frame with revision 3 updates both peers
+    coordinator.updateInputMode("followUp", undefined, 3);
+    expect(coordinator.getInputMode()).toBe("followUp");
+    await vi.waitFor(async () => {
+      const menu = await follower.runtime.handleInboundText("/inputmode", follower.ctx);
+      expect(menu.statusReply).toContain("Follow-up");
+    });
+  });
+
+  it("synchronizes inputModeRevision on configuration reload and rejects stale frames", async () => {
+    const leader = await fixture("leader", 50);
+    const coordinator = coordinatorOf(leader);
+    // Save config with inputModeRevision = 5 on disk (allocated to 6)
+    const saved = await saveConfig(dir, { ...testConfig, inputMode: "steer", inputModeRevision: 5 }, { modeUpdate: true });
+    expect(saved.inputModeRevision).toBe(6);
+    await coordinator.reloadConfig();
+    expect(coordinator.getInputMode()).toBe("steer");
+
+    // Coordinator reloaded revision 6 from disk
+    expect((coordinator as any).inputModeRevision).toBe(6);
+
+    // Stale frame with revision 4 is rejected
+    coordinator.updateInputMode("followUp", undefined, 4);
+    expect(coordinator.getInputMode()).toBe("steer");
+
+    // Equal frame with revision 6 is rejected
+    coordinator.updateInputMode("followUp", undefined, 6);
+    expect(coordinator.getInputMode()).toBe("steer");
+
+    // Strictly newer frame with revision 7 is accepted
+    coordinator.updateInputMode("followUp", undefined, 7);
+    expect(coordinator.getInputMode()).toBe("followUp");
+    expect((coordinator as any).inputModeRevision).toBe(7);
+  });
+
+  it("does not overwrite newer live configuration when a delayed save completes with an older revision", async () => {
+    const leader = await fixture("leader", 50);
+    const follower = await fixture("follower", 51);
+    const coordinator = coordinatorOf(leader);
+    await vi.waitFor(() => expect(coordinator.getRoutes().has(51)).toBe(true));
+
+    let finishSave!: () => void;
+    const savePaused = new Promise<void>(resolve => { finishSave = resolve; });
+    const configModule = await import("../src/config.js");
+    const originalSave = configModule.saveConfig;
+    let saveCount = 0;
+    vi.spyOn(configModule, "saveConfig").mockImplementation(async (dir, config, options) => {
+      saveCount++;
+      if (saveCount === 1) {
+        await savePaused;
+      }
+      return originalSave(dir, config, options);
+    });
+
+    const followerChange = follower.runtime.handleInboundText("/inputmode steer", follower.ctx);
+
+    // Concurrently, leader updates mode to followUp with a newer revision 50
+    coordinator.updateInputMode("followUp", undefined, 50);
+
+    // Now let the older save complete (allocating an older revision < 50)
+    finishSave();
+    const result = await followerChange;
+
+    expect(result.accepted).toBe(false);
+    expect(result.statusReply).toContain("superseded");
+
+    // Follower live mode must NOT revert to steer
+    await vi.waitFor(async () => {
+      const checkFollower = await follower.runtime.handleInboundText("/inputmode", follower.ctx);
+      expect(checkFollower.statusReply).toContain("Follow-up");
+    });
+  });
+
+  it("preserves active-run prompt mirroring and reply delivery after changing model and thinking while busy", async () => {
+    const f = await fixture();
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (method, params) => {
+      calls.push({ method, params });
+      return { message_id: 888 } as any;
+    });
+    await f.runtime.onBeforeAgentStart({ prompt: "active task" }, f.ctx);
+    f.runtime.onMessageStart({ role: "user", content: "active task" }, f.ctx);
+    await f.runtime.outbox.whenIdle();
+
+    // Model and thinking changed mid-run
+    const thinkingChange = await f.runtime.handleInboundText("/thinking high", f.ctx);
+    expect(thinkingChange.busy).toBe(false);
+    expect(f.settings.setThinkingLevel).toHaveBeenCalledWith("high");
+
+    const modelChange = await f.runtime.handleInboundText("/model other/two", f.ctx);
+    expect(modelChange.busy).toBe(false);
+    expect(f.settings.setModel).toHaveBeenCalledWith(f.models[1]);
+
+    // Next turn completes
+    f.runtime.onTurnEnd({ role: "assistant", content: "answer after model change", stopReason: "stop" });
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.outbox.whenIdle();
+
+    const sentTexts = calls.filter(c => c.method === "sendMessage").map(c => c.params.text);
+    expect(sentTexts).toContain("answer after model change");
   });
 });
