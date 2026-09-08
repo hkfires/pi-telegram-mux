@@ -129,7 +129,7 @@ export class LeaderCoordinator {
         server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
       });
       const port = (server.address() as net.AddressInfo).port;
-      const result = await tryAcquireLeaderLock(this.agentDir, port);
+      const result = await tryAcquireLeaderLock(this.agentDir, port, Date.now(), server);
       if (!result.acquired) {
         for (const socket of this.connections.keys()) socket.destroy();
         await new Promise<void>(resolve => server.close(() => resolve()));

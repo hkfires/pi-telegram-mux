@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
+import * as net from "node:net";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import ts from "typescript";
@@ -145,4 +146,55 @@ describe("real multi-process election and crash recovery", () => {
     for (const child of survivors) child.send("stop");
     expect((await Promise.all(stopped)).every(x => !x.polling && !x.transport)).toBe(true);
   }, 20_000);
+
+  it("automatically replaces a retired endpoint owned by a still-live unrelated PID with exactly one Leader", async () => {
+    const dir = path.join(root, "reused-pid");
+    const runtimeDir = path.join(dir, "pi-telegram-mux", "runtime");
+    await fs.mkdir(runtimeDir, { recursive: true });
+    const endpoint = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      endpoint.once("error", reject);
+      endpoint.listen(0, "127.0.0.1", resolve);
+    });
+    const port = (endpoint.address() as net.AddressInfo).port;
+    await new Promise<void>(resolve => endpoint.close(() => resolve()));
+    await fs.writeFile(path.join(runtimeDir, "leader.json"), JSON.stringify({
+      pid: process.pid, port, capability: "retired-instance", epoch: 1, createdAt: 1,
+    }));
+    await startGroup(dir);
+    const current = JSON.parse(await fs.readFile(path.join(runtimeDir, "leader.json"), "utf-8"));
+    expect(current.pid).not.toBe(process.pid);
+    expect(current.capability).not.toBe("retired-instance");
+  }, 20_000);
+
+  it("preserves a suspended Leader without requiring an IPC response and reconnects after it resumes", async () => {
+    const dir = path.join(root, "paused-leader");
+    const gate = path.join(root, "resume-leader");
+    await saveConfig(dir, testConfig);
+    const a = launch(dir);
+    await a.ready;
+    const startedA = message(a.child, "started");
+    a.child.send("start");
+    expect((await startedA).leader).toBe(true);
+    const paused = message(a.child, "paused");
+    a.child.send({ type: "pause", gate });
+    await paused;
+    try {
+      const b = launch(dir);
+      await b.ready;
+      const startedB = message(b.child, "started");
+      b.child.send("start");
+      expect((await startedB).leader).toBe(false);
+      const lockPath = path.join(dir, "pi-telegram-mux", "runtime", "leader.json");
+      expect(JSON.parse(await fs.readFile(lockPath, "utf-8")).pid).toBe(a.child.pid);
+      const resumed = message(a.child, "resumed");
+      await fs.writeFile(gate, "resume");
+      await resumed;
+      await vi.waitFor(async () => {
+        const state = message(b.child, "state");
+        b.child.send("state");
+        expect(await state).toMatchObject({ leader: false, transport: true, polling: false });
+      }, { timeout: 8000 });
+    } finally { await fs.writeFile(gate, "resume"); }
+  }, 25_000);
 });

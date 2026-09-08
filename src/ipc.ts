@@ -118,16 +118,19 @@ export interface AcquireLeaderLockResult {
 }
 
 /**
- * Serialize publication, dead-PID reclamation and release under the same mutex.
- * A live but unresponsive PID is never evicted. The port must already be listening.
+ * Serialize publication, stale-endpoint reclamation and release under the same mutex.
+ * Leaders bind before publication and retain that listener until polling has stopped.
+ * Binding a retired endpoint proves it is no longer owned, even when its PID lives on.
+ * An unresponsive listener is never evicted. candidateServer is the new listener only.
  */
-export async function tryAcquireLeaderLock(agentDir: string, port: number, epoch = Date.now()): Promise<AcquireLeaderLockResult> {
+export async function tryAcquireLeaderLock(agentDir: string, port: number, epoch = Date.now(), candidateServer?: net.Server): Promise<AcquireLeaderLockResult> {
   const runtimeDir = getRuntimeDir(agentDir);
   await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
   const canonicalDir = await fs.realpath(runtimeDir);
   const lockPath = path.join(canonicalDir, LOCK_FILE_NAME);
   const unlock = await acquireElectionMutex(canonicalDir);
   const lockData: LeaderLockData = { pid: process.pid, port, capability: crypto.randomBytes(24).toString("hex"), epoch, createdAt: Date.now() };
+  let retiredEndpoint: net.Server | undefined;
   try {
     for (const file of fsSync.readdirSync(canonicalDir)) {
       const match = /^leader\.json\.(\d+)\.[\da-f]+\.tmp$/.exec(file);
@@ -140,7 +143,24 @@ export async function tryAcquireLeaderLock(agentDir: string, port: number, epoch
           typeof existing.capability !== "string" || !existing.capability) {
         throw new Error("Invalid Leader lock; remove it only after all mux processes have exited");
       }
-      if (isProcessAlive(existing.pid)) return { acquired: false, lockData: existing };
+      if (isProcessAlive(existing.pid)) {
+        const address = candidateServer?.address();
+        // An ephemeral allocation can itself reuse the retired port. Do not mistake
+        // our own new listener for the old Leader or close it as a temporary guard.
+        const ownsEndpoint = candidateServer?.listening && address && typeof address === "object" &&
+          address.address === "127.0.0.1" && address.port === port && port === existing.port;
+        if (!ownsEndpoint) {
+          retiredEndpoint = net.createServer(socket => socket.destroy());
+          const available = await new Promise<boolean>((resolve, reject) => {
+            retiredEndpoint!.once("error", (error: NodeJS.ErrnoException) => {
+              if (error.code === "EADDRINUSE" || error.code === "EACCES") resolve(false);
+              else reject(error);
+            });
+            retiredEndpoint!.listen({ host: "127.0.0.1", port: existing.port, exclusive: true }, () => resolve(true));
+          });
+          if (!available) return { acquired: false, lockData: existing };
+        }
+      }
     }
     // Publish complete metadata atomically; a crash leaves the old record or none.
     const temporaryPath = `${lockPath}.${process.pid}.${lockData.capability}.tmp`;
@@ -151,7 +171,11 @@ export async function tryAcquireLeaderLock(agentDir: string, port: number, epoch
       fsSync.rmSync(temporaryPath, { force: true });
     }
   } finally {
-    await unlock();
+    try {
+      // Hold the retired endpoint through publication so no contender can claim it
+      // in the gap between proving it unowned and replacing the metadata.
+      if (retiredEndpoint?.listening) await new Promise<void>(resolve => retiredEndpoint!.close(() => resolve()));
+    } finally { await unlock(); }
   }
 
   return {

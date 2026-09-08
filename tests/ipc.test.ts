@@ -357,9 +357,62 @@ describe("IPC protocol regressions", () => {
     expect(coordinator.isRunning()).toBe(false);
   });
 
-  it("does not replace the lock of a live PID even if its port is unavailable", async () => {
+  it("does not replace a Leader whose listening endpoint is still owned", async () => {
     const result = await tryAcquireLeaderLock(dir, 1234);
     expect(result.acquired).toBe(false);
     expect(result.lockData.capability).toBe(info.capability);
+  });
+
+  it.each(["live host", "dead host"])("recovers legacy metadata with a retired endpoint and a %s", async host => {
+    const lockPath = path.join(dir, "pi-telegram-mux", "runtime", "leader.json");
+    const previous = JSON.parse(await fs.readFile(lockPath, "utf-8"));
+    await coordinator.stop();
+    if (host === "dead host") previous.pid = 999999;
+    await fs.writeFile(lockPath, JSON.stringify(previous));
+    coordinator = new LeaderCoordinator(testConfig, dir);
+    const recovered = await coordinator.start();
+    expect(recovered.leader).toBe(true);
+    expect(recovered.capability).not.toBe(previous.capability);
+    expect(JSON.parse(await fs.readFile(lockPath, "utf-8")).capability).toBe(recovered.capability);
+    const follower = new IpcFollowerClient(recovered.port, recovered.capability, "recovered");
+    followers.push(follower);
+    await follower.connect();
+    expect(follower.isConnected()).toBe(true);
+  });
+
+  it("recognizes the candidate's own allocation of the retired port", async () => {
+    const lockPath = path.join(dir, "pi-telegram-mux", "runtime", "leader.json");
+    const previous = await fs.readFile(lockPath, "utf-8");
+    await coordinator.stop();
+    await fs.writeFile(lockPath, previous);
+    const candidate = net.createServer(socket => socket.destroy());
+    await new Promise<void>((resolve, reject) => {
+      candidate.once("error", reject);
+      candidate.listen(info.port, "127.0.0.1", resolve);
+    });
+    try {
+      const recovered = await tryAcquireLeaderLock(dir, info.port, Date.now(), candidate);
+      expect(recovered.acquired).toBe(true);
+      expect(candidate.listening).toBe(true);
+      expect(recovered.lockData.capability).not.toBe(info.capability);
+      await recovered.releaseLock!();
+    } finally { await new Promise<void>(resolve => candidate.close(() => resolve())); }
+  });
+
+  it.each(["EACCES", "EADDRINUSE", "EAFNOSUPPORT"])("does not reclaim a record when binding its endpoint fails with %s", async code => {
+    const listen = net.Server.prototype.listen;
+    vi.spyOn(net.Server.prototype, "listen").mockImplementation(function (this: net.Server, ...args: any[]) {
+      if (args[0]?.port === info.port) {
+        queueMicrotask(() => this.emit("error", Object.assign(new Error("Simulated bind failure"), { code })));
+        return this;
+      }
+      return listen.apply(this, args as any);
+    });
+    const acquiring = tryAcquireLeaderLock(dir, 1234);
+    if (code === "EAFNOSUPPORT") await expect(acquiring).rejects.toMatchObject({ code });
+    else expect((await acquiring).acquired).toBe(false);
+    const runtimeDir = path.join(dir, "pi-telegram-mux", "runtime");
+    expect(JSON.parse(await fs.readFile(path.join(runtimeDir, "leader.json"), "utf-8")).capability).toBe(info.capability);
+    expect(await fs.readdir(path.join(runtimeDir, "election"))).toEqual([]);
   });
 });

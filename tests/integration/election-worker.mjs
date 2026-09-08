@@ -52,6 +52,11 @@ process.on("message", async message => {
     await runtime.onSessionShutdown(ctx);
     process.send({ type: "stopped", transport: runtime.hasActiveTransport(), polling });
     process.disconnect();
+  } else if (message?.type === "pause") {
+    process.send({ type: "paused" });
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    while (!fs.existsSync(message.gate)) Atomics.wait(wait, 0, 0, 50);
+    process.send({ type: "resumed" });
   }
 });
 process.send({ type: "ready" });
