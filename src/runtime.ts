@@ -132,6 +132,7 @@ export class MuxRuntime {
   private transportVersion = 0;
   private setupTask: Promise<void> | null = null;
   private reconnectTimer?: NodeJS.Timeout;
+  private lastConnectionError = "";
   private lastTransportError = "";
   private lastCommandMenuError = "";
   private lastInteractionError = "";
@@ -228,6 +229,7 @@ export class MuxRuntime {
       this.reconnectTimer = undefined;
       this.isReconnecting = false;
       this.connectionError = null;
+      this.lastConnectionError = "";
       this.updateStatusBar(ctx);
       return Promise.resolve();
     }
@@ -356,6 +358,7 @@ export class MuxRuntime {
           if (!this.active || version !== this.transportVersion) return;
           if (!this.hasActiveTransport()) throw new IpcError("IPC_CLOSED", "IPC reset during topic reopening");
           this.isReconnecting = false;
+          this.lastConnectionError = "";
           this.updateStatusBar(ctx);
           return;
         } catch (err) {
@@ -379,7 +382,9 @@ export class MuxRuntime {
     // Invalid configuration/JSON, protocol violations and unknown errors are fatal.
     if (!this.active) return;
     this.connectionError = error instanceof Error ? error : new Error("Telegram connection failed", { cause: error });
-    ctx.ui?.notify(`Telegram connection failed: ${this.connectionError.message}`, "error");
+    const notice = `Telegram connection failed: ${this.connectionError.message}`;
+    if (notice !== this.lastConnectionError) ctx.ui?.notify(notice, "error");
+    this.lastConnectionError = notice;
     const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
     if (typeof code === "string" && ["ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "IPC_CLOSED", "IPC_TIMEOUT", "IPC_ELECTION_BUSY", "IPC_CONFIG_BUSY"].includes(code)) this.scheduleReconnect(ctx);
     else { this.isReconnecting = false; this.updateStatusBar(ctx); }

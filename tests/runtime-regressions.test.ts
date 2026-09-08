@@ -34,6 +34,71 @@ describe("Runtime lifecycle and safety regressions", () => {
     vi.spyOn(TelegramClient.prototype, "getChatMember").mockImplementation(async (_chat, user) => user === 1 ? { status: "administrator", can_manage_topics: true } : { status: "member" });
   }
 
+  it.each(["ECONNREFUSED", "IPC_TIMEOUT"])("deduplicates repeated %s connection failure notifications while continuing retries", async code => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let message = "Connection to the local Leader failed";
+    const start = vi.spyOn(LeaderCoordinator.prototype, "start").mockImplementation(async () => {
+      throw Object.assign(new Error(message), { code });
+    });
+    const f = await fixture("offline", null);
+    const setup = vi.spyOn(f.runtime, "setupTransport");
+    expect(f.ui.notify).toHaveBeenCalledExactlyOnceWith(`Telegram connection failed: ${message}`, "error");
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await vi.advanceTimersByTimeAsync(500);
+      await setup.mock.results.at(-1)!.value.catch(() => {});
+    }
+    expect(start).toHaveBeenCalledTimes(4);
+    expect(f.ui.notify).toHaveBeenCalledTimes(1);
+    expect(f.runtime.getIsReconnecting()).toBe(true);
+    expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: reconnecting");
+
+    message = "Connection to a different local Leader failed";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await vi.advanceTimersByTimeAsync(500);
+      await setup.mock.results.at(-1)!.value.catch(() => {});
+    }
+    expect(start).toHaveBeenCalledTimes(6);
+    expect(f.ui.notify).toHaveBeenCalledTimes(2);
+    expect(f.ui.notify).toHaveBeenLastCalledWith(`Telegram connection failed: ${message}`, "error");
+    f.runtime.handleTgStatus(f.ctx);
+    expect(f.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining(`Error: ${message}`), "info");
+  });
+
+  it.each(["leader", "follower"])("reports the same connection failure after %s transport recovery", async role => {
+    if (role === "follower") await fixture("leader");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const error = Object.assign(new Error("Connection to the local Leader failed"), { code: "ECONNREFUSED" });
+    const start = vi.spyOn(LeaderCoordinator.prototype, "start").mockRejectedValueOnce(error);
+    const f = await fixture("recovery", null);
+    expect(f.ui.notify).toHaveBeenCalledExactlyOnceWith(`Telegram connection failed: ${error.message}`, "error");
+
+    await f.runtime.setupTransport(f.ctx);
+    expect(f.runtime.hasActiveTransport()).toBe(true);
+    expect(f.runtime.getIsLeader()).toBe(role === "leader");
+    expect(f.runtime.getIsReconnecting()).toBe(false);
+
+    await (f.runtime as any).stopTransport();
+    start.mockRejectedValueOnce(error);
+    await f.runtime.onSessionStart(f.ctx);
+    expect(f.ui.notify).toHaveBeenCalledTimes(2);
+    expect(f.ui.notify).toHaveBeenLastCalledWith(`Telegram connection failed: ${error.message}`, "error");
+    expect(f.runtime.getIsReconnecting()).toBe(true);
+  });
+
+  it.each(["leader", "follower"])("reports the same connection failure after recognizing an existing %s transport", async role => {
+    const leader = await fixture("leader");
+    const f = role === "leader" ? leader : await fixture("follower", 51);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const error = Object.assign(new Error("Connection to the local Leader failed"), { code: "ECONNREFUSED" });
+    (f.runtime as any).connectionFailed(error, f.ctx);
+    await f.runtime.setupTransport(f.ctx);
+    expect(f.runtime.getIsReconnecting()).toBe(false);
+    (f.runtime as any).connectionFailed(error, f.ctx);
+    expect(f.ui.notify).toHaveBeenCalledTimes(2);
+    expect(f.ui.notify).toHaveBeenLastCalledWith(`Telegram connection failed: ${error.message}`, "error");
+  });
+
   it("does not reconnect or republish status after follower shutdown", async () => {
     const leader = await fixture("leader", 50);
     const follower = await fixture("follower", 51);
