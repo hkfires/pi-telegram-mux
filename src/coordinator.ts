@@ -18,7 +18,6 @@ export interface RouteEntry extends OutputTarget {
   runtimeId: string;
   dispatchInbound: (text: string, messageId: number, media?: InboundMedia | InboundMedia[], signal?: AbortSignal) => Promise<InboundResult>;
   abortRun?: () => boolean | void | Promise<boolean | void>;
-  retainedMessageIds?: number[];
 }
 
 interface MediaAlbum {
@@ -419,7 +418,6 @@ export class LeaderCoordinator {
           ok = this.claimRoute({
             ...target,
             runtimeId: reg.runtimeId,
-            retainedMessageIds: reg.retainedMessageIds,
             dispatchInbound: (text, messageId, media, signal) => this.requestFollower(socket, {
               type: "inbound",
               requestId: "",
