@@ -73,11 +73,15 @@ it.each(["leader-idle", "leader-followUp", "leader-steer", "follower-idle", "fol
   const send = idle ? f.pi.sendUserMessage : f.pi.sendMessage;
   expect(send).toHaveBeenCalledOnce();
   const content = idle ? send.mock.calls[0][0] : send.mock.calls[0][0].content;
-  expect(content).toEqual([
-    { type: "text", text: "[Image#1] [Image#2]\n\nFirst image caption\n\nCompare these" },
-    { type: "image", mimeType: "image/jpeg", data: Buffer.from("photos/image10.jpg").toString("base64") },
-    { type: "image", mimeType: "image/jpeg", data: Buffer.from("photos/image20.jpg").toString("base64") },
-  ]);
+  expect(typeof content).toBe("string");
+  const [one, two, blank, ...captions] = content.split("\n");
+  expect(one).toMatch(/^\[Image#1\] /);
+  expect(two).toMatch(/^\[Image#2\] /);
+  const files = [one.slice(10), two.slice(10)];
+  for (const file of files) expect(path.isAbsolute(file)).toBe(true);
+  expect(await Promise.all(files.map(file => fs.readFile(file, "utf8")))).toEqual(["photos/image10.jpg", "photos/image20.jpg"]);
+  expect(blank).toBe("");
+  expect(captions.join("\n")).toBe("First image caption\n\nCompare these");
   if (!idle) expect(f.pi.sendMessage.mock.calls[0][1]).toMatchObject({ deliverAs: scenario.endsWith("steer") ? "steer" : "followUp" });
   expect(c.getTelegramClient().downloadFile).toHaveBeenCalledTimes(2);
   const retained = await fs.readdir(getMediaDir(dir));
@@ -88,18 +92,21 @@ it.each(["leader-idle", "leader-followUp", "leader-steer", "follower-idle", "fol
   expect([...((c as any).albums as Map<string, any>).values()][0].messages).toEqual([]);
 });
 
-it.each([undefined, "", " \n\t"])("uses only labels when two image captions are %j", async caption => {
+it.each([undefined, "", " \n\t"])("uses only numbered paths when two image captions are %j", async caption => {
   const f = await start();
   f.pi.sendUserMessage.mockImplementation((content: any) => {
     void f.runtime.onBeforeAgentStart(f.ctx).then(() => f.runtime.onMessageStart({ role: "user", content }, f.ctx));
   });
   await Promise.all([c.processUpdate(image(1, "album", caption)), c.processUpdate(image(2, "album", caption))]);
   expect(f.pi.sendUserMessage).toHaveBeenCalledOnce();
-  expect(f.pi.sendUserMessage.mock.calls[0][0]).toEqual([
-    { type: "text", text: "[Image#1] [Image#2]" },
-    { type: "image", mimeType: "image/jpeg", data: Buffer.from("photos/image1.jpg").toString("base64") },
-    { type: "image", mimeType: "image/jpeg", data: Buffer.from("photos/image2.jpg").toString("base64") },
-  ]);
+  const lines = f.pi.sendUserMessage.mock.calls[0][0].split("\n");
+  expect(lines).toHaveLength(2);
+  for (const [index, line] of lines.entries()) {
+    expect(line.startsWith(`[Image#${index + 1}] `)).toBe(true);
+    const file = line.slice(10);
+    expect(path.isAbsolute(file)).toBe(true);
+    expect(await fs.readFile(file, "utf8")).toBe(`photos/image${index + 1}.jpg`);
+  }
 });
 
 it("keeps separate albums and later text ordered without combining topics", async () => {
@@ -197,26 +204,27 @@ it("rejects all members when the first arrives during overload", async () => {
   expect(c.getTelegramClient().getFile).not.toHaveBeenCalled();
 });
 
-it("submits an album above the queue budget intact when the media queue is empty", async () => {
+it("submits large albums as small path strings without loading Base64", async () => {
   const f = await start();
   vi.mocked(f.ctx.isIdle).mockReturnValue(false);
   await f.runtime.onBeforeAgentStart(f.ctx);
   const bytes = Buffer.alloc(13 * 1024 * 1024);
   vi.mocked(c.getTelegramClient().downloadFile).mockResolvedValue(bytes);
+  const read = vi.spyOn(fs, "readFile");
   await Promise.all([c.processUpdate(image(1, "large", "both")), c.processUpdate(image(2, "large"))]);
   expect(f.pi.sendMessage).toHaveBeenCalledOnce();
   const content = f.pi.sendMessage.mock.calls[0][0].content;
-  expect(content).toHaveLength(3);
-  for (const part of content.slice(1)) {
-    expect(part.type).toBe("image");
-    expect(part.data.length).toBe(Math.ceil(bytes.length / 3) * 4);
-  }
+  expect(typeof content).toBe("string");
+  expect(content.length).toBeLessThan(1024);
+  expect(content.split("\n")).toHaveLength(4);
+  expect(content.endsWith("\n\nboth")).toBe(true);
+  expect(read.mock.calls.some(call => String(call[0]).startsWith(getMediaDir(dir)))).toBe(false);
   const retained = await fs.readdir(getMediaDir(dir));
   expect(retained).toHaveLength(2);
   for (const name of retained) expect((await fs.readFile(path.join(getMediaDir(dir), name))).equals(bytes)).toBe(true);
 });
 
-it.each(["anthropic-messages", "bedrock-converse-stream"])("passes a valid 6 MiB PNG to %s without enforcing provider size limits", async api => {
+it.each(["anthropic-messages", "bedrock-converse-stream"])("passes a valid 6 MiB PNG path to %s without enforcing provider size limits", async api => {
   const f = await start();
   (f.ctx as any).model = { id: "claude-test", api, input: ["text", "image"] };
   f.pi.sendUserMessage.mockImplementation((content: any) => {
@@ -247,7 +255,7 @@ it.each(["anthropic-messages", "bedrock-converse-stream"])("passes a valid 6 MiB
   const result = await f.runtime.handleInboundText("inspect", f.ctx, 1, undefined, { path: file, mimeType: "image/png" });
   expect(result.accepted).toBe(true);
   expect(f.pi.sendUserMessage).toHaveBeenCalledOnce();
-  expect(f.pi.sendUserMessage.mock.calls[0][0][1]).toEqual({ type: "image", data: png.toString("base64"), mimeType: "image/png" });
+  expect(f.pi.sendUserMessage.mock.calls[0][0]).toBe(`[Image#1] ${file}\n\ninspect`);
   expect((await fs.readFile(file)).equals(png)).toBe(true);
 });
 
@@ -276,15 +284,15 @@ it.each(["outside", "junction", ...(process.platform === "win32" ? ["case alias"
   }
 });
 
-it.each(["quit", "reload"])("releases Leader resources when image reading stalls during %s", async reason => {
+it.each(["quit", "reload"])("releases Leader resources when image validation stalls during %s", async reason => {
   const f = await start();
-  const read = fs.readFile;
+  const open = fs.open;
   let release!: () => void;
   const barrier = new Promise<void>(resolve => { release = resolve; });
   let reading = false;
-  vi.spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-    if (typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) { reading = true; await barrier; }
-    return (read as any)(...args);
+  vi.spyOn(fs, "open").mockImplementation(async (...args: any[]) => {
+    if (args[1] === "r" && typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) { reading = true; await barrier; }
+    return (open as any)(...args);
   });
   const warn = vi.spyOn(console, "error").mockImplementation(() => {});
   const receiving = c.processUpdate(image(1));

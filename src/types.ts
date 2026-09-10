@@ -74,6 +74,8 @@ export interface TransportStatus {
 }
 
 export const IPC_PROTOCOL_VERSION = 6;
+// Both peers must agree on image delivery semantics, not just the frame schema.
+export const IMAGE_INPUT_MODE = "paths-v1";
 
 /**
  * Leader lock metadata stored in {agentDir}/pi-telegram-mux/runtime/leader.json
@@ -197,8 +199,8 @@ export interface TelegramApiResponse<T> {
  * IPC Frame Types between Leader and Follower
  */
 export type IpcMessage =
-  | { type: "auth"; protocolVersion: number; capability: string; runtimeId: string }
-  | { type: "auth_ack"; protocolVersion: number; epoch: number; configFingerprint: string; connectionFingerprint?: string; status: TransportStatus; inputMode?: BusyInputMode; inputModeRevision?: number }
+  | { type: "auth"; protocolVersion: number; imageInputMode?: string; capability: string; runtimeId: string }
+  | { type: "auth_ack"; protocolVersion: number; imageInputMode?: string; epoch: number; configFingerprint: string; connectionFingerprint?: string; status: TransportStatus; inputMode?: BusyInputMode; inputModeRevision?: number }
   | { type: "sync_input_mode"; mode: BusyInputMode; revision: number }
   | { type: "transport_status"; status: TransportStatus }
   | { type: "transport_reset" }

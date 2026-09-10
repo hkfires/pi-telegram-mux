@@ -8,7 +8,7 @@ import { encodeFrame, FrameParser, tryAcquireLeaderLock } from "./ipc.js";
 import { IMAGE_MIME_TYPES, INPUT_CLEANUP_NOTICE_MS, MAX_INPUT_WORK, MEDIA_IPC_TIMEOUT_MS, removeMedia } from "./media.js";
 import { BoundedOutbox } from "./outbox.js";
 import { ConflictError, isRecoverableTelegramError, RateLimitError, TelegramApiError, TelegramClient } from "./telegram.js";
-import { IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundMedia, type InboundResult, type IpcMessage, type MuxConfig, type OutputTarget, type RuntimeRegistration, type TelegramMessage, type TelegramUpdate, type TransportStatus } from "./types.js";
+import { IMAGE_INPUT_MODE, IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundMedia, type InboundResult, type IpcMessage, type MuxConfig, type OutputTarget, type RuntimeRegistration, type TelegramMessage, type TelegramUpdate, type TransportStatus } from "./types.js";
 
 const inputWorkKey = Symbol.for("pi-telegram-mux.coordinator-input-work.v1");
 const workState = globalThis as typeof globalThis & { [inputWorkKey]?: Set<Promise<void>> };
@@ -277,7 +277,7 @@ export class LeaderCoordinator {
     if (!this.running || socket.destroyed) { socket.destroy(); return; }
     if (socket.writableEnded) return;
     if (!state.runtimeId) {
-      if (msg.type !== "auth" || msg.protocolVersion !== IPC_PROTOCOL_VERSION ||
+      if (msg.type !== "auth" || msg.protocolVersion !== IPC_PROTOCOL_VERSION || msg.imageInputMode !== IMAGE_INPUT_MODE ||
           typeof msg.capability !== "string" || typeof msg.runtimeId !== "string" || !msg.runtimeId || msg.runtimeId.length > 128) {
         socket.destroy(); return;
       }
@@ -286,7 +286,7 @@ export class LeaderCoordinator {
       if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) { socket.destroy(); return; }
       state.runtimeId = msg.runtimeId;
       clearTimeout(state.authTimer);
-      socket.write(encodeFrame({ type: "auth_ack", protocolVersion: IPC_PROTOCOL_VERSION, epoch: this.epoch, configFingerprint: this.configuration, connectionFingerprint: configFingerprint(this.config, "connection"), status: this.status, inputMode: this.config.inputMode ?? "followUp", inputModeRevision: this.inputModeRevision }));
+      socket.write(encodeFrame({ type: "auth_ack", protocolVersion: IPC_PROTOCOL_VERSION, imageInputMode: IMAGE_INPUT_MODE, epoch: this.epoch, configFingerprint: this.configuration, connectionFingerprint: configFingerprint(this.config, "connection"), status: this.status, inputMode: this.config.inputMode ?? "followUp", inputModeRevision: this.inputModeRevision }));
       return;
     }
 

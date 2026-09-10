@@ -199,19 +199,19 @@ it("retains files when a real follower accepts images but its IPC acknowledgemen
 
 it("retains an unreadable handed-off file and rejects rather than submitting its caption alone", async () => {
   const { f, c } = await start();
-  const read = fs.readFile;
-  vi.spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-    if (typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) {
-      throw Object.assign(new Error("Injected read failure"), { code: "EACCES" });
+  const open = fs.open;
+  vi.spyOn(fs, "open").mockImplementation(async (...args: any[]) => {
+    if (args[1] === "r" && typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) {
+      throw Object.assign(new Error("Injected read access failure"), { code: "EACCES" });
     }
-    return (read as any)(...args);
+    return (open as any)(...args);
   });
   await c.processUpdate(photo(1, undefined, 50));
   expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
   expect(f.pi.sendMessage).not.toHaveBeenCalled();
   const retained = await fs.readdir(getMediaDir(dir));
   expect(retained).toHaveLength(1);
-  expect(await read(path.join(getMediaDir(dir), retained[0]), "utf8")).toBe("photos/image1.jpg");
+  expect(await fs.readFile(path.join(getMediaDir(dir), retained[0]), "utf8")).toBe("photos/image1.jpg");
 });
 
 it.each(["reload", "quit"])("keeps completed files through settlement, %s, new Leader startup and a fresh process read", async reason => {

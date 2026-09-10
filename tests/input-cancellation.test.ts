@@ -51,11 +51,11 @@ it.each([false, true].flatMap(follower => [401, 409].map(code => ({ follower, co
   }));
   const { target, c, thread } = await setup(follower);
   const paused = gate();
-  const read = fs.readFile;
+  const open = fs.open;
   let reading = false;
-  vi.spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-    if (typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) { reading = true; await paused.promise; }
-    return (read as any)(...args);
+  vi.spyOn(fs, "open").mockImplementation(async (...args: any[]) => {
+    if (args[1] === "r" && typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) { reading = true; await paused.promise; }
+    return (open as any)(...args);
   });
   const input = c.processUpdate(photo(thread));
   await vi.waitFor(() => expect(reading).toBe(true));
@@ -75,11 +75,11 @@ it.each([false, true].flatMap(follower => [401, 409].map(code => ({ follower, co
 it.each([false, true])("bounds cancelled physical work and retains control commands (follower=%s)", async follower => {
   const { target, c, thread } = await setup(follower);
   const paused = gate();
-  const read = fs.readFile;
+  const open = fs.open;
   let reads = 0;
-  vi.spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-    if (typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) { reads++; await paused.promise; }
-    return (read as any)(...args);
+  vi.spyOn(fs, "open").mockImplementation(async (...args: any[]) => {
+    if (args[1] === "r" && typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) { reads++; await paused.promise; }
+    return (open as any)(...args);
   });
   for (let i = 1; i <= 32; i++) {
     const input = c.processUpdate(photo(thread));

@@ -1,5 +1,4 @@
 import * as crypto from "node:crypto";
-import * as fs from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, MessageEndEvent } from "@earendil-works/pi-coding-agent";
@@ -9,7 +8,7 @@ import { LeaderCoordinator } from "./coordinator.js";
 import { IpcError, IpcFollowerClient } from "./ipc.js";
 import { BoundedOutbox } from "./outbox.js";
 import { extractAssistantText, extractUserText, splitTelegramMessage } from "./render.js";
-import { IMAGE_MIME_TYPES, INPUT_ADMISSION_TIMEOUT_MS, MAX_INPUT_WORK, MEDIA_QUEUE_BUDGET_BYTES, MEDIA_READ_TIMEOUT_MS } from "./media.js";
+import { buildImagePathPrompt, INPUT_ADMISSION_TIMEOUT_MS, MAX_INPUT_WORK, MEDIA_VALIDATION_TIMEOUT_MS } from "./media.js";
 import { MarkdownWorker } from "./markdown-worker.js";
 import { TelegramClient, validateBotAndChat } from "./telegram.js";
 import type { BindingState, BusyInputMode, InboundMedia, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic, TelegramMessage } from "./types.js";
@@ -169,9 +168,9 @@ export class MuxRuntime {
   private currentRun: MirrorRun | null = null;
   private cleanupTask: Promise<void> | null = null;
   private pendingInput?: Admission;
-  private mediaReading?: AbortSignal;
+  private mediaValidating?: AbortSignal;
   private inputCancellation = new AbortController();
-  private readonly queuedInputs = new Map<string, { run: MirrorRun; messageId?: number; mediaBytes?: number }>();
+  private readonly queuedInputs = new Map<string, { run: MirrorRun; messageId?: number }>();
   private settingsCommandInFlight = false;
   private inputModeCommandInFlight = false;
   private inputModeRevision = 0;
@@ -586,26 +585,6 @@ export class MuxRuntime {
     const config = this.config;
     const inputSignal = upstreamSignal ? AbortSignal.any([upstreamSignal, this.inputCancellation.signal]) : this.inputCancellation.signal;
     const images = media ? Array.isArray(media) ? media : [media] : [];
-    if (media) {
-      if (!images.length || images.length > 10 || images.some(image => !image || typeof image.path !== "string" || !IMAGE_MIME_TYPES.has(image.mimeType))) {
-        return { accepted: false, busy: false, statusReply: "Invalid image cache reference or unsupported format." };
-      }
-      try {
-        const cache = await fs.stat(await fs.realpath(getMediaDir(this.agentDir)), { bigint: true });
-        for (const image of images) {
-          const parent = await fs.stat(await fs.realpath(path.dirname(path.resolve(image.path))), { bigint: true });
-          if (!parent.isDirectory() || parent.dev !== cache.dev || parent.ino !== cache.ino) {
-            return { accepted: false, busy: false, statusReply: "Invalid image cache reference or unsupported format." };
-          }
-        }
-      } catch {
-        // Validation can finish after cancellation. Keep a redacted diagnostic
-        // even when its safe rejection can no longer be returned to Telegram.
-        console.error(`[pi-telegram-mux] MEDIA_VALIDATION_FAILED: reference ${inputReference}`);
-        // Input boundary: missing/inaccessible cache directories cannot produce a partial prompt.
-        return { accepted: false, busy: false, statusReply: "Failed to validate image cache on local machine." };
-      }
-    }
     if (inputSignal.aborted) return { accepted: false, busy: false, statusReply: "Input cancelled." };
     if (this.rateLimitUntil > Date.now()) return { accepted: false, busy: true };
     if (!this.active || this.configuring || this.getIsReconnecting() || this.bindingState !== "bound") {
@@ -659,43 +638,25 @@ export class MuxRuntime {
       };
     }
 
-    let promptPayload: string | Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>;
-    let mediaBytes = 0;
+    let promptPayload = trimmed;
     if (media) {
-      if (this.mediaReading && !this.mediaReading.aborted) return { accepted: false, busy: true };
-      this.mediaReading = inputSignal;
+      if (this.mediaValidating && !this.mediaValidating.aborted) return { accepted: false, busy: true };
+      this.mediaValidating = inputSignal;
       try {
-        const stats = await Promise.all(images.map(image => fs.lstat(image.path)));
-        if (stats.some(stat => !stat.isFile())) throw new Error("Image cache is not a regular file");
-        const queuedBytes = [...this.queuedInputs.values()].reduce((sum, input) => sum + (input.mediaBytes ?? 0), 0);
-        mediaBytes = stats.reduce((sum, stat) => sum + Math.ceil(stat.size / 3) * 4, 0);
-        // Never reject an input solely for its size. Large inputs wait for an empty
-        // media queue, and pause further image admission until they are consumed.
-        if (queuedBytes > 0 && queuedBytes + mediaBytes > MEDIA_QUEUE_BUDGET_BYTES) {
-          return { accepted: false, busy: true };
-        }
-        // Keep labels in the text block so Pi can display attachments even without inline graphics.
-        const labels = images.map((_, index) => `[Image#${index + 1}]`).join(" ");
-        promptPayload = [{ type: "text", text: trimmed ? `${labels}\n\n${trimmed}` : labels }];
-        const readSignal = AbortSignal.any([inputSignal, AbortSignal.timeout(MEDIA_READ_TIMEOUT_MS)]);
-        for (let index = 0; index < images.length; index++) {
-          readSignal.throwIfAborted();
-          const buffer = await fs.readFile(images[index].path, { signal: readSignal });
-          if (buffer.length !== stats[index].size) throw new Error("Image cache changed during reading");
-          promptPayload.push({ type: "image", data: buffer.toString("base64"), mimeType: images[index].mimeType });
-        }
+        const validationSignal = AbortSignal.any([inputSignal, AbortSignal.timeout(MEDIA_VALIDATION_TIMEOUT_MS)]);
+        promptPayload = await buildImagePathPrompt(trimmed, images, getMediaDir(this.agentDir), validationSignal);
       } catch (error) {
         const code = (error as NodeJS.ErrnoException | null)?.code;
         if (code !== "ABORT_ERR" && !(error instanceof DOMException && error.name === "AbortError")) {
-          console.error(`[pi-telegram-mux] MEDIA_READ_FAILED: reference ${inputReference}`);
+          // Late I/O failures remain visible even after cancellation or reload,
+          // without leaking paths, captions or arbitrary filesystem error text.
+          console.error(`[pi-telegram-mux] MEDIA_VALIDATION_FAILED: reference ${inputReference}`);
         }
-        // Input boundary: failed cache reads cannot submit a partial text-only task.
-        return { accepted: false, busy: false, statusReply: "Failed to read image cache on local machine." };
+        // Reject the entire album before Pi submission; never send only its caption.
+        return { accepted: false, busy: false, statusReply: "Failed to validate image cache on local machine." };
       } finally {
-        if (this.mediaReading === inputSignal) this.mediaReading = undefined;
+        if (this.mediaValidating === inputSignal) this.mediaValidating = undefined;
       }
-    } else {
-      promptPayload = trimmed;
     }
 
     // /stop can arrive through either the local route or IPC while image I/O is pending.
@@ -751,7 +712,7 @@ export class MuxRuntime {
       if (this.queuedInputs.size >= MAX_QUEUED_INPUTS) return { accepted: false, busy: true };
       const mode: BusyInputMode = explicitMode ?? this.config?.inputMode ?? "followUp";
       const deliveryId = crypto.randomUUID();
-      this.queuedInputs.set(deliveryId, { run: this.currentRun, messageId, mediaBytes });
+      this.queuedInputs.set(deliveryId, { run: this.currentRun, messageId });
       try {
         // In Pi 0.85 an active run queues custom messages synchronously, before
         // any await. Keep the idle check and send together: sendUserMessage's
@@ -957,7 +918,7 @@ export class MuxRuntime {
     // Keep the aborted signal on its admission even after releasing the reservation.
     this.inputCancellation.abort();
     this.inputCancellation = new AbortController();
-    this.mediaReading = undefined;
+    this.mediaValidating = undefined;
     this.finishInput({ accepted: false, busy: false, statusReply: "Input cancelled." });
   }
 
@@ -1426,10 +1387,10 @@ export class MuxRuntime {
 
   private invalidateRun(): void {
     this.generation++;
-    // Detach stale cache I/O; its finalizer cannot release a newer read reservation.
+    // Detach stale cache I/O; its finalizer cannot release a newer validation reservation.
     this.inputCancellation.abort();
     this.inputCancellation = new AbortController();
-    this.mediaReading = undefined;
+    this.mediaValidating = undefined;
     this.rateLimitReopenTask = null;
     this.currentRun?.settle();
     this.currentRun = null;

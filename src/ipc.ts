@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { getRuntimeDir, replaceFile } from "./config.js";
 import { getProcessIdentity } from "./process-identity.js";
 import { MAX_INPUT_WORK } from "./media.js";
-import { IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundResult, type IpcMessage, type LeaderLockData, type OutputTarget, type RuntimeRegistration, type TransportStatus } from "./types.js";
+import { IMAGE_INPUT_MODE, IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundResult, type IpcMessage, type LeaderLockData, type OutputTarget, type RuntimeRegistration, type TransportStatus } from "./types.js";
 
 const MAX_FRAME_BYTES = 1024 * 1024;
 const LOCK_FILE_NAME = "leader.json";
@@ -272,12 +272,13 @@ export class IpcFollowerClient {
       const socket = net.createConnection({ host: "127.0.0.1", port: this.port });
       this.socket = socket;
       const timeout = setTimeout(() => { reject(new IpcError("IPC_TIMEOUT", "IPC connection timeout")); socket.destroy(); }, timeoutMs);
-      socket.on("connect", () => socket.write(encodeFrame({ type: "auth", protocolVersion: IPC_PROTOCOL_VERSION, capability: this.capability, runtimeId: this.runtimeId })));
+      socket.on("connect", () => socket.write(encodeFrame({ type: "auth", protocolVersion: IPC_PROTOCOL_VERSION, imageInputMode: IMAGE_INPUT_MODE, capability: this.capability, runtimeId: this.runtimeId })));
       socket.on("data", (chunk) => {
         try {
           for (const msg of parser.push(chunk)) {
             if (msg.type === "auth_ack") {
               if (msg.protocolVersion !== IPC_PROTOCOL_VERSION) throw new Error("Incompatible IPC protocol; restart all mux processes");
+              if (msg.imageInputMode !== IMAGE_INPUT_MODE) throw new IpcError("IPC_IMAGE_MODE_MISMATCH", "Incompatible image input mode; restart all mux processes with the same version");
               clearTimeout(timeout);
               this.connected = true;
               this.configuration = msg.configFingerprint;

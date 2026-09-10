@@ -57,15 +57,15 @@ async function cache(size = 8, unfinished = false) {
   return { path: file, mimeType: "image/jpeg" };
 }
 
-it.each(["disconnect", "generation", "config"])("does not submit after %s during image reading", async change => {
+it.each(["disconnect", "generation", "config"])("does not submit after %s during image validation", async change => {
   const f = await fixture();
   const media = await cache();
-  const read = fs.readFile;
+  const open = fs.open;
   let release!: () => void;
   const barrier = new Promise<void>(resolve => { release = resolve; });
-  const spy = vi.spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-    if (args[0] === media.path) await barrier;
-    return (read as any)(...args);
+  const spy = vi.spyOn(fs, "open").mockImplementation(async (...args: any[]) => {
+    if (args[0] === media.path && args[1] === "r") await barrier;
+    return (open as any)(...args);
   });
   const task = f.runtime.handleInboundText("caption", f.ctx, 1, undefined, media);
   await vi.waitFor(() => expect(spy).toHaveBeenCalled());
@@ -146,23 +146,26 @@ it.each(["image/svg+xml", "image/tiff", "application/pdf"])("does not execute an
   expect(c.getTelegramClient().getFile).not.toHaveBeenCalled();
 });
 
-it("bounds Base64 queue bytes before reading and releases accounting when consumed", async () => {
+it("queues multiple large image paths without reading bytes and retains delivery identity", async () => {
   const f = await fixture();
   vi.mocked(f.ctx.isIdle).mockReturnValue(false);
   await f.runtime.onBeforeAgentStart(f.ctx);
   const media = await cache(13 * 1024 * 1024);
-  expect((await f.runtime.handleInboundText("one", f.ctx, 1, "followUp", media)).accepted).toBe(true);
   const second = await cache(13 * 1024 * 1024);
   const read = vi.spyOn(fs, "readFile");
-  expect((await f.runtime.handleInboundText("two", f.ctx, 2, "followUp", second)).accepted).toBe(false);
+  expect((await f.runtime.handleInboundText("one", f.ctx, 1, "followUp", media)).accepted).toBe(true);
+  expect((await f.runtime.handleInboundText("two", f.ctx, 2, "followUp", second)).accepted).toBe(true);
   expect(read).not.toHaveBeenCalled();
-  const sent = f.pi.sendMessage.mock.calls[0][0];
-  f.runtime.onMessageStart({ role: "custom", ...sent }, f.ctx);
-  const third = await cache(13 * 1024 * 1024);
-  expect((await f.runtime.handleInboundText("three", f.ctx, 3, "steer", third)).accepted).toBe(true);
+  const [one, two] = f.pi.sendMessage.mock.calls.map(call => call[0]);
+  expect(one.content).toBe(`[Image#1] ${media.path}\n\none`);
+  expect(two.content).toBe(`[Image#1] ${second.path}\n\ntwo`);
+  expect(one.details.deliveryId).not.toBe(two.details.deliveryId);
+  f.runtime.onMessageStart({ role: "custom", ...one }, f.ctx);
+  expect((f.runtime as any).queuedInputs.has(two.details.deliveryId)).toBe(true);
+  expect((f.runtime as any).queuedInputs.has(one.details.deliveryId)).toBe(false);
 });
 
-it("admits an image above the queue budget when empty and backpressures later images until consumption", async () => {
+it("bounds image-path queue count rather than image bytes and releases capacity on consumption", async () => {
   const f = await fixture();
   vi.mocked(f.ctx.isIdle).mockReturnValue(false);
   await f.runtime.onBeforeAgentStart(f.ctx);
@@ -170,12 +173,13 @@ it("admits an image above the queue budget when empty and backpressures later im
   const large = await cache(size);
   expect((await f.runtime.handleInboundText("large", f.ctx, 1, "followUp", large)).accepted).toBe(true);
   const sent = f.pi.sendMessage.mock.calls[0][0];
-  expect(sent.content[1].data.length).toBe(Math.ceil(size / 3) * 4);
+  expect(sent.content).toBe(`[Image#1] ${large.path}\n\nlarge`);
   expect((await fs.stat(large.path)).size).toBe(size);
 
   const small = await cache();
   const read = vi.spyOn(fs, "readFile");
-  expect(await f.runtime.handleInboundText("later", f.ctx, 2, "followUp", small)).toEqual({ accepted: false, busy: true });
+  for (let i = 1; i < 64; i++) expect((await f.runtime.handleInboundText("later", f.ctx, i + 1, "followUp", small)).accepted).toBe(true);
+  expect(await f.runtime.handleInboundText("overload", f.ctx, 65, "followUp", small)).toEqual({ accepted: false, busy: true });
   expect(read).not.toHaveBeenCalled();
   expect(await fs.readFile(small.path)).toEqual(Buffer.alloc(8));
 
@@ -510,7 +514,7 @@ it("sends absolute media references over IPC from a relative agent directory", a
   } finally { follower.close(); }
 });
 
-it.each(["leader-idle", "leader-busy", "follower-idle", "follower-busy"])("stop prevents submission after a paused image read on %s", async scenario => {
+it.each(["leader-idle", "leader-busy", "follower-idle", "follower-busy"])("stop prevents submission after paused image validation on %s", async scenario => {
   const leader = await fixture();
   const follower = await runtimeFixture(dir, "follower", 51, "startup");
   fixtures.push(follower);
@@ -527,16 +531,16 @@ it.each(["leader-idle", "leader-busy", "follower-idle", "follower-busy"])("stop 
     vi.mocked(target.ctx.isIdle).mockReturnValue(false);
     await target.runtime.onBeforeAgentStart(target.ctx);
   }
-  const read = fs.readFile;
+  const open = fs.open;
   let release!: () => void;
   const barrier = new Promise<void>(resolve => { release = resolve; });
   let reading = false;
-  vi.spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-    if (typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) {
+  vi.spyOn(fs, "open").mockImplementation(async (...args: any[]) => {
+    if (args[1] === "r" && typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) {
       reading = true;
       await barrier;
     }
-    return (read as any)(...args);
+    return (open as any)(...args);
   });
   const receiving = c.processUpdate(photo(thread));
   try {
@@ -619,7 +623,7 @@ it.each([
   expect(c.getStatus().feedbackError?.code).toBe(error.code);
 });
 
-it("allows a 3.5-second image read followed by 1.7-second admission over follower IPC", async () => {
+it("allows 3.5-second image validation followed by 1.7-second admission over follower IPC", async () => {
   const leader = await fixture();
   const follower = await runtimeFixture(dir, "follower", 51, "startup");
   fixtures.push(follower);
@@ -629,10 +633,10 @@ it("allows a 3.5-second image read followed by 1.7-second admission over followe
   vi.spyOn(client, "getFile").mockResolvedValue({ file_id: "image", file_unique_id: "image", file_path: "photos/image.jpg" });
   vi.spyOn(client, "downloadFile").mockResolvedValue(Buffer.from("image"));
   const feedback = vi.spyOn(client, "sendMessage").mockResolvedValue({ message_id: 100 } as any);
-  const read = fs.readFile;
-  vi.spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-    if (typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) await new Promise(resolve => setTimeout(resolve, 3500));
-    return (read as any)(...args);
+  const open = fs.open;
+  vi.spyOn(fs, "open").mockImplementation(async (...args: any[]) => {
+    if (args[1] === "r" && typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) await new Promise(resolve => setTimeout(resolve, 3500));
+    return (open as any)(...args);
   });
   const captureInput = follower.pi.sendUserMessage.getMockImplementation()!;
   let lifecycle: Promise<void> | undefined;
@@ -746,20 +750,20 @@ it.each(["stop", "reload"])("releases cancelled capacity exactly once after %s w
   expect(await fs.readdir(getMediaDir(dir))).toEqual([]);
 });
 
-it.each(["stop", "reload"])("admits a fresh image after %s while cancelled cache reads remain stalled", async change => {
+it.each(["stop", "reload"])("admits a fresh image after %s while cancelled cache validation remains stalled", async change => {
   const f = await fixture();
   const c = (f.runtime as any).coordinator as LeaderCoordinator;
   const client = c.getTelegramClient();
   vi.spyOn(client, "getFile").mockResolvedValue({ file_id: "image", file_unique_id: "image", file_path: "photos/image.jpg" });
   vi.spyOn(client, "downloadFile").mockResolvedValue(Buffer.from("image"));
   vi.spyOn(client, "sendMessage").mockResolvedValue({ message_id: 100 } as any);
-  const read = fs.readFile;
+  const open = fs.open;
   const releases: (() => void)[] = [];
-  vi.spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-    if (typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) {
+  vi.spyOn(fs, "open").mockImplementation(async (...args: any[]) => {
+    if (args[1] === "r" && typeof args[0] === "string" && path.dirname(args[0]) === getMediaDir(dir)) {
       await new Promise<void>(resolve => { releases.push(resolve); });
     }
-    return (read as any)(...args);
+    return (open as any)(...args);
   });
   const old = c.processUpdate(photo());
   try {
@@ -777,11 +781,11 @@ it.each(["stop", "reload"])("admits a fresh image after %s while cancelled cache
     }
     const fresh = c.processUpdate(photo());
     await vi.waitFor(() => expect(releases).toHaveLength(2));
-    const reservation = (f.runtime as any).mediaReading;
+    const reservation = (f.runtime as any).mediaValidating;
     const tail = (c as any).inputQueues.get(50);
     releases[0]();
     await vi.waitFor(() => expect((c as any).inputWork.size).toBe(1));
-    expect((f.runtime as any).mediaReading).toBe(reservation);
+    expect((f.runtime as any).mediaValidating).toBe(reservation);
     expect((c as any).inputQueues.get(50)).toBe(tail);
     expect((c as any).pendingUpdates).toBe(1);
     expect(f.pi.sendMessage).not.toHaveBeenCalled();
@@ -794,7 +798,7 @@ it.each(["stop", "reload"])("admits a fresh image after %s while cancelled cache
     expect(retained).toHaveLength(2);
     for (const name of retained) {
       expect(name).toMatch(/\.jpg$/);
-      expect(await read(path.join(getMediaDir(dir), name), "utf8")).toBe("image");
+      expect(await fs.readFile(path.join(getMediaDir(dir), name), "utf8")).toBe("image");
     }
   } finally { for (const release of releases) release(); }
 });

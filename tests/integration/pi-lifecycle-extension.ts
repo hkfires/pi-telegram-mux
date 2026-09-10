@@ -8,6 +8,7 @@ import { loadConfig } from "./config.js";
 
 export default function (pi: ExtensionAPI) {
   const scenario = process.env.MUX_REVIEW_SCENARIO;
+  const albumScenario = scenario === "album" || scenario === "album-read";
   const reloadScenario = scenario?.startsWith("reload-");
   const overlapScenario = scenario?.startsWith("overlap-");
   let overlapResponseComplete = false;
@@ -56,15 +57,18 @@ export default function (pi: ExtensionAPI) {
     models: ["fake", "fake-other"].map(id => ({ id, name: id, reasoning: false, input: ["text", "image"], contextWindow: 100000, maxTokens: 1000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })),
     streamSimple: (model, context) => {
       if (reloadState) reloadState.providerCalls.push(structuredClone(context.messages));
-      modelImageCounts.push(context.messages.reduce((sum, message) => sum + (message.role === "user" && Array.isArray(message.content) ? message.content.filter(part => part.type === "image").length : 0), 0));
+      modelImageCounts.push(context.messages.reduce((sum, message) => sum + ((message.role === "user" || message.role === "toolResult") && Array.isArray(message.content) ? message.content.filter(part => part.type === "image").length : 0), 0));
       modelInputs.push(context.messages.filter(message => message.role === "user").map(message =>
         typeof message.content === "string" ? message.content : message.content.filter(part => part.type === "text").map(part => part.text).join("")));
       const stream = new AssistantMessageEventStream();
       const message = { role: "assistant" as const, content: [{ type: "text" as const, text: `answer ${++answers}` }], api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: "stop" as const, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
       if (answers === 1) beginFirstResponse();
-      const response = scenario === "length-follow-up" && answers === 1
-        ? { ...message, stopReason: "length" as const, usage: { ...message.usage, output: model.maxTokens, totalTokens: model.maxTokens + 1 } }
-        : message;
+      const response = scenario === "album-read" && answers === 1
+        ? { ...message, stopReason: "toolUse" as const, content: [...modelInputs.at(-1)!.at(-1)!.matchAll(/^\[Image#\d+\] (.+)$/gm)].map((match, index) =>
+          ({ type: "toolCall" as const, id: `read-${index}`, name: "read", arguments: { path: match[1] } })) }
+        : scenario === "length-follow-up" && answers === 1
+          ? { ...message, stopReason: "length" as const, usage: { ...message.usage, output: model.maxTokens, totalTokens: model.maxTokens + 1 } }
+          : message;
       const ready = overlapScenario && answers === 1 ? modelGate : busyModelScenario && answers === 1 ? busyInputProcessed : new Promise<void>(resolve => setTimeout(resolve, 25));
       void ready.then(() => { if (overlapScenario) overlapResponseComplete = true; stream.push({ type: "start", partial: response }); stream.push({ type: "done", reason: response.stopReason, message: response }); stream.end(); });
       return stream;
@@ -224,7 +228,7 @@ export default function (pi: ExtensionAPI) {
       }
       return { action: "continue" };
     }
-    if (scenario === "album" || scenario === "follow-up" || scenario === "length-follow-up") return { action: "continue" };
+    if (albumScenario || scenario === "follow-up" || scenario === "length-follow-up") return { action: "continue" };
     await new Promise(resolve => setTimeout(resolve, 20));
     if (scenario === "config") await runtime.handleTgSetup(tui(ctx));
     return { action: "transform", text: "completely transformed" };
@@ -321,13 +325,14 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(JSON.stringify({ type: "mux_review_result", keptRun, prematureIdle, providerStillPending, texts, modelInputs, modelImageCounts, idle: runtime.getIsIdle(), error: runtime.outbox.error?.message }), "info");
       return;
     }
-    if (scenario !== "album" && !stopScenario) { admitted = await runtime.handleInboundText("original", tui(ctx)); return; }
+    if (!albumScenario && !stopScenario) { admitted = await runtime.handleInboundText("original", tui(ctx)); return; }
     const leader = (runtime as any).coordinator as LeaderCoordinator;
     (leader as any).options.albumDelayMs = 10;
     const client = leader.getTelegramClient();
     client.sendMessage = async (_chat, text) => { feedback.push(text); return { message_id: nextMessageId++ } as any; };
     client.getFile = async id => ({ file_id: id, file_unique_id: id, file_path: `photos/${id}.png` });
-    client.downloadFile = async () => Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jTt4AAAAASUVORK5CYII=", "base64");
+    // Valid 2x2 PNG for the actual native read tool (including decoder validation).
+    client.downloadFile = async () => Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAVSURBVBhXY/jPAEQNIIrhPxD8/w8AQ9QJeKxchO4AAAAASUVORK5CYII=", "base64");
     await Promise.all([1, 2].map(id => leader.processUpdate({ update_id: id, message: {
       message_id: id, message_thread_id: 50, chat: { id: -100123, type: "supergroup" }, date: 1,
       from: { id: 123, is_bot: false, first_name: "Fixture" }, media_group_id: "one-album",

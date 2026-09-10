@@ -9,7 +9,7 @@ import { testConfig } from "../helpers.js";
 it.each([
   ...["image", "text"].flatMap(kind => ["before", "after"].map(stage => `overlap-${kind}-${stage}`)),
   ...["image", "text"].flatMap(kind => ["before-check", "after-check", "shutdown", "timeout"].map(stage => `reload-${kind}-${stage}`)),
-  "terminal-admission", "terminal-admission-unknown", "stop-input-before", "stop-input-after", "stop-start", "album", "transformed", "config", "follow-up", "length-follow-up", "reconnect", "busy-follow-up-model", "busy-steer-model", "busy-concurrent-input-gate"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
+  "terminal-admission", "terminal-admission-unknown", "stop-input-before", "stop-input-after", "stop-start", "album", "album-read", "transformed", "config", "follow-up", "length-follow-up", "reconnect", "busy-follow-up-model", "busy-steer-model", "busy-concurrent-input-gate"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-pi-lifecycle-"));
   let child: ChildProcess | undefined;
   try {
@@ -116,11 +116,23 @@ it.each([
       expect(result.modelInputs).toEqual([]);
       expect(result.modelImageCounts).toEqual([]);
       expect(result.texts).toEqual([]);
-    } else if (scenario === "album") {
-      expect(result.received).toEqual(["[Image#1] [Image#2]\n\nCompare these images"]);
-      expect(result.modelInputs).toEqual([["[Image#1] [Image#2]\n\nCompare these images"]]);
-      expect(result.modelImageCounts).toEqual([2]);
-      expect(result.texts).toEqual(["answer 1"]);
+    } else if (scenario === "album" || scenario === "album-read") {
+      expect(result.received).toHaveLength(1);
+      const [one, two, blank, caption] = result.received[0].split("\n");
+      expect(one).toMatch(/^\[Image#1\] /);
+      expect(two).toMatch(/^\[Image#2\] /);
+      for (const line of [one, two]) {
+        const file = line.slice(10);
+        expect(path.isAbsolute(file)).toBe(true);
+        await expect(fs.access(file)).resolves.toBeUndefined();
+      }
+      expect(blank).toBe("");
+      expect(caption).toBe("Compare these images");
+      expect(result.modelInputs).toEqual(scenario === "album" ? [result.received] : [result.received, result.received]);
+      expect(result.modelImageCounts).toEqual(scenario === "album" ? [0] : [0, 2]);
+      expect(result.texts).toEqual([scenario === "album" ? "answer 1" : "answer 2"]);
+      expect(result.reactions).toContainEqual({ messageId: 1, emoji: "👀" });
+      expect(result.reactions).toContainEqual({ messageId: 1, emoji: "💯" });
     } else if (scenario === "busy-concurrent-input-gate") {
       expect(result.inputWaited).toBe(false);
       expect(result.admitted).toHaveLength(2);

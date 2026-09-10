@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LeaderCoordinator } from "../src/coordinator.js";
 import * as configModule from "../src/config.js";
 import { encodeFrame, FrameParser, IpcFollowerClient, tryAcquireLeaderLock } from "../src/ipc.js";
-import { IPC_PROTOCOL_VERSION, type IpcMessage, type OutputTarget } from "../src/types.js";
+import { IMAGE_INPUT_MODE, IPC_PROTOCOL_VERSION, type IpcMessage, type OutputTarget } from "../src/types.js";
 import { RateLimitError, TelegramApiError } from "../src/telegram.js";
 import { testConfig, telegramUpdate } from "./helpers.js";
 
@@ -48,7 +48,7 @@ describe("IPC protocol regressions", () => {
     socket.on("error", () => {});
     socket.on("data", chunk => { for (const msg of parser.push(chunk)) onRequest(msg, socket); });
     await once(socket, "connect");
-    socket.write(encodeFrame({ type: "auth", protocolVersion: IPC_PROTOCOL_VERSION, runtimeId: "raw", capability: info.capability }));
+    socket.write(encodeFrame({ type: "auth", protocolVersion: IPC_PROTOCOL_VERSION, imageInputMode: IMAGE_INPUT_MODE, runtimeId: "raw", capability: info.capability }));
     socket.write(encodeFrame({ type: "register", registration: { runtimeId: "raw", ...target } }));
     await vi.waitFor(() => expect(coordinator.getRoutes().has(50)).toBe(true));
     return socket;
@@ -62,6 +62,58 @@ describe("IPC protocol regressions", () => {
     socket.write(encodeFrame({ type: "auth", protocolVersion: 5, runtimeId: "legacy", capability: info.capability }));
     await closed;
     expect(coordinator.getRoutes().size).toBe(0);
+  });
+
+  it.each([undefined, "inline-v1", "tui-paths-v1"])("rejects a v6 follower with incompatible image mode %j before registration", async imageInputMode => {
+    const socket = net.createConnection({ host: "127.0.0.1", port: info.port });
+    sockets.push(socket);
+    socket.on("error", () => {});
+    await once(socket, "connect");
+    const closed = new Promise<void>(resolve => socket.once("close", () => resolve()));
+    const replies: IpcMessage[] = [];
+    const parser = new FrameParser();
+    socket.on("data", chunk => replies.push(...parser.push(chunk)));
+    socket.write(Buffer.concat([
+      encodeFrame({ type: "auth", protocolVersion: 6, imageInputMode, runtimeId: "mixed", capability: info.capability }),
+      encodeFrame({ type: "register", registration: { runtimeId: "mixed", ...target } }),
+    ]));
+    await closed;
+    expect(replies).toEqual([]);
+    expect(coordinator.getRoutes().size).toBe(0);
+  });
+
+  it.each([undefined, "inline-v1", "tui-paths-v1"])("rejects a v6 leader with incompatible image mode %j before coalesced input", async imageInputMode => {
+    const auth: IpcMessage[] = [];
+    const server = net.createServer(socket => {
+      sockets.push(socket);
+      socket.on("error", () => {});
+      const parser = new FrameParser();
+      socket.on("data", chunk => {
+        for (const msg of parser.push(chunk)) {
+          auth.push(msg);
+          if (msg.type !== "auth") continue;
+          socket.write(Buffer.concat([
+            encodeFrame({ type: "auth_ack", protocolVersion: 6, imageInputMode, epoch: 1, configFingerprint: "fixture", status: { polling: "online" } }),
+            encodeFrame({ type: "inbound", requestId: "must-not-run", messageId: 1, target, fromId: testConfig.allowedUserId, text: "untrusted mixed-mode input" }),
+          ]));
+        }
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const f = new IpcFollowerClient((server.address() as net.AddressInfo).port, "fixture", "new");
+    followers.push(f);
+    const inbound = vi.fn();
+    f.setInboundHandler(inbound);
+    try {
+      await expect(f.connect()).rejects.toMatchObject({ code: "IPC_IMAGE_MODE_MISMATCH" });
+      expect(auth[0]).toMatchObject({ type: "auth", protocolVersion: 6, imageInputMode: IMAGE_INPUT_MODE });
+      expect(f.isConnected()).toBe(false);
+      expect(inbound).not.toHaveBeenCalled();
+    } finally {
+      f.close();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 
   it("rejects an incorrect capability before any Bot API call", async () => {

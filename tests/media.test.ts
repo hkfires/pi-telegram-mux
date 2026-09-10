@@ -17,7 +17,7 @@ const testConfig: MuxConfig = {
   allowedUserId: 99999,
 };
 
-describe("media handling and multimodal prompts", () => {
+describe("media handling and image-path prompts", () => {
   let tempDir: string;
 
   beforeEach(async () => {
@@ -288,7 +288,7 @@ describe("media handling and multimodal prompts", () => {
   });
 
   describe("MuxRuntime - inbound media processing", () => {
-    it("reads image file into Base64, retains the file, and passes multimodal content to sendUserMessage", async () => {
+    it("retains the image and passes its numbered absolute path to sendUserMessage", async () => {
       const mediaDir = await ensureMediaDir(tempDir);
       const testImagePath = path.join(mediaDir, `${crypto.randomUUID()}.png`);
       const imageContent = Buffer.from("raw-test-image-binary-data");
@@ -332,17 +332,14 @@ describe("media handling and multimodal prompts", () => {
 
       expect(result.accepted).toBe(true);
       expect(mockPi.sendUserMessage).toHaveBeenCalledWith(
-        [
-          { type: "text", text: "[Image#1]\n\nPlease inspect this chart" },
-          { type: "image", data: imageContent.toString("base64"), mimeType: "image/png" },
-        ],
+        `[Image#1] ${testImagePath}\n\nPlease inspect this chart`,
         { expandPromptTemplates: false }
       );
 
       expect(await fs.readFile(testImagePath)).toEqual(imageContent);
     });
 
-    it("uses only the image label when text is empty for image input", async () => {
+    it("uses only the image label and path when the caption is empty", async () => {
       const mediaDir = await ensureMediaDir(tempDir);
       const testImagePath = path.join(mediaDir, `${crypto.randomUUID()}.jpg`);
       await fs.writeFile(testImagePath, "some-jpeg-data");
@@ -384,10 +381,7 @@ describe("media handling and multimodal prompts", () => {
 
       expect(result.accepted).toBe(true);
       expect(mockPi.sendUserMessage).toHaveBeenCalledWith(
-        [
-          { type: "text", text: "[Image#1]" },
-          { type: "image", data: Buffer.from("some-jpeg-data").toString("base64"), mimeType: "image/jpeg" },
-        ],
+        `[Image#1] ${testImagePath}`,
         { expandPromptTemplates: false }
       );
     });
@@ -437,7 +431,7 @@ describe("media handling and multimodal prompts", () => {
       expect(await fs.readFile(testImagePath, "utf8")).toBe("some-jpeg-data");
     });
 
-    it("queues multimodal message when Pi is busy", async () => {
+    it("queues a numbered image path with the existing custom-message identity when Pi is busy", async () => {
       const mediaDir = await ensureMediaDir(tempDir);
       const testImagePath = path.join(mediaDir, `${crypto.randomUUID()}.png`);
       const imageBytes = Buffer.from("busy-mode-image-bytes");
@@ -479,10 +473,8 @@ describe("media handling and multimodal prompts", () => {
       expect(mockPi.sendMessage).toHaveBeenCalledWith(
         expect.objectContaining({
           customType: "Telegram",
-          content: [
-            { type: "text", text: "[Image#1]\n\nFollowup with diagram" },
-            { type: "image", data: imageBytes.toString("base64"), mimeType: "image/png" },
-          ],
+          content: `[Image#1] ${testImagePath}\n\nFollowup with diagram`,
+          details: { runtimeId: runtime.runtimeId, deliveryId: expect.any(String) },
         }),
         { triggerTurn: true, deliverAs: "followUp" }
       );

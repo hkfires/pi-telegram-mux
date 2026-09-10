@@ -91,16 +91,13 @@ If the original topic has been deleted, restoring the session displays a warning
 
 ### Image Input
 
-Send a photo or image file in the bound Telegram topic and write your request in the caption. You can also send it without a caption; no default prompt is added.
-
-To ask about several images together, send them as a Telegram album (up to 10 images). They are submitted as one task and numbered `[Image#1]`, `[Image#2]`, etc. Separate uploads are not merged.
+Send photos, image files, or albums (up to 10 images) in the bound Telegram topic, with instructions in the caption (sending without a caption will not add default instructions).
 
 **Notes:**
 
-- Use `/model` to select a vision-capable model. JPEG, PNG, GIF, and WebP are supported; other attachments are not.
-- The extension does not limit single-image or album file sizes, but Telegram and the model service may reject them. New inputs may be temporarily refused when the session is busy.
-- If an album image cannot be downloaded or read, the whole album is rejected. Late-arriving images produce a notice rather than starting another task.
-- Images sent to Pi are kept locally and are not automatically deleted. The default folder is `~/.pi/agent/pi-telegram-mux/media/`; if `PI_CODING_AGENT_DIR` is set, use `pi-telegram-mux/media/` under that directory. Delete unneeded images manually to free disk space. Deleted files can no longer be opened using their old paths.
+- Use `/model` to select a vision-capable model and keep the `read` tool enabled. Supports JPEG, PNG, GIF, and WebP.
+- If any image in an album fails, the whole group will not run.
+- Images are stored locally (defaults to `~/.pi/agent/pi-telegram-mux/media/`) and are not deleted automatically. Clean them up manually as needed.
 
 **Restart all Pi instances after upgrading to avoid mixing old and new versions.**
 
