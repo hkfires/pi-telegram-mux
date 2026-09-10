@@ -579,6 +579,51 @@ describe("Telegram session settings commands", () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["sendMessage", "editMessageText"].flatMap(method => [false, true].map(expired => ({ method, expired }))))("starts the menu lifetime after delayed $method delivery (expired: $expired)", async ({ method, expired }) => {
+    const f = await fixture();
+    for (let n = 0; n < 15; n++) f.models.push({ provider: "p", id: `m${n}` });
+    const coordinator = coordinatorOf(f);
+    let now = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const fetch = globalThis.fetch;
+    const menus: TelegramInlineKeyboardMarkup[] = [];
+    let rejected = false;
+    let deliveredAt = 0;
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      const operation = String(input).split("/").at(-1)!;
+      if (!["sendMessage", "editMessageText"].includes(operation)) return fetch(input, init);
+      const params = JSON.parse(String(init?.body));
+      if (operation === method && !rejected) {
+        rejected = true;
+        return new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 1 } }), { status: 429 });
+      }
+      if (operation === method && !deliveredAt) {
+        // Model eleven minutes of monotonic time passing while delivery is held
+        // for retry, without making the regression itself wait eleven minutes.
+        now += 11 * 60_000;
+        deliveredAt = now;
+      }
+      menus.push(params.reply_markup);
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 900 } }));
+    });
+    await coordinator.processUpdate(telegramUpdate(50, "/model"));
+    await coordinator.feedback.whenIdle();
+    if (method === "editMessageText") {
+      await coordinator.processUpdate(click(button(menus.at(-1)!, "Next")));
+      await coordinator.feedback.whenIdle();
+    }
+    expect(rejected).toBe(true);
+    expect(deliveredAt).toBeGreaterThan(10 * 60_000);
+    expect(coordinator.feedback.error).toBeNull();
+    const data = button(menus.at(-1)!, "Next");
+    const dispatch = vi.spyOn(f.runtime, "handleInboundText");
+    now = deliveredAt + 10 * 60_000 + (expired ? 1 : -1);
+    await coordinator.processUpdate(click(data));
+    await coordinator.feedback.whenIdle();
+    if (expired) expect(dispatch).not.toHaveBeenCalled();
+    else expect(dispatch.mock.calls.map(([command]) => command)).toEqual([method === "sendMessage" ? "/model page 2" : "/model page 3"]);
+  });
+
   it("rejects unauthorized, copied, forged and inaccessible callbacks without consuming valid choices", async () => {
     const send = vi.spyOn(TelegramClient.prototype, "sendMessage").mockResolvedValue({ message_id: 900 } as any);
     const f = await fixture();
@@ -888,7 +933,7 @@ describe("Telegram session settings commands", () => {
     expect(poll.mock.calls[0][0]!.allowed_updates).toEqual(["message", "callback_query"]);
   });
 
-  it.each(["answerCallbackQuery", "editMessageText"])("drops feedback after a real HTTP 429 from %s and accepts fresh work after cooldown", async rejectedMethod => {
+  it.each(["answerCallbackQuery", "editMessageText"])("retains feedback after a real HTTP 429 from %s without replaying the settings action", async rejectedMethod => {
     const originalFetch = globalThis.fetch;
     const requests: Array<{ method: string; at: number; params: any }> = [];
     let rejectedAt = 0;
@@ -916,8 +961,8 @@ describe("Telegram session settings commands", () => {
     await coordinator.feedback.whenIdle();
     expect(f.settings.setModel).toHaveBeenCalledTimes(1);
     const edits = requests.filter(request => request.method === "editMessageText");
-    expect(edits).toHaveLength(rejectedMethod === "editMessageText" ? 1 : 0);
-    expect(coordinator.getStatus().rateLimitUntil).toBeGreaterThan(Date.now());
+    expect(edits).toHaveLength(rejectedMethod === "editMessageText" ? 2 : 1);
+    expect(edits.at(-1)!.at - rejectedAt).toBeGreaterThanOrEqual(1000);
     await vi.waitFor(() => expect(coordinator.getStatus().rateLimitUntil).toBeUndefined(), { timeout: 2000 });
     expect(requests.filter(request => request.method === "editMessageText")).toHaveLength(edits.length);
     await coordinator.processUpdate(telegramUpdate(51, "/status", 4));
@@ -927,7 +972,7 @@ describe("Telegram session settings commands", () => {
     expect(requests.at(-1)!.params).toMatchObject({ message_thread_id: 51, text: expect.stringContaining("Topic: Online") });
   });
 
-  it.each(["leader", "follower"])("drops a rejected %s reply and resumes fresh output without reconnecting", async owner => {
+  it.each(["leader", "follower"])("retries a rate-limited %s reply and resumes queued output without reconnecting", async owner => {
     const leader = await fixture();
     const follower = await fixture("follower", 51);
     const f = owner === "leader" ? leader : follower;
@@ -943,12 +988,11 @@ describe("Telegram session settings commands", () => {
       if (!String(input).endsWith("/sendMessage")) return originalFetch(input, init);
       const params = JSON.parse(init!.body as string);
       sent.push(params.text);
-      if (params.text === "rejected reply") return new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 2 } }), { status: 429 });
+      if (params.text === "rejected reply" && sent.filter(text => text === params.text).length === 1) return new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 2 } }), { status: 429 });
       return new Response(JSON.stringify({ ok: true, result: { message_id: 901 } }));
     });
     await f.runtime.onBeforeAgentStart({ prompt: "initial" }, f.ctx);
     f.runtime.onTurnEnd({ role: "assistant", content: "rejected reply", stopReason: "stop" });
-    await f.runtime.outbox.whenIdle();
     await vi.waitFor(() => {
       for (const peer of [leader, follower]) expect(peer.ui.setStatus).toHaveBeenLastCalledWith("tg", expect.stringContaining("429"));
     });
@@ -958,14 +1002,16 @@ describe("Telegram session settings commands", () => {
       for (const peer of [leader, follower]) expect(peer.ui.setStatus.mock.calls.at(-1)?.[1]).toContain("1s");
     }, { timeout: 1500 });
     await vi.waitFor(() => expect(coordinator.getStatus().rateLimitUntil).toBeUndefined(), { timeout: 2000 });
-    // A late result belonging to the dropped run must not reappear after recovery.
-    f.runtime.onTurnEnd({ role: "assistant", content: "obsolete late reply", stopReason: "stop" });
+    await f.runtime.outbox.whenIdle();
+    // The active run remains usable after a definite rejection is retried.
+    f.runtime.onMessageStart({ role: "assistant" }, f.ctx);
+    f.runtime.onTurnEnd({ role: "assistant", content: "later reply", stopReason: "stop" });
     await f.runtime.onAgentSettled(f.ctx);
     await f.runtime.onBeforeAgentStart({ prompt: "fresh" }, f.ctx);
     f.runtime.onTurnEnd({ role: "assistant", content: "fresh reply", stopReason: "stop" });
     await f.runtime.onAgentSettled(f.ctx);
     await f.runtime.outbox.whenIdle();
-    expect(sent).toEqual(["rejected reply", "fresh reply"]);
+    expect(sent).toEqual(["rejected reply", "rejected reply", "later reply", "fresh reply"]);
     expect(reload).not.toHaveBeenCalled();
     expect([leader.runtime.getGeneration(), follower.runtime.getGeneration()]).toEqual(generations);
     expect(f.runtime.outbox.error).toBeNull();
@@ -1024,16 +1070,15 @@ describe("Telegram session settings commands", () => {
     f.runtime.outbox.enqueue(async signal => {
       await f.runtime.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: 51, text: "rejected" }, target, signal);
     });
-    await f.runtime.outbox.whenIdle();
+    await vi.waitFor(() => expect(f.ui.setStatus.mock.calls.at(-1)?.[1]).toContain("429"));
     expect(coordinator.getStatus().rateLimitUntil).toBeUndefined();
-    expect(f.runtime.outbox.error).toMatchObject({ code: "TELEGRAM_HTTP_429", retryAfter: 1 });
-    expect(f.ui.setStatus.mock.calls.at(-1)?.[1]).toContain("429");
-    await vi.waitFor(() => expect(f.runtime.outbox.error).toBeNull(), { timeout: 2000 });
+    expect(f.runtime.outbox.error).toBeNull();
+    await f.runtime.outbox.whenIdle();
     f.runtime.outbox.enqueue(async signal => {
       await f.runtime.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: 51, text: "fresh" }, target, signal);
     });
     await f.runtime.outbox.whenIdle();
-    expect(sent).toEqual(["rejected", "fresh"]);
+    expect(sent).toEqual(["rejected", "rejected", "fresh"]);
     expect(f.runtime.outbox.error).toBeNull();
   });
 

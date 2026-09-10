@@ -11,6 +11,7 @@ describe("placeholder ownership and delivery boundaries", () => {
   let deletionFailure: number | "timeout" | "decode" | undefined;
   let messageId: number;
   let deletionRetryAfter: number;
+  let answerRejections: number;
   let calls: { method: string; params: Record<string, any>; time: number }[];
   const fixtures: Fixture[] = [];
 
@@ -18,6 +19,7 @@ describe("placeholder ownership and delivery boundaries", () => {
     dir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-placeholder-"));
     deletionFailure = undefined;
     deletionRetryAfter = 1;
+    answerRejections = 0;
     messageId = 0;
     calls = [];
     const fetch = globalThis.fetch;
@@ -34,7 +36,7 @@ describe("placeholder ownership and delivery boundaries", () => {
         if (deletionFailure === "decode") return new Response("not JSON");
         return new Response(JSON.stringify({ ok: false, error_code: deletionFailure, parameters: { retry_after: deletionRetryAfter } }), { status: deletionFailure });
       }
-      if (method === "sendMessage" && params.text === "trigger ordinary 429") {
+      if (method === "sendMessage" && (params.text === "trigger ordinary 429" || (params.text === "First answer" && answerRejections-- > 0))) {
         return new Response(JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 1 } }), { status: 429 });
       }
       if (method === "sendMessage") return new Response(JSON.stringify({ ok: true, result: { message_id: ++messageId } }));
@@ -92,32 +94,45 @@ describe("placeholder ownership and delivery boundaries", () => {
       expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
     }, 10_000);
 
-    it("preserves FIFO and another runtime's answer during a cleanup-only 429", async () => {
+    it.each(["cleanup", "answer"])("preserves FIFO and another runtime's answer during a %s 429", async source => {
       const f = await fixture(role);
       const other = await runtimeFixture(dir, "other", 51);
       fixtures.push(other);
       await other.runtime.onBeforeAgentStart({ prompt: "Other task" }, other.ctx);
       other.runtime.onMessageStart({ role: "user", content: "Other task" }, other.ctx);
       await other.runtime.outbox.whenIdle();
-      deletionFailure = 429;
+      if (source === "cleanup") deletionFailure = 429;
+      else {
+        // Rendering has separate coverage; only transport timing matters here.
+        vi.spyOn((f.runtime as any).markdownWorker, "render").mockImplementation(async (text: string) => [{ text }]);
+        answerRejections = 2;
+      }
       f.runtime.onTurnEnd({ role: "assistant", content: "First answer", stopReason: "stop" });
       f.runtime.onMessageStart({ role: "assistant" }, f.ctx);
       f.runtime.onTurnEnd({ role: "assistant", content: "Second answer", stopReason: "stop" });
       await f.runtime.onAgentSettled(f.ctx);
-      await vi.waitFor(() => expect((f.runtime as any).rateLimitPreservesOutput).toBe(true));
-      await vi.waitFor(() => expect((other.runtime as any).rateLimitPreservesOutput).toBe(true));
+      await vi.waitFor(() => expect((f.runtime as any).rateLimitUntil).toBeGreaterThan(Date.now()));
+      await vi.waitFor(() => expect((other.runtime as any).rateLimitUntil).toBeGreaterThan(Date.now()));
       other.runtime.onTurnEnd({ role: "assistant", content: "Other answer", stopReason: "stop" });
       await other.runtime.onAgentSettled(other.ctx);
-      // A local prompt can start during the cosmetic cooldown without losing output.
+      // A local prompt can start during either cooldown without losing output.
       await f.runtime.onBeforeAgentStart({ prompt: "Next task" }, f.ctx);
       f.runtime.onMessageStart({ role: "user", content: "Next task" }, f.ctx);
       f.runtime.onTurnEnd({ role: "assistant", content: "Next answer", stopReason: "stop" });
       await f.runtime.onAgentSettled(f.ctx);
       await Promise.all([f.runtime.outbox.whenIdle(), other.runtime.outbox.whenIdle()]);
-      const deletion = calls.find(c => c.method === "deleteMessage")!;
-      const answers = calls.filter(c => c.method === "sendMessage" && c.params.text.includes("answer"));
+      const attempts = calls.filter(c => c.method === "sendMessage" && c.params.text === "First answer");
+      expect(attempts).toHaveLength(source === "answer" ? 3 : 1);
+      if (source === "answer") {
+        expect(attempts[1].time - attempts[0].time).toBeGreaterThanOrEqual(1000);
+        expect(attempts[2].time - attempts[1].time).toBeGreaterThanOrEqual(1000);
+        expect(attempts.every(c => JSON.stringify(c.params) === JSON.stringify(attempts[0].params))).toBe(true);
+      }
+      const rejected = source === "answer" ? attempts.slice(0, 2) : [];
+      const answers = calls.filter(c => c.method === "sendMessage" && c.params.text.includes("answer") && !rejected.includes(c));
       expect(answers).toHaveLength(4);
-      expect(answers.every(c => c.time - deletion.time >= 1000)).toBe(true);
+      const firstRejection = source === "answer" ? attempts[0] : calls.find(c => c.method === "deleteMessage")!;
+      expect(answers.every(c => c.time - firstRejection.time >= 1000)).toBe(true);
       expect(answers.filter(c => c.params.message_thread_id === 50).map(c => c.params.text)).toEqual(["First answer", "Second answer", "Next answer"]);
       expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
       expect((f.runtime as any).pendingPlaceholders.size).toBe(0);
@@ -125,23 +140,28 @@ describe("placeholder ownership and delivery boundaries", () => {
       expect(other.runtime.outbox.error).toBeNull();
     }, 10_000);
 
-    it.each(["disconnect", "switch", "shutdown"])("cancels the cleanup-cooldown wait on %s", async action => {
+    it.each(["disconnect", "switch", "shutdown"].flatMap(action => ["cleanup", "answer"].map(source => ({ action, source }))))("cancels the cooldown wait on $action ($source)", async ({ action, source }) => {
       const f = await fixture(role);
-      deletionFailure = 429;
-      f.runtime.onTurnEnd({ role: "assistant", content: "Obsolete answer", stopReason: "stop" });
+      if (source === "cleanup") deletionFailure = 429;
+      else {
+        // Do not spend the rate-limit assertion deadline starting a worker.
+        vi.spyOn((f.runtime as any).markdownWorker, "render").mockImplementation(async (text: string) => [{ text }]);
+        answerRejections = 1;
+      }
+      f.runtime.onTurnEnd({ role: "assistant", content: "First answer", stopReason: "stop" });
       await f.runtime.onAgentSettled(f.ctx);
-      await vi.waitFor(() => expect((f.runtime as any).rateLimitPreservesOutput).toBe(true));
+      await vi.waitFor(() => expect((f.runtime as any).rateLimitUntil).toBeGreaterThan(Date.now()));
       if (action === "disconnect") await f.runtime.handleTgDisconnect(f.ctx);
       else if (action === "switch") await f.runtime.onSessionBeforeSwitch(f.ctx);
       else await f.runtime.onSessionShutdown(f.ctx);
       await f.runtime.outbox.whenIdle();
       await new Promise(resolve => setTimeout(resolve, 1100));
-      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual(["⏳ Working..."]);
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual(source === "answer" ? ["⏳ Working...", "First answer"] : ["⏳ Working..."]);
       expect((f.runtime as any).pendingPlaceholders.size).toBe(0);
       expect(f.runtime.outbox.error).toBeNull();
     });
 
-    it("abandons settled runs on every ordinary 429, including automatic recovery", async () => {
+    it("delivers settled runs after every ordinary cooldown without accumulating placeholders", async () => {
       const f = await fixture(role);
       const client = (fixtures[0].runtime as any).coordinator.getTelegramClient();
       for (let n = 0; n < 3; n++) {
@@ -151,16 +171,52 @@ describe("placeholder ownership and delivery boundaries", () => {
         }
         const run = (f.runtime as any).currentRun;
         await expect(client.callApi("sendMessage", { chat_id: testConfig.chatId, text: "trigger ordinary 429" })).rejects.toMatchObject({ code: "TELEGRAM_HTTP_429" });
-        await vi.waitFor(() => expect(run.suppressed).toBe(true));
-        f.runtime.onTurnEnd({ role: "assistant", content: "Discarded answer", stopReason: "stop" });
+        await vi.waitFor(() => expect((f.runtime as any).rateLimitUntil).toBeGreaterThan(Date.now()));
+        expect(run.suppressed).toBe(false);
+        f.runtime.onTurnEnd({ role: "assistant", content: "Retained answer", stopReason: "stop" });
         await f.runtime.onAgentSettled(f.ctx);
+        await f.runtime.outbox.whenIdle();
         expect((f.runtime as any).pendingPlaceholders.size).toBe(0);
         expect(run.workingMessageId).toBeUndefined();
         await vi.waitFor(() => expect((f.runtime as any).rateLimitUntil).toBe(0), { timeout: 2500 });
       }
       expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(0);
-      expect(calls.some(c => c.params.text === "Discarded answer")).toBe(false);
+      expect(calls.filter(c => c.params.text === "Retained answer")).toHaveLength(3);
     }, 15_000);
+
+    it("keeps cooldown waits bounded and does not revive overflowed output", async () => {
+      const f = await fixture(role);
+      vi.spyOn((f.runtime as any).markdownWorker, "render").mockImplementation(async (text: string) => [{ text }]);
+      answerRejections = 1;
+      f.runtime.onTurnEnd({ role: "assistant", content: "First answer", stopReason: "stop" });
+      await vi.waitFor(() => expect((f.runtime as any).rateLimitUntil).toBeGreaterThan(Date.now()));
+      expect(f.runtime.outbox.size).toBe(1);
+      const pending = vi.fn(async () => {});
+      for (let i = 0; i < 31; i++) expect(f.runtime.outbox.enqueue(pending)).toBe(true);
+      expect(f.runtime.outbox.size).toBe(32);
+      expect(f.runtime.outbox.enqueue(pending)).toBe(false);
+      await f.runtime.outbox.whenIdle();
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      expect(f.runtime.outbox.error).toMatchObject({ code: "OUTBOX_FULL" });
+      expect(pending).not.toHaveBeenCalled();
+      expect(calls.filter(c => c.params.text === "First answer")).toHaveLength(1);
+      expect((f.runtime as any).pendingPlaceholders.size).toBe(0);
+    });
+
+    it("retries only the rejected chunk rather than replaying successful chunks", async () => {
+      const f = await fixture(role);
+      answerRejections = 1;
+      vi.spyOn((f.runtime as any).markdownWorker, "render").mockResolvedValue([
+        { text: "Part one" }, { text: "First answer" }, { text: "Part three" },
+      ]);
+      f.runtime.onTurnEnd({ role: "assistant", content: "Chunked answer", stopReason: "stop" });
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual([
+        "⏳ Working...", "Part one", "First answer", "First answer", "Part three",
+      ]);
+      expect(f.runtime.outbox.error).toBeNull();
+    });
 
     it("releases placeholder references immediately when the bounded FIFO fails", async () => {
       const f = await fixture(role);
@@ -180,7 +236,7 @@ describe("placeholder ownership and delivery boundaries", () => {
     deletionRetryAfter = 5;
     a.runtime.onTurnEnd({ role: "assistant", content: "Answer after cooldown", stopReason: "stop" });
     await a.runtime.onAgentSettled(a.ctx);
-    await vi.waitFor(() => expect((a.runtime as any).rateLimitPreservesOutput).toBe(true));
+    await vi.waitFor(() => expect((a.runtime as any).rateLimitUntil).toBeGreaterThan(Date.now()));
     const started = Date.now();
     const b = await runtimeFixture(dir, "resuming", 51, reason);
     fixtures.push(b);

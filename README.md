@@ -132,7 +132,7 @@ Send text in a topic to submit a task. These commands automatically appear in th
 | `tg: connected (…)` | Current session is bound to a Telegram topic |
 | `tg: disconnected` | Synchronization manually disconnected |
 | `tg: offline` / `tg: reconnecting` | Offline or attempting reconnection |
-| `tg: 429 · …` | Shared rate-limit cooldown; pending output is dropped, sync resumes automatically |
+| `tg: 429 · …` | Rate-limited by Telegram; output is paused and will resume automatically when the cooldown ends |
 | `tg: conflict (409)` | Another process is polling updates with the same Bot Token |
 | `tg: error` | Connection or sync error. Run `/tg-status` to inspect details |
 

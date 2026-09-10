@@ -59,7 +59,7 @@ export class RateLimitError extends TelegramApiError {
   }
 }
 
-/** The request never reached HTTP; only cosmetic cleanup started this cooldown. */
+/** The request never reached HTTP. Keep the stable IPC code for pre-dispatch pauses. */
 export class CleanupPauseError extends RateLimitError {
   override readonly code = "TELEGRAM_CLEANUP_PAUSED";
 }
@@ -100,8 +100,7 @@ export class TelegramClient {
   private readonly apiBase: string;
   private readonly defaultTimeoutMs: number;
   private pauseUntilMs = 0;
-  private cleanupPause = false;
-  public onRateLimit?: (until: number, preserveOutput: boolean) => void;
+  public onRateLimit?: (until: number) => void;
   private readonly requests = new Set<AbortController>();
 
   public abortAll(reason?: "reload"): void {
@@ -141,12 +140,10 @@ export class TelegramClient {
   /**
    * Manually record a 429 retry_after deadline in memory.
    */
-  public recordRateLimit(retryAfterSeconds: number, preserveOutput = false): void {
-    // An overlapping ordinary 429 always wins, even without extending the deadline.
-    this.cleanupPause = preserveOutput && (!this.isRateLimited() || this.cleanupPause);
+  public recordRateLimit(retryAfterSeconds: number): void {
     const deadline = Date.now() + Math.max(1, retryAfterSeconds) * 1000;
     this.pauseUntilMs = Math.max(this.pauseUntilMs, deadline);
-    this.onRateLimit?.(this.pauseUntilMs, this.cleanupPause);
+    this.onRateLimit?.(this.pauseUntilMs);
   }
 
   /**
@@ -161,8 +158,7 @@ export class TelegramClient {
   ): Promise<T> {
     if (this.isRateLimited() && !options?.ignoreRateLimit) {
       const waitSec = Math.ceil(this.getRemainingPauseMs() / 1000);
-      if (this.cleanupPause) throw new CleanupPauseError(waitSec);
-      throw new RateLimitError(waitSec);
+      throw new CleanupPauseError(waitSec);
     }
 
     const url = `${this.apiBase}/bot${this.botToken}/${method}`;
@@ -220,7 +216,7 @@ export class TelegramClient {
         const retryAfter = parsed.parameters?.retry_after ?? 5;
         if (!Number.isSafeInteger(retryAfter) || retryAfter <= 0) throw new TelegramDecodeError("Invalid Telegram retry_after");
         if (!options?.ignoreRateLimit) {
-          this.recordRateLimit(retryAfter, method === "deleteMessage");
+          this.recordRateLimit(retryAfter);
         }
         throw new RateLimitError(retryAfter);
       }

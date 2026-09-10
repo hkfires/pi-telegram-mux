@@ -396,22 +396,21 @@ describe("telegram client module", () => {
     expect(http).not.toHaveBeenCalled();
   });
 
-  it.each(["cleanup-first", "ordinary-first"])("ordinary 429 wins overlapping cooldowns (%s)", order => {
+  it("extends shared cooldowns without shortening the existing deadline", () => {
     const client = new TelegramClient({ botToken: mockToken, apiBase: mockApiBase });
     const status = vi.fn();
     client.onRateLimit = status;
     const now = vi.spyOn(Date, "now").mockReturnValue(1000);
     try {
-      client.recordRateLimit(10, order === "cleanup-first");
-      expect(status).toHaveBeenLastCalledWith(11000, order === "cleanup-first");
-      client.recordRateLimit(5, order !== "cleanup-first");
-      expect(status).toHaveBeenLastCalledWith(11000, false);
-      client.recordRateLimit(15, true);
-      expect(status).toHaveBeenLastCalledWith(16000, false);
-      // A new cleanup-only interval becomes eligible only after the old pause ends.
+      client.recordRateLimit(10);
+      expect(status).toHaveBeenLastCalledWith(11000);
+      client.recordRateLimit(5);
+      expect(status).toHaveBeenLastCalledWith(11000);
+      client.recordRateLimit(15);
+      expect(status).toHaveBeenLastCalledWith(16000);
       now.mockReturnValue(17000);
-      client.recordRateLimit(1, true);
-      expect(status).toHaveBeenLastCalledWith(18000, true);
+      client.recordRateLimit(1);
+      expect(status).toHaveBeenLastCalledWith(18000);
     } finally { now.mockRestore(); }
   });
 });

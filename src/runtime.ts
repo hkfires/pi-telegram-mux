@@ -157,7 +157,6 @@ export class MuxRuntime {
   private reconnectTimer?: NodeJS.Timeout;
   private lastConnectionError = "";
   private rateLimitUntil = 0;
-  private rateLimitPreservesOutput = false;
   private rateLimitTimer?: NodeJS.Timeout;
   private lastTransportError = "";
   private lastCommandMenuError = "";
@@ -185,13 +184,6 @@ export class MuxRuntime {
   constructor(private readonly pi: ExtensionAPI, private readonly agentDir: string) {
     this.outbox = new BoundedOutbox(error => {
       this.abandonPlaceholders("OUTPUT_FAILED");
-      const failure = error as Error & { code?: string; retryAfter?: number };
-      // An RPC rejection may arrive without a cooldown broadcast (for example
-      // while joining during reload). Keep recovery bounded by its retry_after.
-      if (failure.code === "TELEGRAM_HTTP_429" && Number.isSafeInteger(failure.retryAfter) && failure.retryAfter! > 0) {
-        if (this.rateLimitUntil <= Date.now()) this.rateLimitUntil = Date.now() + failure.retryAfter! * 1000;
-        if (this.currentRun) this.currentRun.suppressed = true;
-      }
       this.activeCtx?.ui?.notify(`Telegram sync paused: ${error.message}`, "error");
       this.updateStatusBar();
     });
@@ -222,18 +214,9 @@ export class MuxRuntime {
     }
     const transportStatus = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
     const until = transportStatus?.rateLimitUntil ?? 0;
-    const preserveOutput = transportStatus?.rateLimitPreservesOutput === true;
-    if (until > Date.now() && (until !== this.rateLimitUntil || preserveOutput !== this.rateLimitPreservesOutput)) {
-      this.rateLimitUntil = until;
-      this.rateLimitPreservesOutput = preserveOutput;
-      if (!preserveOutput) {
-        if (this.currentRun) this.currentRun.suppressed = true;
-        this.abandonPlaceholders("RATE_LIMIT");
-        // Ordinary rejected delivery is never replayed. Cleanup-only cooldowns
-        // retain the bounded FIFO; its unsent calls wait at the transport boundary.
-        if (!this.outbox.error || (this.outbox.error as { code?: string }).code === "TELEGRAM_HTTP_429") this.outbox.reset();
-      }
-    }
+    // All cooldowns preserve the bounded FIFO and active runs. RPC-only pauses
+    // can outlive the last broadcast, so never shorten their local deadline.
+    if (until > Date.now()) this.rateLimitUntil = Math.max(this.rateLimitUntil, until);
     clearTimeout(this.rateLimitTimer);
     this.rateLimitTimer = undefined;
     const remaining = Math.max(0, this.rateLimitUntil - Date.now());
@@ -242,7 +225,6 @@ export class MuxRuntime {
       this.rateLimitTimer.unref();
     } else if (this.rateLimitUntil) {
       this.rateLimitUntil = 0;
-      if ((this.outbox.error as { code?: string } | null)?.code === "TELEGRAM_HTTP_429") this.outbox.reset();
     }
     if (this.active && ctx && remaining === 0 && !this.configuring && !this.recovering && !this.setupTask && !this.rateLimitReopenTask &&
         this.bindingState === "bound" && this.topicNeedsReopen && this.registeredTarget && this.isTargetCurrent(this.registeredTarget, ctx) &&
@@ -579,7 +561,7 @@ export class MuxRuntime {
     const generation = this.generation;
     const waitSignal = signal ?? this.inputCancellation.signal;
     for (;;) {
-      signal?.throwIfAborted();
+      waitSignal.throwIfAborted();
       if (!this.active || generation !== this.generation || this.configuring || (target && (!this.activeCtx || !this.isTargetCurrent(target, this.activeCtx)))) throw new Error("Telegram output target is no longer active");
       try {
         if (this.coordinator) return await this.coordinator.callTelegram<T>(method, params, this.runtimeId, target, undefined, signal);
@@ -587,12 +569,15 @@ export class MuxRuntime {
         throw new Error("No active transport to Telegram Leader");
       } catch (error) {
         const failure = error as { code?: string; retryAfter?: number } | null;
-        // Only this stable transport code proves HTTP was never attempted. Do not
-        // retry actual 429 responses, uncertain sends, or cosmetic deletion itself.
-        // Topic reopening owns its cooldown recovery outside the request deadline.
-        if (method === "deleteMessage" || method === "reopenForumTopic" || failure?.code !== "TELEGRAM_CLEANUP_PAUSED" ||
-            !Number.isSafeInteger(failure.retryAfter) || failure.retryAfter! <= 0) throw error;
-        await delay(Math.min(2_147_483_647, failure.retryAfter! * 1000), undefined, { signal: waitSignal });
+        // Delivery boundary: only a pre-HTTP pause or a definite 429 rejection
+        // is safe to retry. Unknown outcomes (timeouts, decoding, network errors)
+        // still propagate. Deletion is best-effort; reopening owns its own timer.
+        if (method === "deleteMessage" || method === "reopenForumTopic" ||
+            !["TELEGRAM_CLEANUP_PAUSED", "TELEGRAM_HTTP_429"].includes(failure?.code ?? "") ||
+            !Number.isSafeInteger(failure?.retryAfter) || failure!.retryAfter! <= 0) throw error;
+        this.rateLimitUntil = Math.max(this.rateLimitUntil, Date.now() + failure!.retryAfter! * 1000);
+        this.updateStatusBar();
+        await delay(Math.min(2_147_483_647, failure!.retryAfter! * 1000), undefined, { signal: waitSignal });
         if (this.configurationTask) await this.waitForConfiguration(waitSignal);
       }
     }
@@ -1157,7 +1142,7 @@ export class MuxRuntime {
     const run: MirrorRun = {
       sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, ctx,
       target: null, origin: origin?.consumed ? undefined : origin,
-      suppressed: (this.rateLimitUntil > Date.now() && !this.rateLimitPreservesOutput) || this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.signal.aborted || origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
+      suppressed: this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.signal.aborted || origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
       firstUserMessage: true, text: "", settled, settle,
     };
     this.currentRun = run;

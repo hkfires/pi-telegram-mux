@@ -67,8 +67,6 @@ export interface InboundResult {
 
 export interface TransportStatus {
   rateLimitUntil?: number;
-  // Cosmetic cleanup must pause, not discard, pending task output.
-  rateLimitPreservesOutput?: boolean;
   polling: "starting" | "online" | "retrying" | "error" | "conflict";
   error?: { code: string; message: string };
   feedbackError?: { code: string; message: string };

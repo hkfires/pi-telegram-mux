@@ -99,7 +99,7 @@ export class LeaderCoordinator {
 
   constructor(private config: MuxConfig, private readonly agentDir: string, client?: TelegramClient, private readonly options: CoordinatorOptions = {}) {
     this.client = client ?? new TelegramClient({ botToken: config.botToken });
-    this.client.onRateLimit = (until, preserveOutput) => this.pauseForRateLimit(until, preserveOutput);
+    this.client.onRateLimit = until => this.pauseForRateLimit(until);
     this.inputModeRevision = config.inputModeRevision ?? 0;
     this.configuration = configFingerprint(config);
     this.feedback = new BoundedOutbox(error => this.publishStatus({ ...this.status, feedbackError: this.describeError(error) }));
@@ -112,21 +112,19 @@ export class LeaderCoordinator {
   public isRunning(): boolean { return this.running; }
   public isReloading(): boolean { return this.reloading !== null; }
 
-  private pauseForRateLimit(until: number, preserveOutput = false): void {
+  private pauseForRateLimit(until: number): void {
     if (!this.running) return;
     clearTimeout(this.rateLimitTimer);
-    // Discard obsolete feedback; never replay a rejected send after cooling down.
-    if (!this.feedback.error || ["TELEGRAM_HTTP_429", "TELEGRAM_CLEANUP_PAUSED"].includes((this.feedback.error as { code?: string }).code ?? "")) this.feedback.reset();
-    this.publishStatus({ ...this.status, rateLimitUntil: until, rateLimitPreservesOutput: preserveOutput });
+    // Pending feedback and task output keep their existing bounded queue slots.
+    this.publishStatus({ ...this.status, rateLimitUntil: until });
     this.rateLimitTimer = setTimeout(() => {
       this.rateLimitTimer = undefined;
       if (!this.running) return;
       if (this.client.isRateLimited()) {
-        this.pauseForRateLimit(Date.now() + this.client.getRemainingPauseMs(), this.status.rateLimitPreservesOutput);
+        this.pauseForRateLimit(Date.now() + this.client.getRemainingPauseMs());
         return;
       }
-      if (["TELEGRAM_HTTP_429", "TELEGRAM_CLEANUP_PAUSED"].includes((this.feedback.error as { code?: string } | null)?.code ?? "")) this.feedback.reset();
-      const status = { ...this.status, rateLimitUntil: undefined, rateLimitPreservesOutput: undefined };
+      const status = { ...this.status, rateLimitUntil: undefined };
       for (const key of ["error", "feedbackError", "commandMenuError", "interactionError"] as const) {
         if (["TELEGRAM_HTTP_429", "TELEGRAM_CLEANUP_PAUSED"].includes(status[key]?.code ?? "")) delete status[key];
       }
@@ -572,7 +570,7 @@ export class LeaderCoordinator {
   private startPolling(): void {
     const controller = new AbortController();
     this.pollController = controller;
-    this.publishStatus({ polling: "starting", rateLimitUntil: this.status.rateLimitUntil, rateLimitPreservesOutput: this.status.rateLimitPreservesOutput });
+    this.publishStatus({ polling: "starting", rateLimitUntil: this.status.rateLimitUntil });
     this.pollingTask = this.poll(controller.signal).catch(error => {
       // Poll supervisor boundary: shutdown/reload cancellation is expected. Every
       // other failure becomes a persistent, broadcast error state; no silent retry.
@@ -1009,9 +1007,21 @@ export class LeaderCoordinator {
   }
 
   private async deliverFeedback<T>(client: TelegramClient, signal: AbortSignal, route: RouteEntry, generation: number, send: () => Promise<T>): Promise<T | undefined> {
-    signal.throwIfAborted();
-    if (!this.running || this.reloading || this.client !== client || this.routes.get(route.threadId) !== route || route.generation !== generation || client.isRateLimited()) return undefined;
-    return send();
+    for (;;) {
+      signal.throwIfAborted();
+      if (!this.running || this.reloading || this.client !== client || this.routes.get(route.threadId) !== route || route.generation !== generation) return undefined;
+      if (client.isRateLimited()) {
+        await delay(Math.min(2_147_483_647, client.getRemainingPauseMs()), undefined, { signal });
+        continue;
+      }
+      try { return await send(); }
+      catch (error) {
+        // Feedback delivery boundary: retry only definite 429 rejections or
+        // pre-HTTP pauses, never re-execute the settings action or uncertain I/O.
+        if (!(error instanceof RateLimitError) || !Number.isSafeInteger(error.retryAfter) || error.retryAfter! <= 0) throw error;
+        await delay(Math.min(2_147_483_647, error.retryAfter! * 1000), undefined, { signal });
+      }
+    }
   }
 
   public getInputMode(): BusyInputMode {
@@ -1062,20 +1072,16 @@ export class LeaderCoordinator {
       }
       // Ephemeral tokens never contain model identifiers and cannot outlive this Leader.
       const token = crypto.randomBytes(12).toString("hex");
-      const state: SettingsMenu = { route, generation, expiresAt: now + 10 * 60_000, commands: [] };
+      const state: SettingsMenu = { route, generation, expiresAt: 0, commands: [] };
       const replyMarkup = { inline_keyboard: (menu ?? []).map(row => row.map(button => {
         const index = state.commands.push(button.command) - 1;
         return { text: button.text, callback_data: `mux:${token}:${index}` };
       })) };
-      if (menu) {
-        while (this.menus.size >= 128) this.menus.delete(this.menus.keys().next().value!);
-        this.menus.set(token, state);
-      }
       try {
         if (messageId !== undefined) {
           try {
-            await this.deliverFeedback(client, signal, route, generation, () => client.callApi("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: replyMarkup }, undefined, signal));
-            state.messageId = messageId;
+            const edited = await this.deliverFeedback(client, signal, route, generation, () => client.callApi("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: replyMarkup }, undefined, signal));
+            if (edited !== undefined) state.messageId = messageId;
           } catch (error) {
             // A generic 400 definitively rejects this edit, but does not identify why.
             // Report it and send one plain-text failure notice, never infer deletion from wording,
@@ -1094,6 +1100,14 @@ export class LeaderCoordinator {
         } else {
           const sent = await this.deliverFeedback(client, signal, route, generation, () => client.sendMessage(chatId, text, { message_thread_id: route.threadId, ...(menu ? { reply_markup: replyMarkup } : {}) }, signal));
           state.messageId = sent?.message_id;
+        }
+        // A queued/retried menu is not usable until Telegram confirms delivery.
+        // Start its full lifetime now; never revive a cancelled or replaced route.
+        if (menu && state.messageId !== undefined && !signal.aborted && this.running && !this.reloading &&
+            this.client === client && this.routes.get(route.threadId) === route && route.generation === generation) {
+          state.expiresAt = performance.now() + 10 * 60_000;
+          while (this.menus.size >= 128) this.menus.delete(this.menus.keys().next().value!);
+          this.menus.set(token, state);
         }
       } catch (error) {
         this.menus.delete(token);
@@ -1167,9 +1181,9 @@ export class LeaderCoordinator {
       const remainingPause = this.client.getRemainingPauseMs();
       this.client.onRateLimit = undefined;
       this.client = client;
-      this.client.onRateLimit = (until, preserveOutput) => this.pauseForRateLimit(until, preserveOutput);
-      if (sameToken && remainingPause > 0) this.client.recordRateLimit(remainingPause / 1000, this.status.rateLimitPreservesOutput);
-      else this.status = { ...this.status, rateLimitUntil: undefined, rateLimitPreservesOutput: undefined };
+      this.client.onRateLimit = until => this.pauseForRateLimit(until);
+      if (sameToken && remainingPause > 0) this.client.recordRateLimit(remainingPause / 1000);
+      else this.status = { ...this.status, rateLimitUntil: undefined };
       this.botUsername = undefined;
       await this.options.onConfigChange?.(config);
       this.startPolling();
