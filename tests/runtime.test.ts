@@ -292,22 +292,15 @@ describe("runtime module", () => {
       // Steering can be consumed before an earlier follow-up with identical text.
       f.runtime.onMessageStart({ ...second, role: "custom" }, f.ctx);
       await f.runtime.outbox.whenIdle();
-      expect(f.telegram.mock.calls.filter(([method]) => method === "setMessageReaction").map(([, params]) => params)).toEqual([
-        expect.objectContaining({ message_id: 102, reaction: [{ type: "emoji", emoji: "👀" }] }),
-      ]);
+      expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["⏳ Working..."]);
       f.runtime.onMessageStart({ ...first, role: "custom" }, f.ctx);
       await f.runtime.outbox.whenIdle();
-      expect(f.telegram.mock.calls.filter(([method]) => method === "setMessageReaction").map(([, params]) => params.message_id)).toEqual([102, 101]);
-      expect(f.telegram.mock.calls.some(([method]) => method === "sendMessage")).toBe(false);
+      f.telegram.mockClear();
 
       f.runtime.onTurnEnd({ role: "assistant", content: "both complete", stopReason: "stop" });
       await f.runtime.onAgentSettled(f.ctx);
       await f.runtime.outbox.whenIdle();
-      for (const messageId of [101, 102]) {
-        expect(f.telegram.mock.calls.filter(([method, params]) => method === "setMessageReaction" && params.message_id === messageId).map(([, params]) => params.reaction)).toEqual([
-          [{ type: "emoji", emoji: "👀" }], [{ type: "emoji", emoji: "💯" }],
-        ]);
-      }
+      expect(f.telegram.mock.calls.filter(([method]) => method === "deleteMessage").length).toBe(1);
       expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["both complete"]);
     });
 
@@ -320,7 +313,7 @@ describe("runtime module", () => {
       expect(f.telegram).not.toHaveBeenCalled();
       f.runtime.onMessageStart({ ...message, role: "custom" }, f.ctx);
       await f.runtime.outbox.whenIdle();
-      expect(f.telegram.mock.calls.filter(([method]) => method === "setMessageReaction").map(([, params]) => params.message_id)).toEqual([101]);
+      expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["⏳ Working..."]);
     });
 
     it.each(["Pi idle", "runtime settled"])("rejects busy input while %s leaves only one active-run signal", async state => {
@@ -352,7 +345,6 @@ describe("runtime module", () => {
       f.runtime.onMessageEnd({ role: "assistant", content: "", stopReason: "aborted" });
       await f.runtime.onAgentSettled(f.ctx);
       await f.runtime.outbox.whenIdle();
-      expect(f.telegram.mock.calls.filter(([method, params]) => method === "setMessageReaction" && params.message_id === 101).map(([, params]) => params.reaction)).toEqual([[{ type: "emoji", emoji: "😭" }]]);
       expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toContainEqual(expect.stringContaining("queued Telegram messages were not delivered"));
       await f.runtime.onBeforeAgentStart({ prompt: "new task" }, f.ctx);
       f.runtime.onMessageStart({ role: "user", content: "new task" }, f.ctx);
@@ -361,7 +353,6 @@ describe("runtime module", () => {
       f.runtime.onMessageEnd({ role: "assistant", content: "new answer", stopReason: "stop" });
       await f.runtime.onAgentSettled(f.ctx);
       await f.runtime.outbox.whenIdle();
-      expect(f.telegram.mock.calls.some(([method, params]) => method === "setMessageReaction" && params.message_id === 101)).toBe(false);
       expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["new answer"]);
     });
 
@@ -620,15 +611,14 @@ describe("runtime module", () => {
         if (method === "sendMessage") {
           sentMessages.push(params.text);
         }
-        return {} as any;
+        return { message_id: 100 } as any;
       });
 
       await runtime.onAgentSettled(mockCtx);
       await runtime.outbox.whenIdle();
 
-      // Only assistant reply should be sent, NO prompt echo
-      expect(sentMessages.length).toBe(1);
-      expect(sentMessages[0]).toBe("Hello back!");
+      // Only working placeholder and assistant reply should be sent, NO prompt echo
+      expect(sentMessages).toEqual(["⏳ Working...", "Hello back!"]);
     });
 
     it("mirrors admitted user text rather than stale session history", async () => {
@@ -914,7 +904,7 @@ describe("runtime module", () => {
       expect(spyCall).not.toHaveBeenCalled();
     });
 
-    it("updates reaction from 👀 to 💯 on completion for Telegram inbound message", async () => {
+    it("sends working message placeholder on inbound task and deletes it on completion", async () => {
       const mockPi = {
         appendEntry: vi.fn(),
         sendUserMessage: vi.fn(),
@@ -927,7 +917,7 @@ describe("runtime module", () => {
           customType: "pi-telegram-mux.binding",
           data: {
             version: 1,
-            sessionId: "sess-reaction-inbound",
+            sessionId: "sess-working-inbound",
             chatId: mockConfig.chatId,
             threadId: 777,
           },
@@ -938,7 +928,7 @@ describe("runtime module", () => {
         mode: "tui",
         isIdle: () => true,
         sessionManager: {
-          getSessionId: () => "sess-reaction-inbound",
+          getSessionId: () => "sess-working-inbound",
           getEntries: () => entries,
           getSessionFile: () => "/tmp/sess.jsonl",
         },
@@ -946,11 +936,9 @@ describe("runtime module", () => {
 
       await runtime.onSessionStart(mockCtx);
 
-      const reactions: Array<{ messageId: number; emoji: string }> = [];
+      const calls: Array<{ method: string; params: any }> = [];
       vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
-        if (method === "setMessageReaction") {
-          reactions.push({ messageId: params.message_id, emoji: params.reaction?.[0]?.emoji });
-        }
+        calls.push({ method, params });
         return { message_id: 100 } as any;
       });
 
@@ -962,22 +950,33 @@ describe("runtime module", () => {
       expect((await admission).accepted).toBe(true);
       await runtime.outbox.whenIdle();
 
-      // Initial reaction should be 👀 on inbound message 999
-      expect(reactions).toEqual([{ messageId: 999, emoji: "👀" }]);
+      // Initial working placeholder should be sent with disable_notification: true
+      expect(calls.filter(c => c.method === "sendMessage")).toEqual([
+        expect.objectContaining({
+          method: "sendMessage",
+          params: expect.objectContaining({ text: "⏳ Working...", disable_notification: true }),
+        }),
+      ]);
 
       // Complete agent run
       runtime.onMessageEnd({ role: "assistant", content: "Result is 42", stopReason: "stop" });
       await runtime.onAgentSettled(mockCtx);
       await runtime.outbox.whenIdle();
 
-      // Final reaction should transition to 💯
-      expect(reactions).toEqual([
-        { messageId: 999, emoji: "👀" },
-        { messageId: 999, emoji: "💯" },
+      // Working placeholder should be deleted, followed by final answer
+      expect(calls.filter(c => c.method === "deleteMessage")).toEqual([
+        expect.objectContaining({
+          method: "deleteMessage",
+          params: expect.objectContaining({ message_id: 100 }),
+        }),
+      ]);
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual([
+        "⏳ Working...",
+        "Result is 42",
       ]);
     });
 
-    it("updates reaction to 😱 on error and 😭 on abort for inbound message", async () => {
+    it("deletes working message placeholder on error or abort for inbound message", async () => {
       const mockPi = {
         appendEntry: vi.fn(),
         sendUserMessage: vi.fn(),
@@ -990,7 +989,7 @@ describe("runtime module", () => {
           customType: "pi-telegram-mux.binding",
           data: {
             version: 1,
-            sessionId: "sess-reaction-error",
+            sessionId: "sess-working-error",
             chatId: mockConfig.chatId,
             threadId: 777,
           },
@@ -1001,7 +1000,7 @@ describe("runtime module", () => {
         mode: "tui",
         isIdle: () => true,
         sessionManager: {
-          getSessionId: () => "sess-reaction-error",
+          getSessionId: () => "sess-working-error",
           getEntries: () => entries,
           getSessionFile: () => "/tmp/sess.jsonl",
         },
@@ -1009,11 +1008,9 @@ describe("runtime module", () => {
 
       await runtime.onSessionStart(mockCtx);
 
-      const reactions: Array<{ messageId: number; emoji: string }> = [];
+      const calls: Array<{ method: string; params: any }> = [];
       vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
-        if (method === "setMessageReaction") {
-          reactions.push({ messageId: params.message_id, emoji: params.reaction?.[0]?.emoji });
-        }
+        calls.push({ method, params });
         return { message_id: 100 } as any;
       });
 
@@ -1028,13 +1025,14 @@ describe("runtime module", () => {
       await runtime.onAgentSettled(mockCtx);
       await runtime.outbox.whenIdle();
 
-      expect(reactions).toEqual([
-        { messageId: 888, emoji: "👀" },
-        { messageId: 888, emoji: "😱" },
+      expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual([
+        "⏳ Working...",
+        "⚠️ Task failed. Please check local Pi errors.",
       ]);
     });
 
-    it("sets 👀 and 💯 reactions on mirrored local prompt", async () => {
+    it("mirrors local prompt without working placeholder and delivers final reply", async () => {
       const mockPi = {
         appendEntry: vi.fn(),
         sendUserMessage: vi.fn(),
@@ -1066,16 +1064,13 @@ describe("runtime module", () => {
 
       await runtime.onSessionStart(mockCtx);
 
-      const reactions: Array<{ messageId: number; emoji: string }> = [];
+      const calls: Array<{ method: string; params: any }> = [];
       let sentCount = 0;
       vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
+        calls.push({ method, params });
         if (method === "sendMessage") {
           sentCount++;
-          // First send is prompt mirror, assign message_id 501
           return { message_id: 500 + sentCount } as any;
-        }
-        if (method === "setMessageReaction") {
-          reactions.push({ messageId: params.message_id, emoji: params.reaction?.[0]?.emoji });
         }
         return true as any;
       });
@@ -1085,19 +1080,238 @@ describe("runtime module", () => {
       runtime.onMessageStart({ role: "user", content: "Run tests locally" }, mockCtx);
       await runtime.outbox.whenIdle();
 
-      // Mirrored prompt was sent (msg 501), reaction 👀 applied to msg 501
-      expect(reactions).toEqual([{ messageId: 501, emoji: "👀" }]);
+      // Mirrored prompt was sent (msg 501), no working placeholder for local prompt
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual([
+        "🧑‍💻 [Prompt]\nRun tests locally",
+      ]);
 
       // Complete agent run
       runtime.onMessageEnd({ role: "assistant", content: "All tests pass", stopReason: "stop" });
       await runtime.onAgentSettled(mockCtx);
       await runtime.outbox.whenIdle();
 
-      // Final reaction should be 💯 on msg 501
-      expect(reactions).toEqual([
-        { messageId: 501, emoji: "👀" },
-        { messageId: 501, emoji: "💯" },
+      // No deleteMessage needed since no working placeholder was sent
+      expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(0);
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual([
+        "🧑‍💻 [Prompt]\nRun tests locally",
+        "All tests pass",
+      ]);
+    });
+
+    it("continues final and subsequent delivery when placeholder ownership was evicted", async () => {
+      const mockPi = {
+        appendEntry: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any;
+
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: { version: 1, sessionId: "sess-benign-delete", chatId: mockConfig.chatId, threadId: 777 },
+        },
+      ];
+      const mockCtx = {
+        mode: "tui", isIdle: () => true,
+        sessionManager: { getSessionId: () => "sess-benign-delete", getEntries: () => entries, getSessionFile: () => "/tmp/sess.jsonl" },
+      } as any;
+      await runtime.onSessionStart(mockCtx);
+
+      const calls: Array<{ method: string; params: any }> = [];
+      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params) => {
+        calls.push({ method, params });
+        if (method === "deleteMessage") throw new Error("Message does not belong to this route or was already deleted");
+        return { message_id: 100 } as any;
+      });
+
+      mockPi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      });
+
+      await runtime.handleInboundText("Task", mockCtx, 999);
+      await runtime.outbox.whenIdle();
+
+      const run = (runtime as any).currentRun;
+      runtime.onMessageEnd({ role: "assistant", content: "Result", stopReason: "stop" });
+      await runtime.onAgentSettled(mockCtx);
+      await runtime.outbox.whenIdle();
+
+      expect(runtime.outbox.error).toBeNull();
+      expect(run.workingMessageId).toBeUndefined();
+      expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
+      await runtime.onBeforeAgentStart({ prompt: "Later task" }, mockCtx);
+      runtime.onMessageStart({ role: "user", content: "Later task" }, mockCtx);
+      runtime.onMessageEnd({ role: "assistant", content: "Later result", stopReason: "stop" });
+      await runtime.onAgentSettled(mockCtx);
+      await runtime.outbox.whenIdle();
+      expect(runtime.outbox.error).toBeNull();
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual([
+        "⏳ Working...",
+        "Result",
+        "🧑‍💻 [Prompt]\nLater task",
+        "Later result",
+      ]);
+    });
+
+    it("continues final delivery after an unexpected placeholder deletion failure", async () => {
+      const mockPi = {
+        appendEntry: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any;
+
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: { version: 1, sessionId: "sess-fail-delete", chatId: mockConfig.chatId, threadId: 777 },
+        },
+      ];
+      const mockCtx = {
+        mode: "tui", isIdle: () => true,
+        sessionManager: { getSessionId: () => "sess-fail-delete", getEntries: () => entries, getSessionFile: () => "/tmp/sess.jsonl" },
+      } as any;
+      await runtime.onSessionStart(mockCtx);
+
+      const calls: Array<{ method: string; params: any }> = [];
+      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params) => {
+        calls.push({ method, params });
+        if (method === "deleteMessage") {
+          const err = new Error("Telegram connection timeout");
+          Object.assign(err, { code: "TELEGRAM_TIMEOUT" });
+          throw err;
+        }
+        return { message_id: 100 } as any;
+      });
+
+      mockPi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      });
+
+      await runtime.handleInboundText("Task", mockCtx, 999);
+      await runtime.outbox.whenIdle();
+
+      runtime.onMessageEnd({ role: "assistant", content: "Result", stopReason: "stop" });
+      await runtime.onAgentSettled(mockCtx);
+      await runtime.outbox.whenIdle();
+
+      expect(runtime.outbox.error).toBeNull();
+      expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual(["⏳ Working...", "Result"]);
+    });
+
+    it("continues final delivery when Telegram refuses placeholder deletion", async () => {
+      const mockPi = {
+        appendEntry: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any;
+
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: { version: 1, sessionId: "sess-cant-delete", chatId: mockConfig.chatId, threadId: 777 },
+        },
+      ];
+      const mockCtx = {
+        mode: "tui", isIdle: () => true,
+        sessionManager: { getSessionId: () => "sess-cant-delete", getEntries: () => entries, getSessionFile: () => "/tmp/sess.jsonl" },
+      } as any;
+      await runtime.onSessionStart(mockCtx);
+
+      const calls: Array<{ method: string; params: any }> = [];
+      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params) => {
+        calls.push({ method, params });
+        if (method === "deleteMessage") {
+          const err = new Error("Bad Request: message can't be deleted");
+          Object.assign(err, { code: "TELEGRAM_HTTP_400", errorCode: 400 });
+          throw err;
+        }
+        return { message_id: 100 } as any;
+      });
+
+      mockPi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      });
+
+      await runtime.handleInboundText("Task", mockCtx, 999);
+      await runtime.outbox.whenIdle();
+
+      runtime.onMessageEnd({ role: "assistant", content: "Result", stopReason: "stop" });
+      await runtime.onAgentSettled(mockCtx);
+      await runtime.outbox.whenIdle();
+
+      expect(runtime.outbox.error).toBeNull();
+      expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual(["⏳ Working...", "Result"]);
+    });
+
+    it("awaits active configuration dialog before deleting working placeholder and sending reply", async () => {
+      const mockPi = {
+        appendEntry: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any;
+
+      const runtime = new MuxRuntime(mockPi, tempDir);
+      const entries: any[] = [
+        {
+          type: "custom",
+          customType: "pi-telegram-mux.binding",
+          data: { version: 1, sessionId: "sess-config-dialog", chatId: mockConfig.chatId, threadId: 777 },
+        },
+      ];
+      const mockCtx = {
+        mode: "tui", isIdle: () => true,
+        sessionManager: { getSessionId: () => "sess-config-dialog", getEntries: () => entries, getSessionFile: () => "/tmp/sess.jsonl" },
+      } as any;
+      await runtime.onSessionStart(mockCtx);
+
+      const calls: Array<{ method: string; params: any }> = [];
+      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params) => {
+        calls.push({ method, params });
+        if (method === "sendMessage") return { message_id: 100 } as any;
+        return true as any;
+      });
+
+      mockPi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      });
+
+      await runtime.handleInboundText("Task", mockCtx, 999);
+      await runtime.outbox.whenIdle();
+
+      // Simulate opening configuration dialog
+      let resolveConfig!: () => void;
+      const configPromise = new Promise<void>(res => { resolveConfig = res; });
+      (runtime as any).configuring = true;
+      (runtime as any).configurationTask = configPromise;
+
+      // Agent settles while configuration dialog is still open
+      runtime.onMessageEnd({ role: "assistant", content: "Final Answer", stopReason: "stop" });
+      await runtime.onAgentSettled(mockCtx);
+
+      // Outbox task should wait for configuration dialog, not fail
+      expect(runtime.outbox.error).toBeNull();
+      // deleteMessage should not have executed yet because configuring is true
+      expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(0);
+
+      // Dismiss configuration dialog
+      (runtime as any).configuring = false;
+      (runtime as any).configurationTask = null;
+      resolveConfig();
+
+      await runtime.outbox.whenIdle();
+
+      // Now deleteMessage and sendMessage have both run successfully
+      expect(runtime.outbox.error).toBeNull();
+      expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
+      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual([
+        "⏳ Working...",
+        "Final Answer",
       ]);
     });
   });
+
 });

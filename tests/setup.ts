@@ -11,8 +11,11 @@ beforeEach(() => {
     if (url.hostname === "api.telegram.org" && url.pathname.endsWith("/getMe")) {
       return Promise.resolve(new Response(JSON.stringify({ ok: true, result: { id: 1, is_bot: true, first_name: "Fixture", username: "fixture_bot" } })));
     }
-    if (url.hostname === "api.telegram.org" && (url.pathname.endsWith("/closeForumTopic") || url.pathname.endsWith("/reopenForumTopic") || url.pathname.endsWith("/setMyCommands") || url.pathname.endsWith("/answerCallbackQuery") || url.pathname.endsWith("/editMessageText"))) {
+    if (url.hostname === "api.telegram.org" && (url.pathname.endsWith("/closeForumTopic") || url.pathname.endsWith("/reopenForumTopic") || url.pathname.endsWith("/setMyCommands") || url.pathname.endsWith("/answerCallbackQuery") || url.pathname.endsWith("/editMessageText") || url.pathname.endsWith("/deleteMessage"))) {
       return Promise.resolve(new Response(JSON.stringify({ ok: true, result: true })));
+    }
+    if (url.hostname === "api.telegram.org" && url.pathname.endsWith("/sendMessage")) {
+      return Promise.resolve(new Response(JSON.stringify({ ok: true, result: { message_id: 100, date: 1, chat: { id: 1, type: "supergroup" }, text: "mock" } })));
     }
     if (url.hostname === "api.telegram.org" && url.pathname.endsWith("/getUpdates")) {
       return new Promise<Response>((_resolve, reject) => {

@@ -242,6 +242,7 @@ export class IpcFollowerClient {
   private updateStatus(status: TransportStatus): void {
     if (!status || !["starting", "online", "retrying", "error", "conflict"].includes(status.polling) ||
         (status.rateLimitUntil !== undefined && (!Number.isSafeInteger(status.rateLimitUntil) || status.rateLimitUntil <= 0)) ||
+        (status.rateLimitPreservesOutput !== undefined && typeof status.rateLimitPreservesOutput !== "boolean") ||
         [status.error, status.feedbackError, status.commandMenuError, status.interactionError].some(error => error !== undefined && (!error || typeof error.code !== "string" || typeof error.message !== "string"))) {
       throw new Error("Invalid IPC transport status");
     }

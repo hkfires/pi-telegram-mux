@@ -53,6 +53,7 @@ export interface RuntimeRegistration {
   sessionId: string;
   threadId: number | null;
   generation: number;
+  retainedMessageIds?: number[];
 }
 
 export interface InboundResult {
@@ -66,6 +67,8 @@ export interface InboundResult {
 
 export interface TransportStatus {
   rateLimitUntil?: number;
+  // Cosmetic cleanup must pause, not discard, pending task output.
+  rateLimitPreservesOutput?: boolean;
   polling: "starting" | "online" | "retrying" | "error" | "conflict";
   error?: { code: string; message: string };
   feedbackError?: { code: string; message: string };
@@ -73,7 +76,7 @@ export interface TransportStatus {
   interactionError?: { code: string; message: string };
 }
 
-export const IPC_PROTOCOL_VERSION = 6;
+export const IPC_PROTOCOL_VERSION = 7;
 // Both peers must agree on image delivery semantics, not just the frame schema.
 export const IMAGE_INPUT_MODE = "paths-v1";
 

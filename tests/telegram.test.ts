@@ -342,4 +342,76 @@ describe("telegram client module", () => {
     const sendResult = await client.sendMessage(-100123, "Answer");
     expect(sendResult).toMatchObject({ message_id: 999 });
   });
+
+  it("calls deleteMessage successfully", async () => {
+    const client = new TelegramClient({
+      botToken: mockToken,
+      apiBase: mockApiBase,
+    });
+
+    let receivedBody = "";
+    nextHandler = (req, res) => {
+      let body = "";
+      req.on("data", chunk => { body += chunk; });
+      req.on("end", () => {
+        receivedBody = body;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result: true }));
+      });
+    };
+
+    const result = await client.deleteMessage(-100123, 42);
+    expect(result).toBe(true);
+    expect(JSON.parse(receivedBody)).toEqual({
+      chat_id: -100123,
+      message_id: 42,
+    });
+  });
+
+  it("enforces rate-limit pause and throws RateLimitError when deleteMessage receives 429", async () => {
+    const client = new TelegramClient({
+      botToken: mockToken,
+      apiBase: mockApiBase,
+    });
+
+    nextHandler = (_req, res) => {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ok: false,
+        error_code: 429,
+        description: "Too Many Requests: retry after 5",
+        parameters: { retry_after: 5 },
+      }));
+    };
+
+    await expect(client.deleteMessage(-100123, 42)).rejects.toThrow(RateLimitError);
+    expect(client.isRateLimited()).toBe(true);
+    expect(client.getRemainingPauseMs()).toBeGreaterThan(0);
+
+    // Follow-up deletion remains blocked; unsent output gets a distinct stable code.
+    await expect(client.deleteMessage(-100123, 43)).rejects.toThrow(RateLimitError);
+    const http = vi.fn((_req, res) => res.end(JSON.stringify({ ok: true, result: true })));
+    nextHandler = http;
+    await expect(client.sendMessage(-100123, "Not sent yet")).rejects.toMatchObject({ code: "TELEGRAM_CLEANUP_PAUSED", retryAfter: 5 });
+    expect(http).not.toHaveBeenCalled();
+  });
+
+  it.each(["cleanup-first", "ordinary-first"])("ordinary 429 wins overlapping cooldowns (%s)", order => {
+    const client = new TelegramClient({ botToken: mockToken, apiBase: mockApiBase });
+    const status = vi.fn();
+    client.onRateLimit = status;
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    try {
+      client.recordRateLimit(10, order === "cleanup-first");
+      expect(status).toHaveBeenLastCalledWith(11000, order === "cleanup-first");
+      client.recordRateLimit(5, order !== "cleanup-first");
+      expect(status).toHaveBeenLastCalledWith(11000, false);
+      client.recordRateLimit(15, true);
+      expect(status).toHaveBeenLastCalledWith(16000, false);
+      // A new cleanup-only interval becomes eligible only after the old pause ends.
+      now.mockReturnValue(17000);
+      client.recordRateLimit(1, true);
+      expect(status).toHaveBeenLastCalledWith(18000, true);
+    } finally { now.mockRestore(); }
+  });
 });

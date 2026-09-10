@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext, MessageEndEvent } from "@earendil-works/pi-coding-agent";
 import { appendBindingEntry, resolveBindingState } from "./binding.js";
 import { getMediaDir, configFingerprint, loadConfig, saveConfig, validateConfig } from "./config.js";
@@ -41,6 +42,7 @@ const INPUT_MODE_PENDING_NOTICE = "The input mode configuration is still being s
 
 const MAX_MIRRORED_TEXT_LENGTH = 65_536;
 const MAX_QUEUED_INPUTS = 64;
+const MAX_PENDING_PLACEHOLDERS = 128;
 const TELEGRAM_INPUT_TYPE = "Telegram";
 const TOPIC_MISSING_NOTICE = "Telegram topic is no longer available. A new topic will be created when you send your next prompt in Pi.";
 
@@ -121,7 +123,6 @@ interface MirrorRun {
   ctx: ExtensionContext;
   target: OutputTarget | null;
   origin?: Admission;
-  promptMessageIds: number[];
   suppressed: boolean;
   firstUserMessage: boolean;
   text: string;
@@ -129,6 +130,7 @@ interface MirrorRun {
   replyQueued?: boolean;
   settled: Promise<void>;
   settle: () => void;
+  workingMessageId?: number;
 }
 
 export class MuxRuntime {
@@ -155,6 +157,7 @@ export class MuxRuntime {
   private reconnectTimer?: NodeJS.Timeout;
   private lastConnectionError = "";
   private rateLimitUntil = 0;
+  private rateLimitPreservesOutput = false;
   private rateLimitTimer?: NodeJS.Timeout;
   private lastTransportError = "";
   private lastCommandMenuError = "";
@@ -166,6 +169,7 @@ export class MuxRuntime {
   private createInFlight = false;
   private readonly unknownCreates = new Set<string>();
   private currentRun: MirrorRun | null = null;
+  private readonly pendingPlaceholders = new Set<MirrorRun>();
   private cleanupTask: Promise<void> | null = null;
   private pendingInput?: Admission;
   private mediaValidating?: AbortSignal;
@@ -180,6 +184,7 @@ export class MuxRuntime {
 
   constructor(private readonly pi: ExtensionAPI, private readonly agentDir: string) {
     this.outbox = new BoundedOutbox(error => {
+      this.abandonPlaceholders("OUTPUT_FAILED");
       const failure = error as Error & { code?: string; retryAfter?: number };
       // An RPC rejection may arrive without a cooldown broadcast (for example
       // while joining during reload). Keep recovery bounded by its retry_after.
@@ -215,12 +220,19 @@ export class MuxRuntime {
         pendingReopen.threadId !== this.currentThreadId || pendingReopen.botToken !== this.config?.botToken || pendingReopen.chatId !== this.config?.chatId)) {
       this.rateLimitReopenTarget = null;
     }
-    const until = (this.coordinator?.getStatus() ?? this.followerClient?.getStatus())?.rateLimitUntil ?? 0;
-    if (until > Date.now() && until !== this.rateLimitUntil) {
+    const transportStatus = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
+    const until = transportStatus?.rateLimitUntil ?? 0;
+    const preserveOutput = transportStatus?.rateLimitPreservesOutput === true;
+    if (until > Date.now() && (until !== this.rateLimitUntil || preserveOutput !== this.rateLimitPreservesOutput)) {
       this.rateLimitUntil = until;
-      if (this.currentRun) this.currentRun.suppressed = true;
-      // Failed and pending output is dropped, not replayed after the cooldown.
-      if (!this.outbox.error || (this.outbox.error as { code?: string }).code === "TELEGRAM_HTTP_429") this.outbox.reset();
+      this.rateLimitPreservesOutput = preserveOutput;
+      if (!preserveOutput) {
+        if (this.currentRun) this.currentRun.suppressed = true;
+        this.abandonPlaceholders("RATE_LIMIT");
+        // Ordinary rejected delivery is never replayed. Cleanup-only cooldowns
+        // retain the bounded FIFO; its unsent calls wait at the transport boundary.
+        if (!this.outbox.error || (this.outbox.error as { code?: string }).code === "TELEGRAM_HTTP_429") this.outbox.reset();
+      }
     }
     clearTimeout(this.rateLimitTimer);
     this.rateLimitTimer = undefined;
@@ -392,6 +404,7 @@ export class MuxRuntime {
                 // Only an explicit Leader reset owns cancellation of stale work;
                 // ordinary connection loss must retain genuine outbox failures.
                 if (reset) this.invalidateRun();
+                else this.abandonPlaceholders("TRANSPORT_DISCONNECTED");
                 this.followerClient = null;
                 if (!reset && failure?.code === "IPC_PROTOCOL_ERROR") this.connectionFailed(new IpcError(failure.code, failure.message), ctx);
                 else this.scheduleReconnect(ctx);
@@ -516,7 +529,12 @@ export class MuxRuntime {
     if (!this.active) return false;
     const sessionId = ctx.sessionManager.getSessionId();
     const threadId = this.bindingState === "bound" ? this.currentThreadId : null;
-    const reg: RuntimeRegistration = { runtimeId: this.runtimeId, sessionId, threadId, generation: this.generation };
+    const reg: RuntimeRegistration = {
+      runtimeId: this.runtimeId,
+      sessionId,
+      threadId,
+      generation: this.generation,
+    };
     if (this.coordinator && threadId !== null) {
       const target: OutputTarget = { sessionId, threadId, generation: this.generation };
       const ok = this.coordinator.registerLocalRoute({
@@ -558,11 +576,26 @@ export class MuxRuntime {
   }
 
   public async callTelegram<T>(method: string, params: Record<string, unknown>, target?: OutputTarget, signal?: AbortSignal): Promise<T> {
-    signal?.throwIfAborted();
-    if (!this.active || this.configuring || (target && (!this.activeCtx || !this.isTargetCurrent(target, this.activeCtx)))) throw new Error("Telegram output target is no longer active");
-    if (this.coordinator) return this.coordinator.callTelegram<T>(method, params, this.runtimeId, target, undefined, signal);
-    if (this.followerClient) return this.followerClient.callTelegram<T>(method, params, target, undefined, signal);
-    throw new Error("No active transport to Telegram Leader");
+    const generation = this.generation;
+    const waitSignal = signal ?? this.inputCancellation.signal;
+    for (;;) {
+      signal?.throwIfAborted();
+      if (!this.active || generation !== this.generation || this.configuring || (target && (!this.activeCtx || !this.isTargetCurrent(target, this.activeCtx)))) throw new Error("Telegram output target is no longer active");
+      try {
+        if (this.coordinator) return await this.coordinator.callTelegram<T>(method, params, this.runtimeId, target, undefined, signal);
+        if (this.followerClient) return await this.followerClient.callTelegram<T>(method, params, target, undefined, signal);
+        throw new Error("No active transport to Telegram Leader");
+      } catch (error) {
+        const failure = error as { code?: string; retryAfter?: number } | null;
+        // Only this stable transport code proves HTTP was never attempted. Do not
+        // retry actual 429 responses, uncertain sends, or cosmetic deletion itself.
+        // Topic reopening owns its cooldown recovery outside the request deadline.
+        if (method === "deleteMessage" || method === "reopenForumTopic" || failure?.code !== "TELEGRAM_CLEANUP_PAUSED" ||
+            !Number.isSafeInteger(failure.retryAfter) || failure.retryAfter! <= 0) throw error;
+        await delay(Math.min(2_147_483_647, failure.retryAfter! * 1000), undefined, { signal: waitSignal });
+        if (this.configurationTask) await this.waitForConfiguration(waitSignal);
+      }
+    }
   }
 
   public async handleInboundText(text: string, ctx: ExtensionContext, messageId?: number, explicitMode?: BusyInputMode, media?: InboundMedia | InboundMedia[], upstreamSignal?: AbortSignal): Promise<InboundResult> {
@@ -909,7 +942,10 @@ export class MuxRuntime {
     const polling = (this.coordinator?.getStatus() ?? this.followerClient?.getStatus())?.polling;
     // A completed/unknown IPC admission may no longer have an active RPC slot.
     // Terminal status also revokes those mobile origins, without aborting local work.
-    if (polling === "error" || polling === "conflict") this.cancelInput();
+    if (polling === "error" || polling === "conflict") {
+      this.cancelInput();
+      this.abandonPlaceholders("TRANSPORT_FAILED");
+    }
     this.updateStatusBar(ctx);
   }
 
@@ -972,13 +1008,11 @@ export class MuxRuntime {
     run.stopReason = undefined;
     run.replyQueued = false;
     if (queued) {
-      const messageId = queued.messageId;
-      if (typeof messageId === "number") {
-        run.promptMessageIds.push(messageId);
-        this.outbox.enqueue(async signal => {
-          if (this.isRunCurrent(run) && run.target && !signal.aborted) await this.setReaction(run.target, messageId, "👀", signal);
-        });
-      }
+      this.outbox.enqueue(async signal => {
+        if (this.isRunCurrent(run) && run.target && !signal.aborted) {
+          await this.sendWorkingMessage(run, signal);
+        }
+      });
       return;
     }
     if (run.firstUserMessage) {
@@ -996,11 +1030,7 @@ export class MuxRuntime {
       // which Pi delivers without another before_agent_start event.
       const prompt = `🧑‍💻 [Prompt]\n${text.length <= MAX_MIRRORED_TEXT_LENGTH ? text : "Prompt is too long. Please view it locally in Pi; task results will still be synced."}`;
       this.outbox.enqueue(async signal => {
-        const sent = await this.sendRunText(prompt, run, signal);
-        if (sent && typeof sent.message_id === "number" && run.target && !signal.aborted) {
-          run.promptMessageIds.push(sent.message_id);
-          await this.setReaction(run.target, sent.message_id, "👀", signal);
-        }
+        await this.sendRunText(prompt, run, signal);
       }, Buffer.byteLength(prompt, "utf-8"));
     }
   }
@@ -1075,9 +1105,10 @@ export class MuxRuntime {
       if (!(error instanceof Error && /^(?:Bad Request: )?TOPIC_NOT_MODIFIED$/i.test(error.message))) {
         this.connectionError = error instanceof Error ? error : new Error("Telegram topic reopen failed", { cause: error });
         const failure = this.connectionError as Error & { code?: string; retryAfter?: number };
-        if (failure.code === "TELEGRAM_HTTP_429") {
-          // Reopening is idempotent. Keep the pending operation until its cooldown
-          // expires, including when only an IPC rejection supplied retry_after.
+        if (failure.code === "TELEGRAM_HTTP_429" || failure.code === "TELEGRAM_CLEANUP_PAUSED") {
+          // Reopen boundary: both a real 429 and a pre-HTTP cleanup pause retain
+          // this idempotent operation. Wait outside the three-second I/O deadline,
+          // including when only an IPC rejection supplied retry_after.
           const retryAfter = Number.isSafeInteger(failure.retryAfter) && failure.retryAfter! > 0 ? failure.retryAfter! : 5;
           // Configuration reloads can clear diagnostics and change route generations
           // without completing this operation. Retain its stable ownership separately.
@@ -1115,28 +1146,18 @@ export class MuxRuntime {
     this.activeCtx = ctx;
     this.isIdle = false;
     const oldRun = this.currentRun;
-    if (oldRun && !oldRun.replyQueued && oldRun.promptMessageIds.length > 0 && oldRun.target) {
-      const target = oldRun.target;
-      const ids = [...oldRun.promptMessageIds];
+    if (oldRun && !oldRun.replyQueued && oldRun.target) {
       this.outbox.enqueue(async signal => {
-        if (!signal.aborted) {
-          for (const id of ids) {
-            await this.setReaction(target, id, "😭", signal);
-          }
-        }
+        await this.deleteWorkingMessage(oldRun, signal);
       });
     }
     let settle!: () => void;
     const settled = new Promise<void>(resolve => { settle = resolve; });
-    const promptMessageIds: number[] = [];
-    if (origin && !origin.consumed && typeof origin.messageId === "number") {
-      promptMessageIds.push(origin.messageId);
-    }
     // Runs admitted during recovery/configuration must never gain a target later.
     const run: MirrorRun = {
       sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, ctx,
-      target: null, origin: origin?.consumed ? undefined : origin, promptMessageIds,
-      suppressed: this.rateLimitUntil > Date.now() || this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.signal.aborted || origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
+      target: null, origin: origin?.consumed ? undefined : origin,
+      suppressed: (this.rateLimitUntil > Date.now() && !this.rateLimitPreservesOutput) || this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.signal.aborted || origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
       firstUserMessage: true, text: "", settled, settle,
     };
     this.currentRun = run;
@@ -1173,8 +1194,8 @@ export class MuxRuntime {
         if (!await this.registerRoute(ctx, signal)) throw new Error("Failed to register the Telegram topic; synchronization has stopped.");
       }
       if (!this.isRunCurrent(run) || signal.aborted || !run.target) return;
-      for (const msgId of run.promptMessageIds) {
-        await this.setReaction(run.target, msgId, "👀", signal);
+      if (run.origin) {
+        await this.sendWorkingMessage(run, signal);
       }
     });
   }
@@ -1226,7 +1247,10 @@ export class MuxRuntime {
     this.onMessageEnd(message);
     if ((run.stopReason !== "stop" && run.stopReason !== "length") || ("content" in message && Array.isArray(message.content) && message.content.some(part => part?.type === "toolCall"))) return;
     const text = run.text;
-    if (text.trim()) this.outbox.enqueue(async signal => { await this.sendRunText(text, run, signal); }, Buffer.byteLength(text, "utf-8"));
+    if (text.trim()) this.outbox.enqueue(async signal => {
+      await this.deleteWorkingMessage(run, signal);
+      await this.sendRunText(text, run, signal);
+    }, Buffer.byteLength(text, "utf-8"));
     run.replyQueued = true;
     // Release first-turn topic preparation without marking the agent idle or
     // dropping the run: queued user messages still belong to this agent run.
@@ -1250,23 +1274,16 @@ export class MuxRuntime {
     if (undelivered.length && this.isRunCurrent(run)) {
       this.outbox.enqueue(async signal => {
         if (!this.isRunCurrent(run) || !run.target || signal.aborted) return;
-        for (const input of undelivered) {
-          if (typeof input.messageId === "number") await this.setReaction(run.target, input.messageId, "😭", signal);
-        }
         await this.sendRunText("⚠️ Some queued Telegram messages were not delivered before the task ended. Check local Pi before resending.", run, signal);
       });
     }
-    const emoji = run.stopReason === "error" ? "😱"
-      : run.stopReason === "aborted" ? "😭"
-      : "💯";
     if (!this.isRunCurrent(run) || run.replyQueued) {
-      if (this.isRunCurrent(run)) {
+      if (!this.isRunCurrent(run)) {
+        if (this.pendingPlaceholders.delete(run)) console.error("[pi-telegram-mux] WORKING_MESSAGE_ABANDONED (RUN_SUPPRESSED)");
+        run.workingMessageId = undefined;
+      } else {
         this.outbox.enqueue(async signal => {
-          if (run.target && !signal.aborted) {
-            for (const msgId of run.promptMessageIds) {
-              await this.setReaction(run.target, msgId, emoji, signal);
-            }
-          }
+          await this.deleteWorkingMessage(run, signal);
         });
       }
       return;
@@ -1275,32 +1292,63 @@ export class MuxRuntime {
       : run.stopReason === "aborted" ? "⏹ Task aborted."
       : run.stopReason === "toolUse" || run.stopReason === "pending" ? "⚠️ Task did not produce a final response. Please check local Pi status."
       : run.text;
-    if (text.trim()) this.outbox.enqueue(async signal => { await this.sendRunText(text, run, signal); }, Buffer.byteLength(text, "utf-8"));
     this.outbox.enqueue(async signal => {
-      if (run.target && !signal.aborted) {
-        for (const msgId of run.promptMessageIds) {
-          await this.setReaction(run.target, msgId, emoji, signal);
-        }
-      }
-    });
+      await this.deleteWorkingMessage(run, signal);
+      if (text.trim()) await this.sendRunText(text, run, signal);
+    }, Buffer.byteLength(text, "utf-8"));
   }
 
-  private async setReaction(target: OutputTarget, messageId: number, emoji: string, signal?: AbortSignal): Promise<void> {
+  private async sendWorkingMessage(run: MirrorRun, signal: AbortSignal): Promise<void> {
+    if (this.configurationTask) await this.waitForConfiguration(signal);
     const config = this.config;
-    if (!config || !this.active || this.bindingState === "disconnected") return;
+    if (!config || !run.target || !this.isRunCurrent(run) || signal.aborted || run.workingMessageId || !this.hasActiveTransport() || !this.isTargetCurrent(run.target, run.ctx)) return;
+    const sent = await this.callTelegram<TelegramMessage>(
+      "sendMessage",
+      {
+        chat_id: config.chatId,
+        message_thread_id: run.target.threadId,
+        text: "⏳ Working...",
+        disable_notification: true,
+      },
+      run.target,
+      signal
+    );
+    if (sent && typeof sent.message_id === "number" && !signal.aborted && this.isRunCurrent(run) && !this.outbox.error && this.hasActiveTransport()) {
+      if (this.pendingPlaceholders.size >= MAX_PENDING_PLACEHOLDERS) {
+        const oldest = this.pendingPlaceholders.values().next().value!;
+        oldest.workingMessageId = undefined;
+        this.pendingPlaceholders.delete(oldest);
+        console.error("[pi-telegram-mux] WORKING_MESSAGE_ABANDONED (CAPACITY)");
+      }
+      run.workingMessageId = sent.message_id;
+      this.pendingPlaceholders.add(run);
+    }
+  }
+
+  private async deleteWorkingMessage(run: MirrorRun, signal?: AbortSignal): Promise<void> {
+    if (this.configurationTask) await this.waitForConfiguration(signal);
+    const messageId = run.workingMessageId;
+    const target = run.target;
+    const config = this.config;
+    // Consume tracking even when the target is no longer usable. Retaining a
+    // settled run cannot restore transport authority or confirm remote deletion.
+    this.pendingPlaceholders.delete(run);
+    run.workingMessageId = undefined;
+    if (!messageId) return;
+    if (!target || !config || !this.active || this.bindingState === "disconnected" || !this.hasActiveTransport() || !this.isTargetCurrent(target, run.ctx) || signal?.aborted) {
+      console.error("[pi-telegram-mux] WORKING_MESSAGE_ABANDONED (TARGET_UNAVAILABLE)");
+      return;
+    }
     try {
-      await this.callTelegram(
-        "setMessageReaction",
-        {
-          chat_id: config.chatId,
-          message_id: messageId,
-          reaction: [{ type: "emoji", emoji }],
-        },
-        target,
-        signal
-      );
-    } catch {
-      // Best-effort reaction: ignore permissions, unsupported reactions, or rate limits.
+      const deadline = AbortSignal.timeout(3000);
+      await this.callTelegram("deleteMessage", { chat_id: config.chatId, message_id: messageId }, target, signal ? AbortSignal.any([signal, deadline]) : deadline);
+    } catch (error) {
+      // Final-delivery boundary: placeholder cleanup is cosmetic and cannot
+      // block the actual answer. Report once, discard ownership, and never retry.
+      const code = (error as { code?: unknown } | null)?.code;
+      console.error(`[pi-telegram-mux] WORKING_MESSAGE_DELETE_FAILED${typeof code === "string" ? ` (${code})` : ""}: message ${messageId}`);
+    } finally {
+      run.workingMessageId = undefined;
     }
   }
 
@@ -1385,7 +1433,17 @@ export class MuxRuntime {
     return firstMessage;
   }
 
+  /** Abandon cosmetic ownership at terminal boundaries without claiming deletion. */
+  private abandonPlaceholders(reason: string): void {
+    if (!this.pendingPlaceholders.size) return;
+    console.error(`[pi-telegram-mux] WORKING_MESSAGE_ABANDONED (${reason}): ${this.pendingPlaceholders.size} placeholder(s)`);
+    for (const run of this.pendingPlaceholders) run.workingMessageId = undefined;
+    this.pendingPlaceholders.clear();
+  }
+
   private invalidateRun(): void {
+    // Lifecycle callers transfer eligible cleanup first; obsolete leases are abandoned.
+    this.abandonPlaceholders("LIFECYCLE_CHANGED");
     this.generation++;
     // Detach stale cache I/O; its finalizer cannot release a newer validation reservation.
     this.inputCancellation.abort();
@@ -1399,30 +1457,37 @@ export class MuxRuntime {
     this.finishInput({ accepted: false, busy: false, statusReply: "Session changed; execution result unknown. Please check local status." });
   }
 
-  private cleanupRunReactions(): Promise<void> | null {
-    const run = this.currentRun;
-    const target = run?.target;
-    const config = this.config;
+  private cleanupRun(): Promise<void> | null {
+    const runs = [...this.pendingPlaceholders];
+    if (!runs.length || !this.active) return this.cleanupTask;
     const coordinator = this.coordinator;
     const follower = this.followerClient;
-    if (!run || !target || !config || !this.active || this.configuring || !run.promptMessageIds.length) return this.cleanupTask;
-    const messageIds = run.promptMessageIds.splice(0);
+    // Transfer queued cleanup before invalidateRun cancels ordinary output.
+    const pending = runs.map(run => ({ target: run.target, config: run.config, messageId: run.workingMessageId }));
+    for (const run of runs) {
+      this.pendingPlaceholders.delete(run);
+      run.workingMessageId = undefined;
+    }
     const previous = this.cleanupTask;
     const task = (async () => {
       if (previous) await previous;
-      // Retain the acknowledged route while ordinary output is synchronously fenced.
-      // All reactions share one deadline so cleanup cannot hold navigation or exit open.
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 3000);
       try {
-        for (const messageId of messageIds) {
-          if (controller.signal.aborted) break;
-          const params = { chat_id: config.chatId, message_id: messageId, reaction: [{ type: "emoji", emoji: "😭" }] };
+        for (const { target, config, messageId: workingMessageId } of pending) {
+          if (!target || !config || !workingMessageId || controller.signal.aborted) continue;
+          const deleteParams = { chat_id: config.chatId, message_id: workingMessageId };
           try {
-            if (coordinator) await coordinator.callTelegram("setMessageReaction", params, this.runtimeId, target, undefined, controller.signal);
-            else if (follower) await follower.callTelegram("setMessageReaction", params, target, undefined, controller.signal);
-          } catch {
-            // Cleanup is best-effort; a failed reaction must not block route release.
+            if (coordinator) await coordinator.callTelegram("deleteMessage", deleteParams, this.runtimeId, target, undefined, controller.signal);
+            else if (follower) await follower.callTelegram("deleteMessage", deleteParams, target, undefined, controller.signal);
+            else throw new Error("No transport available for placeholder cleanup");
+          } catch (error) {
+            // Shutdown/navigation boundary: report failed cleanup without preventing
+            // route release. A failed or cancelled deletion never confirms removal.
+            const code = (error as { code?: unknown } | null)?.code;
+            if (code !== "TELEGRAM_ABORTED" && code !== "TELEGRAM_RELOADING") {
+              console.error(`[pi-telegram-mux] WORKING_MESSAGE_CLEANUP_FAILED: message ${workingMessageId}`);
+            }
           }
         }
       } finally { clearTimeout(timer); }
@@ -1462,7 +1527,7 @@ export class MuxRuntime {
       ctx.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
       return Promise.resolve({ cancel: true });
     }
-    const cleanup = this.cleanupRunReactions();
+    const cleanup = this.cleanupRun();
     this.invalidateRun();
     // before_* can be cancelled by another extension; release ownership at shutdown.
     // Only enabled integration needs registration; configured transport failures remain errors.
@@ -1484,7 +1549,7 @@ export class MuxRuntime {
       this.activeCtx?.ui.notify(SETTINGS_PENDING_NOTICE, "warning");
       return Promise.resolve({ cancel: true });
     }
-    const cleanup = this.cleanupRunReactions();
+    const cleanup = this.cleanupRun();
     this.invalidateRun();
     const ctx = this.activeCtx;
     if (ctx && this.active && this.config) this.outbox.enqueue(async signal => {
@@ -1506,7 +1571,7 @@ export class MuxRuntime {
     const shouldClose = event?.reason !== "reload" && this.active && !this.configuring && !this.getIsReconnecting() && !hasError &&
       config?.autoCloseTopics === true && target && this.bindingState === "bound" && target.threadId === this.currentThreadId &&
       target.sessionId === ctx.sessionManager.getSessionId() && this.hasActiveTransport();
-    const cleanup = this.cleanupRunReactions();
+    const cleanup = this.cleanupRun();
     // Fence inputs and cancel queued output synchronously, retaining the last acknowledged route only for closure.
     this.active = false;
     this.rateLimitReopenTarget = null;
@@ -1633,15 +1698,21 @@ export class MuxRuntime {
     }
   }
 
-  public handleTgDisconnect(ctx: ExtensionContext): void {
+  public async handleTgDisconnect(ctx: ExtensionContext): Promise<void> {
     if (!this.active || ctx.mode !== "tui" || !this.config || this.configuring || this.recovering) return;
     if (this.bindingState === "disconnected") return;
     if (!appendBindingEntry(this.pi, ctx, this.config.chatId, null)) { ctx.ui?.notify("Failed to write disconnect record.", "error"); return; }
+    const cleanup = this.cleanupRun();
     this.invalidateRun();
+    if (cleanup) {
+      this.recovering = true;
+      try { await cleanup; }
+      finally { this.recovering = false; }
+    }
     this.unregisterRoute(ctx);
     this.bindingState = "disconnected";
     this.currentThreadId = null;
-    if (this.topicNeedsReopen && (this.connectionError as { code?: string } | null)?.code === "TELEGRAM_HTTP_429") this.connectionError = null;
+    if (this.topicNeedsReopen && ["TELEGRAM_HTTP_429", "TELEGRAM_CLEANUP_PAUSED"].includes((this.connectionError as { code?: string } | null)?.code ?? "")) this.connectionError = null;
     this.updateStatusBar(ctx);
     ctx.ui?.notify("Disconnected from Telegram topic.", "info");
   }
@@ -1694,7 +1765,9 @@ export class MuxRuntime {
           // changes committed by another instance while this save was waiting.
           const config = await saveConfig(this.agentDir, { updates: changes });
           saved = true;
+          const cleanup = this.cleanupRun();
           this.invalidateRun();
+          if (cleanup) await cleanup;
           if (this.coordinator) {
             await this.coordinator.reloadConfig();
           } else if (this.followerClient?.isConnected()) {

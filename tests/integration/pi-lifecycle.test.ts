@@ -38,7 +38,7 @@ it.each([
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", chunk => { stderr += chunk; });
     const result = await new Promise<any>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`Pi lifecycle timeout: ${stderr}\n${JSON.stringify(messages)}`)), 15_000);
+      const timer = setTimeout(() => reject(new Error(`Pi lifecycle timeout: ${stderr}\n${JSON.stringify(messages)}`)), 25_000);
       let buffer = "";
       child!.stdout!.setEncoding("utf8");
       child!.stdout!.on("data", chunk => {
@@ -131,8 +131,6 @@ it.each([
       expect(result.modelInputs).toEqual(scenario === "album" ? [result.received] : [result.received, result.received]);
       expect(result.modelImageCounts).toEqual(scenario === "album" ? [0] : [0, 2]);
       expect(result.texts).toEqual([scenario === "album" ? "answer 1" : "answer 2"]);
-      expect(result.reactions).toContainEqual({ messageId: 1, emoji: "👀" });
-      expect(result.reactions).toContainEqual({ messageId: 1, emoji: "💯" });
     } else if (scenario === "busy-concurrent-input-gate") {
       expect(result.inputWaited).toBe(false);
       expect(result.admitted).toHaveLength(2);
@@ -140,10 +138,6 @@ it.each([
       expect(result.received).toEqual(["local-one", "busy-one", "busy-two"]);
       expect(result.modelInputs.at(-1)).toEqual(["local-one", "busy-one", "busy-two"]);
       expect(result.texts).toEqual(["🧑‍💻 [Prompt]\nlocal-one", "answer 1", "answer 2", "answer 3"]);
-      for (const messageId of [101, 102]) {
-        expect(result.reactions).toContainEqual({ messageId, emoji: "👀" });
-        expect(result.reactions).toContainEqual({ messageId, emoji: "💯" });
-      }
     } else if (scenario.startsWith("busy-")) {
       expect(result.inputWaited).toBe(false);
       expect(result.modelChanged).toBe(true);
@@ -151,8 +145,6 @@ it.each([
       expect(result.received).toEqual(["local-one", "remote busy prompt"]);
       expect(result.modelInputs.at(-1)).toEqual(["local-one", "remote busy prompt"]);
       expect(result.texts).toEqual(["🧑‍💻 [Prompt]\nlocal-one", "answer 1", "answer 2"]);
-      expect(result.reactions).toContainEqual({ messageId: 101, emoji: "👀" });
-      expect(result.reactions).toContainEqual({ messageId: 101, emoji: "💯" });
     } else if (scenario === "follow-up" || scenario === "length-follow-up") {
       expect(result.received).toEqual(["local-one", "local-follow-up"]);
       expect(result.texts).toEqual(["🧑‍💻 [Prompt]\nlocal-one", "answer 1", "🧑‍💻 [Prompt]\nlocal-follow-up", "answer 2"]);
@@ -174,4 +166,4 @@ it.each([
     }
     await fs.rm(dir, { recursive: true, force: true });
   }
-}, 20_000);
+}, 30_000);

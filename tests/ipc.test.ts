@@ -54,17 +54,17 @@ describe("IPC protocol regressions", () => {
     return socket;
   }
 
-  it("rejects a legacy v5 peer before it can register a media route", async () => {
+  it.each([5, 6])("rejects a legacy v%s peer before route registration", async protocolVersion => {
     const socket = net.createConnection({ host: "127.0.0.1", port: info.port });
     sockets.push(socket);
     await once(socket, "connect");
     const closed = once(socket, "close");
-    socket.write(encodeFrame({ type: "auth", protocolVersion: 5, runtimeId: "legacy", capability: info.capability }));
+    socket.write(encodeFrame({ type: "auth", protocolVersion, imageInputMode: IMAGE_INPUT_MODE, runtimeId: "legacy", capability: info.capability }));
     await closed;
     expect(coordinator.getRoutes().size).toBe(0);
   });
 
-  it.each([undefined, "inline-v1", "tui-paths-v1"])("rejects a v6 follower with incompatible image mode %j before registration", async imageInputMode => {
+  it.each([undefined, "inline-v1", "tui-paths-v1"])("rejects a current follower with incompatible image mode %j before registration", async imageInputMode => {
     const socket = net.createConnection({ host: "127.0.0.1", port: info.port });
     sockets.push(socket);
     socket.on("error", () => {});
@@ -74,7 +74,7 @@ describe("IPC protocol regressions", () => {
     const parser = new FrameParser();
     socket.on("data", chunk => replies.push(...parser.push(chunk)));
     socket.write(Buffer.concat([
-      encodeFrame({ type: "auth", protocolVersion: 6, imageInputMode, runtimeId: "mixed", capability: info.capability }),
+      encodeFrame({ type: "auth", protocolVersion: IPC_PROTOCOL_VERSION, imageInputMode, runtimeId: "mixed", capability: info.capability }),
       encodeFrame({ type: "register", registration: { runtimeId: "mixed", ...target } }),
     ]));
     await closed;
@@ -82,7 +82,10 @@ describe("IPC protocol regressions", () => {
     expect(coordinator.getRoutes().size).toBe(0);
   });
 
-  it.each([undefined, "inline-v1", "tui-paths-v1"])("rejects a v6 leader with incompatible image mode %j before coalesced input", async imageInputMode => {
+  it.each([
+    { protocolVersion: 6, imageInputMode: IMAGE_INPUT_MODE },
+    ...[undefined, "inline-v1", "tui-paths-v1"].map(imageInputMode => ({ protocolVersion: IPC_PROTOCOL_VERSION, imageInputMode })),
+  ])("rejects an incompatible leader %j before coalesced input", async ({ protocolVersion, imageInputMode }) => {
     const auth: IpcMessage[] = [];
     const server = net.createServer(socket => {
       sockets.push(socket);
@@ -93,7 +96,7 @@ describe("IPC protocol regressions", () => {
           auth.push(msg);
           if (msg.type !== "auth") continue;
           socket.write(Buffer.concat([
-            encodeFrame({ type: "auth_ack", protocolVersion: 6, imageInputMode, epoch: 1, configFingerprint: "fixture", status: { polling: "online" } }),
+            encodeFrame({ type: "auth_ack", protocolVersion, imageInputMode, epoch: 1, configFingerprint: "fixture", status: { polling: "online" } }),
             encodeFrame({ type: "inbound", requestId: "must-not-run", messageId: 1, target, fromId: testConfig.allowedUserId, text: "untrusted mixed-mode input" }),
           ]));
         }
@@ -105,8 +108,9 @@ describe("IPC protocol regressions", () => {
     const inbound = vi.fn();
     f.setInboundHandler(inbound);
     try {
-      await expect(f.connect()).rejects.toMatchObject({ code: "IPC_IMAGE_MODE_MISMATCH" });
-      expect(auth[0]).toMatchObject({ type: "auth", protocolVersion: 6, imageInputMode: IMAGE_INPUT_MODE });
+      if (protocolVersion !== IPC_PROTOCOL_VERSION) await expect(f.connect()).rejects.toThrow("Incompatible IPC protocol");
+      else await expect(f.connect()).rejects.toMatchObject({ code: "IPC_IMAGE_MODE_MISMATCH" });
+      expect(auth[0]).toMatchObject({ type: "auth", protocolVersion: IPC_PROTOCOL_VERSION, imageInputMode: IMAGE_INPUT_MODE });
       expect(f.isConnected()).toBe(false);
       expect(inbound).not.toHaveBeenCalled();
     } finally {
@@ -141,6 +145,141 @@ describe("IPC protocol regressions", () => {
     await registered.callTelegram("setMessageReaction", { chat_id: testConfig.chatId, message_id: 123, reaction: [{ type: "emoji", emoji: "⚡" }] }, target);
     expect(api).toHaveBeenCalledWith("setMessageReaction", { chat_id: testConfig.chatId, message_id: 123, reaction: [{ type: "emoji", emoji: "⚡" }] }, undefined, expect.any(AbortSignal), { ignoreRateLimit: true });
     api.mockClear();
+
+    await expect(registered.callTelegram("deleteMessage", { chat_id: testConfig.chatId, message_id: 0 })).rejects.toThrow("Invalid message_id");
+    await expect(registered.callTelegram("deleteMessage", { chat_id: testConfig.chatId, message_id: 123 })).rejects.toThrow("fenced");
+    await expect(registered.callTelegram("deleteMessage", { chat_id: testConfig.chatId, message_id: 123 }, target)).rejects.toThrow("does not belong to this route");
+
+    // Send message through target route so coordinator tracks ownership
+    api.mockResolvedValueOnce({ message_id: 555 });
+    const sent = await registered.callTelegram<TelegramMessage>("sendMessage", { chat_id: testConfig.chatId, message_thread_id: 50, text: "msg" }, target);
+    expect(sent.message_id).toBe(555);
+
+    // Deleting the owned message succeeds without ignoreRateLimit
+    api.mockResolvedValueOnce(true);
+    await registered.callTelegram("deleteMessage", { chat_id: testConfig.chatId, message_id: 555 }, target);
+    expect(api).toHaveBeenCalledWith("deleteMessage", { chat_id: testConfig.chatId, message_id: 555 }, undefined, expect.any(AbortSignal));
+    api.mockClear();
+  });
+
+  it("reconciles retained message ownership on route registration and reconnection", async () => {
+    const api = vi.spyOn(coordinator.getTelegramClient(), "callApi");
+    const follower = await connect("reconcile-owner");
+
+    // Invalid retainedMessageIds should close connection
+    await expect(follower.register({
+      runtimeId: "reconcile-owner", ...target, retainedMessageIds: [-1],
+    })).rejects.toThrow("closed");
+
+    // Reconnect and register with valid retained message IDs (simulating in-flight placeholder from active run)
+    const validFollower = await connect("reconcile-owner-valid");
+    await validFollower.register({
+      runtimeId: "reconcile-owner-valid", ...target, retainedMessageIds: [777],
+    });
+
+    // A different topic's real message cannot be claimed through registration.
+    const other = await connect("other-topic");
+    const otherTarget = { ...target, threadId: 51 };
+    await other.register({ runtimeId: "other-topic", ...otherTarget });
+    api.mockResolvedValueOnce({ message_id: 777 });
+    await other.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: 51, text: "private" }, otherTarget);
+    await validFollower.register({ runtimeId: "reconcile-owner-valid", ...target, retainedMessageIds: [777] });
+    api.mockClear();
+
+    // Authenticated local peers still cannot forge deletion authority.
+    await expect(validFollower.callTelegram("deleteMessage", { chat_id: testConfig.chatId, message_id: 777 }, target)).rejects.toThrow("does not belong to this route");
+
+    expect(api).not.toHaveBeenCalled();
+
+    // Send a new message 888
+    api.mockResolvedValueOnce({ message_id: 888 });
+    await validFollower.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: 50, text: "placeholder" }, target);
+
+    // Follower disconnects
+    validFollower.close();
+
+    // Reconnecting follower registers with retained message ID 888 (reconnection reconciliation)
+    const reconnected = await connect("reconcile-owner-valid");
+    await reconnected.register({
+      runtimeId: "reconcile-owner-valid", ...target, retainedMessageIds: [888],
+    });
+
+    // Deleting 888 after reconnect succeeds
+    api.mockResolvedValueOnce(true);
+    await reconnected.callTelegram("deleteMessage", { chat_id: testConfig.chatId, message_id: 888 }, target);
+    expect(api).toHaveBeenCalledWith("deleteMessage", { chat_id: testConfig.chatId, message_id: 888 }, undefined, expect.any(AbortSignal));
+  });
+
+  it("bounds ownership records and rejects unverified restoration of evicted placeholders", async () => {
+    const api = vi.spyOn(coordinator.getTelegramClient(), "callApi");
+    for (let n = 0; n < 130; n++) {
+      const runtimeId = `abandoned-${n}`;
+      const lease = { ...target, threadId: 1000 + n };
+      const peer = await connect(runtimeId);
+      await peer.register({ runtimeId, ...lease });
+      api.mockResolvedValueOnce({ message_id: 5000 + n });
+      await peer.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: lease.threadId, text: "placeholder" }, lease);
+      peer.close();
+      await vi.waitFor(() => expect(coordinator.getRoutes().has(lease.threadId)).toBe(false));
+    }
+    const records = (coordinator as any).routeMessages as Map<number, unknown>;
+    expect(records.size).toBe(128);
+    expect(records.has(1000)).toBe(false);
+    const peer = await connect("abandoned-0");
+    const lease = { ...target, threadId: 1000 };
+    await peer.register({ runtimeId: "abandoned-0", ...lease, retainedMessageIds: [5000] });
+    api.mockResolvedValueOnce(true);
+    await expect(peer.callTelegram("deleteMessage", { chat_id: testConfig.chatId, message_id: 5000 }, lease)).rejects.toThrow("does not belong");
+  }, 30_000);
+
+  it.each(["chat", "bot", "preference"])("scopes disconnected message ownership across %s reloads", async change => {
+    const owner = await connect("reload-owner");
+    await owner.register({ runtimeId: "reload-owner", ...target });
+    vi.spyOn(coordinator.getTelegramClient(), "callApi").mockResolvedValueOnce({ message_id: 4321 });
+    await owner.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: target.threadId, text: "placeholder" }, target);
+    owner.close();
+    await vi.waitFor(() => expect(coordinator.getRoutes().has(target.threadId)).toBe(false));
+    const config = { ...testConfig,
+      ...(change === "chat" ? { chatId: -100999 } : change === "bot" ? { botToken: "replacement-token" } : { autoCloseTopics: true }),
+    };
+    await configModule.saveConfig(dir, config);
+    await coordinator.reloadConfig();
+    await vi.waitFor(() => expect((coordinator as any).botUsername).toBe("fixture_bot"));
+    const reconnected = await connect("reload-owner");
+    await reconnected.register({ runtimeId: "reload-owner", ...target });
+    const api = vi.spyOn(coordinator.getTelegramClient(), "callApi").mockResolvedValue(true);
+    const deletion = reconnected.callTelegram("deleteMessage", { chat_id: config.chatId, message_id: 4321 }, target);
+    if (change === "preference") await expect(deletion).resolves.toBe(true);
+    else {
+      await expect(deletion).rejects.toThrow("does not belong");
+      expect(api).not.toHaveBeenCalled();
+      api.mockResolvedValueOnce({ message_id: 4321 });
+      await reconnected.callTelegram("sendMessage", { chat_id: config.chatId, message_thread_id: target.threadId, text: "fresh" }, target);
+      await expect(reconnected.callTelegram("deleteMessage", { chat_id: config.chatId, message_id: 4321 }, target)).resolves.toBe(true);
+    }
+  });
+
+  it.each(["same-owner", "other-runtime", "other-session"])("isolates retained message records after disconnect: %s", async scenario => {
+    const api = vi.spyOn(coordinator.getTelegramClient(), "callApi").mockResolvedValue({ message_id: 4321 });
+    const owner = await connect("original");
+    await owner.register({ runtimeId: "original", ...target });
+    await owner.callTelegram("sendMessage", { chat_id: testConfig.chatId, message_thread_id: target.threadId, text: "placeholder" }, target);
+    owner.close();
+    await vi.waitFor(() => expect(coordinator.getRoutes().has(target.threadId)).toBe(false));
+    const runtimeId = scenario === "other-runtime" ? "replacement" : "original";
+    const nextTarget = { ...target, sessionId: scenario === "other-session" ? "replacement-session" : target.sessionId };
+    const next = await connect(runtimeId);
+    await next.register({ runtimeId, ...nextTarget });
+    api.mockClear();
+    api.mockResolvedValue(true);
+    const deletion = next.callTelegram("deleteMessage", { chat_id: testConfig.chatId, message_id: 4321 }, nextTarget);
+    if (scenario === "same-owner") {
+      await expect(deletion).resolves.toBe(true);
+      expect(api).toHaveBeenCalledOnce();
+    } else {
+      await expect(deletion).rejects.toThrow("does not belong to this route");
+      expect(api).not.toHaveBeenCalled();
+    }
   });
 
   it.each(["closeForumTopic", "reopenForumTopic"])("fences ownership, session and generation for %s", async method => {

@@ -18,6 +18,7 @@ export interface RouteEntry extends OutputTarget {
   runtimeId: string;
   dispatchInbound: (text: string, messageId: number, media?: InboundMedia | InboundMedia[], signal?: AbortSignal) => Promise<InboundResult>;
   abortRun?: () => boolean | void | Promise<boolean | void>;
+  retainedMessageIds?: number[];
 }
 
 interface MediaAlbum {
@@ -90,6 +91,7 @@ export class LeaderCoordinator {
   private reloading: Promise<void> | null = null;
   private readonly routes = new Map<number, RouteEntry>();
   private readonly routeOwners = new Map<number, net.Socket>();
+  private readonly routeMessages = new Map<number, { runtimeId: string; sessionId: string; ids: Set<number> }>();
   private readonly menus = new Map<string, SettingsMenu>();
   private callbackAnswersInFlight = 0;
   private readonly connections = new Map<net.Socket, FollowerConnection>();
@@ -97,7 +99,7 @@ export class LeaderCoordinator {
 
   constructor(private config: MuxConfig, private readonly agentDir: string, client?: TelegramClient, private readonly options: CoordinatorOptions = {}) {
     this.client = client ?? new TelegramClient({ botToken: config.botToken });
-    this.client.onRateLimit = until => this.pauseForRateLimit(until);
+    this.client.onRateLimit = (until, preserveOutput) => this.pauseForRateLimit(until, preserveOutput);
     this.inputModeRevision = config.inputModeRevision ?? 0;
     this.configuration = configFingerprint(config);
     this.feedback = new BoundedOutbox(error => this.publishStatus({ ...this.status, feedbackError: this.describeError(error) }));
@@ -110,23 +112,23 @@ export class LeaderCoordinator {
   public isRunning(): boolean { return this.running; }
   public isReloading(): boolean { return this.reloading !== null; }
 
-  private pauseForRateLimit(until: number): void {
+  private pauseForRateLimit(until: number, preserveOutput = false): void {
     if (!this.running) return;
     clearTimeout(this.rateLimitTimer);
     // Discard obsolete feedback; never replay a rejected send after cooling down.
-    if (!this.feedback.error || (this.feedback.error as { code?: string }).code === "TELEGRAM_HTTP_429") this.feedback.reset();
-    this.publishStatus({ ...this.status, rateLimitUntil: until });
+    if (!this.feedback.error || ["TELEGRAM_HTTP_429", "TELEGRAM_CLEANUP_PAUSED"].includes((this.feedback.error as { code?: string }).code ?? "")) this.feedback.reset();
+    this.publishStatus({ ...this.status, rateLimitUntil: until, rateLimitPreservesOutput: preserveOutput });
     this.rateLimitTimer = setTimeout(() => {
       this.rateLimitTimer = undefined;
       if (!this.running) return;
       if (this.client.isRateLimited()) {
-        this.pauseForRateLimit(Date.now() + this.client.getRemainingPauseMs());
+        this.pauseForRateLimit(Date.now() + this.client.getRemainingPauseMs(), this.status.rateLimitPreservesOutput);
         return;
       }
-      if ((this.feedback.error as { code?: string } | null)?.code === "TELEGRAM_HTTP_429") this.feedback.reset();
-      const status = { ...this.status, rateLimitUntil: undefined };
+      if (["TELEGRAM_HTTP_429", "TELEGRAM_CLEANUP_PAUSED"].includes((this.feedback.error as { code?: string } | null)?.code ?? "")) this.feedback.reset();
+      const status = { ...this.status, rateLimitUntil: undefined, rateLimitPreservesOutput: undefined };
       for (const key of ["error", "feedbackError", "commandMenuError", "interactionError"] as const) {
-        if (status[key]?.code === "TELEGRAM_HTTP_429") delete status[key];
+        if (["TELEGRAM_HTTP_429", "TELEGRAM_CLEANUP_PAUSED"].includes(status[key]?.code ?? "")) delete status[key];
       }
       this.publishStatus(status);
     }, Math.min(2_147_483_647, Math.max(1, until - Date.now())));
@@ -155,6 +157,12 @@ export class LeaderCoordinator {
   private claimRoute(route: RouteEntry, socket?: net.Socket): boolean {
     const existing = this.routes.get(route.threadId);
     if (existing && (existing.runtimeId !== route.runtimeId || this.routeOwners.get(route.threadId) !== socket || existing.generation > route.generation)) return false;
+    const retained = this.routeMessages.get(route.threadId);
+    if (retained && (retained.runtimeId !== route.runtimeId || retained.sessionId !== route.sessionId)) {
+      this.routeMessages.delete(route.threadId);
+    }
+    // Authenticated local peers are still isolated by route. Their retained IDs
+    // are not proof of ownership; only this Leader's send history grants deletion.
     if (existing?.sessionId === route.sessionId && existing.generation === route.generation) {
       // Preserve lease identity for ordinary registration refreshes. Queued
       // feedback also checks generation to reject navigation/configuration changes.
@@ -171,7 +179,7 @@ export class LeaderCoordinator {
   }
 
   public unregisterLocalRoute(threadId: number, runtimeId: string): void {
-    if (this.routes.get(threadId)?.runtimeId === runtimeId && !this.routeOwners.has(threadId)) this.releaseRoute(threadId);
+    if (this.routes.get(threadId)?.runtimeId === runtimeId && !this.routeOwners.has(threadId)) this.releaseRoute(threadId, true);
   }
 
   /** Bind the real endpoint first, then acquire and publish leadership exactly once. */
@@ -248,16 +256,25 @@ export class LeaderCoordinator {
     if (this.routes.get(route.threadId) === route) this.inputQueues.delete(route.threadId);
   }
 
-  private releaseRoute(threadId: number): void {
+  private releaseRoute(threadId: number, clearMessages = true): void {
     const route = this.routes.get(threadId);
     if (route) this.cancelRouteInputs(route);
     this.routes.delete(threadId);
     this.routeOwners.delete(threadId);
+    if (clearMessages) this.routeMessages.delete(threadId);
+    else {
+      // Bound abandoned leases while leaving active routes untouched. Reconnecting
+      // runtimes with evicted history must abandon cosmetic placeholder deletion.
+      const disconnected = [...this.routeMessages.keys()].filter(id => !this.routes.has(id));
+      for (const id of disconnected.slice(0, Math.max(0, disconnected.length - 128))) {
+        this.routeMessages.delete(id);
+      }
+    }
   }
 
   private removeSocketRoutes(socket: net.Socket): void {
     for (const [threadId, owner] of this.routeOwners) {
-      if (owner === socket) this.releaseRoute(threadId);
+      if (owner === socket) this.releaseRoute(threadId, false);
     }
   }
 
@@ -343,7 +360,9 @@ export class LeaderCoordinator {
     }
     if (msg.type === "release") {
       if (!state.registration || msg.runtimeId !== state.runtimeId || msg.sessionId !== state.registration.sessionId) throw new Error("Invalid route release");
-      this.removeSocketRoutes(socket);
+      for (const [threadId, owner] of this.routeOwners) {
+        if (owner === socket) this.releaseRoute(threadId, true);
+      }
       state.registrationRevision++;
       state.registration = { ...state.registration, threadId: null };
       socket.write(encodeFrame({ type: "release_ack", ok: true }));
@@ -389,6 +408,12 @@ export class LeaderCoordinator {
             !Number.isSafeInteger(reg.generation) || reg.generation < 1 ||
             (reg.threadId !== null && (!Number.isSafeInteger(reg.threadId) || reg.threadId <= 0)) ||
             (state.registration && reg.generation < state.registration.generation)) throw new Error("Invalid route registration");
+        if (reg.retainedMessageIds !== undefined) {
+          if (!Array.isArray(reg.retainedMessageIds) || reg.retainedMessageIds.length > 128 ||
+              reg.retainedMessageIds.some(id => !Number.isSafeInteger(id) || id <= 0)) {
+            throw new Error("Invalid retained message IDs in route registration");
+          }
+        }
         let ok = true;
         if (reg.threadId === null) this.removeSocketRoutes(socket);
         else {
@@ -396,6 +421,7 @@ export class LeaderCoordinator {
           ok = this.claimRoute({
             ...target,
             runtimeId: reg.runtimeId,
+            retainedMessageIds: reg.retainedMessageIds,
             dispatchInbound: (text, messageId, media, signal) => this.requestFollower(socket, {
               type: "inbound",
               requestId: "",
@@ -494,6 +520,23 @@ export class LeaderCoordinator {
           this.routeOwners.get(target.threadId) !== socket || params.message_thread_id !== target.threadId) {
         throw new Error("Forum topic target fenced");
       }
+    } else if (method === "deleteMessage") {
+      if (!Number.isSafeInteger(params.message_id) || (params.message_id as number) <= 0) {
+        throw new Error("Invalid message_id for deleteMessage");
+      }
+      const route = target ? this.routes.get(target.threadId) : undefined;
+      if (!target || !route || route.runtimeId !== runtimeId || route.sessionId !== target.sessionId || route.generation !== target.generation ||
+          this.routeOwners.get(target.threadId) !== socket) {
+        throw new Error("Output target fenced for deleteMessage");
+      }
+      const record = this.routeMessages.get(target.threadId);
+      const ids = record?.ids;
+      if (record?.runtimeId !== runtimeId || record?.sessionId !== target.sessionId || !ids?.has(params.message_id as number)) {
+        throw new Error("Message does not belong to this route or was already deleted");
+      }
+      const result = await this.client.callApi<T>(method, params, undefined, signal);
+      ids.delete(params.message_id as number);
+      return result;
     } else if (method === "setMessageReaction") {
       if (!Number.isSafeInteger(params.message_id) || (params.message_id as number) <= 0) {
         throw new Error("Invalid message_id for setMessageReaction");
@@ -507,13 +550,29 @@ export class LeaderCoordinator {
     } else if (method !== "createForumTopic" || typeof params.name !== "string" || !params.name.trim() || params.name.length > 128) {
       throw new Error("Unsupported Telegram request");
     }
-    return this.client.callApi<T>(method, params, undefined, signal);
+    const client = this.client;
+    const result = await client.callApi<T>(method, params, undefined, signal);
+    if (client === this.client && method === "sendMessage" && target && result && typeof (result as { message_id?: unknown }).message_id === "number") {
+      const route = this.routes.get(target.threadId);
+      if (!route || route.runtimeId !== runtimeId || route.sessionId !== target.sessionId || route.generation !== target.generation || this.routeOwners.get(target.threadId) !== socket) return result;
+      let ids = this.routeMessages.get(target.threadId)?.ids;
+      if (!ids) {
+        ids = new Set();
+        this.routeMessages.set(target.threadId, { runtimeId, sessionId: target.sessionId, ids });
+      }
+      if (ids.size >= 128) {
+        const oldest = ids.values().next().value!;
+        ids.delete(oldest);
+      }
+      ids.add((result as unknown as { message_id: number }).message_id);
+    }
+    return result;
   }
 
   private startPolling(): void {
     const controller = new AbortController();
     this.pollController = controller;
-    this.publishStatus({ polling: "starting", rateLimitUntil: this.status.rateLimitUntil });
+    this.publishStatus({ polling: "starting", rateLimitUntil: this.status.rateLimitUntil, rateLimitPreservesOutput: this.status.rateLimitPreservesOutput });
     this.pollingTask = this.poll(controller.signal).catch(error => {
       // Poll supervisor boundary: shutdown/reload cancellation is expected. Every
       // other failure becomes a persistent, broadcast error state; no silent retry.
@@ -1089,6 +1148,9 @@ export class LeaderCoordinator {
         if (socket !== requester) this.resetFollowerConnection(socket, state);
       }
       const sameToken = this.config.botToken === config.botToken;
+      // Telegram message IDs are scoped to a chat and bot authority. Detached
+      // follower history must not survive a change of either identity.
+      if (!sameToken || this.config.chatId !== config.chatId) this.routeMessages.clear();
       if (!sameToken) this.offset = undefined;
       // A mode save can finish while the old poller drains. For the same
       // connection, retain that newer commit instead of reinstalling the snapshot.
@@ -1105,9 +1167,9 @@ export class LeaderCoordinator {
       const remainingPause = this.client.getRemainingPauseMs();
       this.client.onRateLimit = undefined;
       this.client = client;
-      this.client.onRateLimit = until => this.pauseForRateLimit(until);
-      if (sameToken && remainingPause > 0) this.client.recordRateLimit(remainingPause / 1000);
-      else this.status = { ...this.status, rateLimitUntil: undefined };
+      this.client.onRateLimit = (until, preserveOutput) => this.pauseForRateLimit(until, preserveOutput);
+      if (sameToken && remainingPause > 0) this.client.recordRateLimit(remainingPause / 1000, this.status.rateLimitPreservesOutput);
+      else this.status = { ...this.status, rateLimitUntil: undefined, rateLimitPreservesOutput: undefined };
       this.botUsername = undefined;
       await this.options.onConfigChange?.(config);
       this.startPolling();

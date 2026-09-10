@@ -822,6 +822,6 @@ it("reports detached cleanup failures without poisoning the replacement lifecycl
   expect((c as any).pendingUpdates).toBe(0);
 });
 
-it("isolates media-capable IPC from legacy v5", () => {
-  expect(IPC_PROTOCOL_VERSION).toBe(6);
+it("isolates placeholder-capable IPC from legacy v6", () => {
+  expect(IPC_PROTOCOL_VERSION).toBe(7);
 });

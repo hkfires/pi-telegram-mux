@@ -109,7 +109,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
       expect(await f.runtime.handleInboundText("fresh task", f.ctx)).toEqual({ accepted: true, busy: false });
       await processing;
       await f.runtime.outbox.whenIdle();
-      expect(send.mock.calls.map(([, params]) => params.text)).toEqual(["fresh answer"]);
+      expect(send.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["⏳ Working...", "fresh answer"]);
     });
   });
 
@@ -238,7 +238,7 @@ describe("review regressions: origin, nonblocking FIFO and terminal messages", (
     expect((await admission).accepted).toBe(!changed);
     await f.runtime.outbox.whenIdle();
     expect(f.runtime.getIsIdle()).toBe(true);
-    expect(call.mock.calls.filter(args => args[0] === "sendMessage").map(args => args[1].text)).toEqual(changed ? [] : ["confidential answer"]);
+    expect(call.mock.calls.filter(args => args[0] === "sendMessage").map(args => args[1].text)).toEqual(changed ? [] : ["⏳ Working...", "confidential answer"]);
     if (changed) expect(call).not.toHaveBeenCalled();
   });
 

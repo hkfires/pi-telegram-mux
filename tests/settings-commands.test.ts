@@ -186,8 +186,8 @@ describe("Telegram session settings commands", () => {
       const [queuedMessage] = f.pi.sendMessage.mock.calls[0];
       f.runtime.onMessageStart({ ...queuedMessage, role: "custom" }, f.ctx);
       await f.runtime.outbox.whenIdle();
-      expect(f.runtime.callTelegram).toHaveBeenCalledWith("setMessageReaction", expect.objectContaining({
-        message_id: 101, reaction: [{ type: "emoji", emoji: "👀" }],
+      expect(f.runtime.callTelegram).toHaveBeenCalledWith("sendMessage", expect.objectContaining({
+        text: "⏳ Working...", disable_notification: true,
       }), expect.anything(), expect.anything());
       expect(f.pi.sendMessage).toHaveBeenCalledTimes(1);
       expect(f.pi.sendUserMessage).not.toHaveBeenCalled();

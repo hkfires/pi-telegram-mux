@@ -87,11 +87,13 @@ export default function (pi: ExtensionAPI) {
   let starts = 0;
   let nextMessageId = 1000;
   runtime.callTelegram = async (method, params) => {
-    if (method === "setMessageReaction") {
-      reactions.push({ messageId: params.message_id, emoji: (params.reaction as { emoji?: string }[])[0]?.emoji });
-    } else {
-      texts.push(params.text ?? "create");
+    if (method === "deleteMessage") {
+      return true as any;
     }
+    if (method === "sendMessage" && params.text === "⏳ Working...") {
+      return { message_thread_id: 50, message_id: nextMessageId++ } as any;
+    }
+    texts.push(params.text ?? "create");
     return { message_thread_id: 50, message_id: nextMessageId++ } as any;
   };
   if (reloadState) {

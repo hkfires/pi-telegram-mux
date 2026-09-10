@@ -59,6 +59,11 @@ export class RateLimitError extends TelegramApiError {
   }
 }
 
+/** The request never reached HTTP; only cosmetic cleanup started this cooldown. */
+export class CleanupPauseError extends RateLimitError {
+  override readonly code = "TELEGRAM_CLEANUP_PAUSED";
+}
+
 export class ConflictError extends TelegramApiError {
   constructor(message: string) {
     super(message, 409);
@@ -95,7 +100,8 @@ export class TelegramClient {
   private readonly apiBase: string;
   private readonly defaultTimeoutMs: number;
   private pauseUntilMs = 0;
-  public onRateLimit?: (until: number) => void;
+  private cleanupPause = false;
+  public onRateLimit?: (until: number, preserveOutput: boolean) => void;
   private readonly requests = new Set<AbortController>();
 
   public abortAll(reason?: "reload"): void {
@@ -135,10 +141,12 @@ export class TelegramClient {
   /**
    * Manually record a 429 retry_after deadline in memory.
    */
-  public recordRateLimit(retryAfterSeconds: number): void {
+  public recordRateLimit(retryAfterSeconds: number, preserveOutput = false): void {
+    // An overlapping ordinary 429 always wins, even without extending the deadline.
+    this.cleanupPause = preserveOutput && (!this.isRateLimited() || this.cleanupPause);
     const deadline = Date.now() + Math.max(1, retryAfterSeconds) * 1000;
     this.pauseUntilMs = Math.max(this.pauseUntilMs, deadline);
-    this.onRateLimit?.(this.pauseUntilMs);
+    this.onRateLimit?.(this.pauseUntilMs, this.cleanupPause);
   }
 
   /**
@@ -153,6 +161,7 @@ export class TelegramClient {
   ): Promise<T> {
     if (this.isRateLimited() && !options?.ignoreRateLimit) {
       const waitSec = Math.ceil(this.getRemainingPauseMs() / 1000);
+      if (this.cleanupPause) throw new CleanupPauseError(waitSec);
       throw new RateLimitError(waitSec);
     }
 
@@ -211,7 +220,7 @@ export class TelegramClient {
         const retryAfter = parsed.parameters?.retry_after ?? 5;
         if (!Number.isSafeInteger(retryAfter) || retryAfter <= 0) throw new TelegramDecodeError("Invalid Telegram retry_after");
         if (!options?.ignoreRateLimit) {
-          this.recordRateLimit(retryAfter);
+          this.recordRateLimit(retryAfter, method === "deleteMessage");
         }
         throw new RateLimitError(retryAfter);
       }
@@ -322,7 +331,7 @@ export class TelegramClient {
   public async sendMessage(
     chatId: number,
     text: string,
-    options?: { message_thread_id?: number; reply_markup?: TelegramInlineKeyboardMarkup },
+    options?: { message_thread_id?: number; reply_markup?: TelegramInlineKeyboardMarkup; disable_notification?: boolean },
     signal?: AbortSignal
   ): Promise<TelegramMessage> {
     const params: Record<string, unknown> = {
@@ -333,7 +342,20 @@ export class TelegramClient {
       params.message_thread_id = options.message_thread_id;
     }
     if (options?.reply_markup) params.reply_markup = options.reply_markup;
+    if (options?.disable_notification !== undefined) params.disable_notification = options.disable_notification;
     return this.callApi<TelegramMessage>("sendMessage", params, undefined, signal);
+  }
+
+  public async deleteMessage(
+    chatId: number,
+    messageId: number,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    const params: Record<string, unknown> = {
+      chat_id: chatId,
+      message_id: messageId,
+    };
+    return this.callApi<boolean>("deleteMessage", params, undefined, signal);
   }
 
   public async setMessageReaction(

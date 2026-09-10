@@ -66,7 +66,7 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("tg-disconnect", {
     description: "Disconnect current session from its Telegram Forum Topic",
     handler: async (_args, ctx) => {
-      runtime.handleTgDisconnect(ctx);
+      await runtime.handleTgDisconnect(ctx);
     },
   });
 
