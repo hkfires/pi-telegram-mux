@@ -1,25 +1,40 @@
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, MessageEndEvent } from "@earendil-works/pi-coding-agent";
 import { appendBindingEntry, resolveBindingState } from "./binding.js";
-import { configFingerprint, loadConfig, saveConfig, validateConfig } from "./config.js";
+import { getMediaDir, configFingerprint, loadConfig, saveConfig, validateConfig } from "./config.js";
 import { LeaderCoordinator } from "./coordinator.js";
 import { IpcError, IpcFollowerClient } from "./ipc.js";
 import { BoundedOutbox } from "./outbox.js";
 import { extractAssistantText, extractUserText, splitTelegramMessage } from "./render.js";
+import { IMAGE_MIME_TYPES, INPUT_ADMISSION_TIMEOUT_MS, MAX_INPUT_WORK, MEDIA_QUEUE_BUDGET_BYTES, MEDIA_READ_TIMEOUT_MS } from "./media.js";
 import { MarkdownWorker } from "./markdown-worker.js";
 import { TelegramClient, validateBotAndChat } from "./telegram.js";
-import type { BindingState, BusyInputMode, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic, TelegramMessage } from "./types.js";
+import type { BindingState, BusyInputMode, InboundMedia, InboundResult, MuxConfig, OutputTarget, RuntimeRegistration, TelegramForumTopic, TelegramMessage } from "./types.js";
 
 // Pi cannot cancel setModel(). Keep its safety barrier across extension reloads, but never
 // await it during shutdown: quitting the Pi process is the safe recovery for a hung provider.
 const modelChangesKey = Symbol.for("pi-telegram-mux.pending-model-changes.v1");
 const inputModeChangesKey = Symbol.for("pi-telegram-mux.pending-input-mode-changes.v1");
+const mediaWorkKey = Symbol.for("pi-telegram-mux.media-work.v1");
+const admissionsKey = Symbol.for("pi-telegram-mux.mobile-admissions.v1");
+const inputOriginKey = Symbol.for("pi-telegram-mux.input-origin.v1");
 const processState = globalThis as typeof globalThis & {
+  [mediaWorkKey]?: Set<symbol>;
+  [admissionsKey]?: Set<Admission>;
+  [inputOriginKey]?: AsyncLocalStorage<Admission>;
   [modelChangesKey]?: Map<string, Promise<boolean>>;
   [inputModeChangesKey]?: Map<string, Set<Promise<InboundResult>>>;
 };
+// Unknown work survives extension reload: cancellation cannot manufacture free
+// capacity while the OS or Pi still retains it.
+const mediaWork = processState[mediaWorkKey] ??= new Set<symbol>();
+const mobileAdmissions = processState[admissionsKey] ??= new Set<Admission>();
+// Pi may resume an old input hook through newly loaded lifecycle handlers.
+// Share provenance (not cancellation controllers); never disable it on shutdown.
+const inputOrigin = processState[inputOriginKey] ??= new AsyncLocalStorage<Admission>();
 const pendingModelChanges = processState[modelChangesKey] ??= new Map<string, Promise<boolean>>();
 const pendingInputModeChanges = processState[inputModeChangesKey] ??= new Map<string, Set<Promise<InboundResult>>>();
 const SETTINGS_PENDING_NOTICE = "A Telegram model change is still pending. Wait for it to finish, or quit and restart Pi if it is stuck. /reload cannot cancel it.";
@@ -90,9 +105,14 @@ interface Admission {
   generation: number;
   config: MuxConfig | null;
   consumed: boolean;
+  started?: boolean;
+  rejected?: boolean;
+  discardUserMessage?: boolean;
+  signal: AbortSignal;
   messageId?: number;
   resolve?: (result: InboundResult) => void;
   timer: NodeJS.Timeout;
+  detach?: () => void;
 }
 
 interface MirrorRun {
@@ -149,11 +169,13 @@ export class MuxRuntime {
   private currentRun: MirrorRun | null = null;
   private cleanupTask: Promise<void> | null = null;
   private pendingInput?: Admission;
-  private readonly queuedInputs = new Map<string, { run: MirrorRun; messageId?: number }>();
+  private mediaReading?: AbortSignal;
+  private inputCancellation = new AbortController();
+  private readonly queuedInputs = new Map<string, { run: MirrorRun; messageId?: number; mediaBytes?: number }>();
   private settingsCommandInFlight = false;
   private inputModeCommandInFlight = false;
   private inputModeRevision = 0;
-  private readonly inputOrigin = new AsyncLocalStorage<Admission>();
+  private readonly inputOrigin = inputOrigin;
   public readonly outbox: BoundedOutbox;
   private readonly markdownWorker = new MarkdownWorker();
 
@@ -318,7 +340,7 @@ export class MuxRuntime {
               await this.registerRoute(ctx);
             }
           },
-          onStatusChange: () => { if (this.active && version === this.transportVersion) this.updateStatusBar(); },
+          onStatusChange: () => { if (this.active && version === this.transportVersion) this.transportStatusChanged(); },
         });
         try {
           const result = await candidate.start();
@@ -331,7 +353,7 @@ export class MuxRuntime {
             const client = new IpcFollowerClient(result.port, result.capability, this.runtimeId);
             let modeConflict: { mode: BusyInputMode; revision: number } | undefined;
             this.followerClient = client;
-            client.setStatusHandler(() => { if (this.active && version === this.transportVersion) this.updateStatusBar(ctx); });
+            client.setStatusHandler(() => { if (this.active && version === this.transportVersion) this.transportStatusChanged(ctx); });
             client.setInputModeHandler((mode, revision) => {
               if ((mode !== "followUp" && mode !== "steer") || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) return;
               if (revision === this.getInputModeRevision() && mode !== (this.config?.inputMode ?? "followUp")) {
@@ -353,12 +375,14 @@ export class MuxRuntime {
                 this.pendingInput.config.inputModeRevision = revision;
               }
             });
-            client.setInboundHandler(msg => {
+            client.setInboundHandler((msg, signal) => {
               if (!this.isTargetCurrent(msg.target, ctx) || msg.fromId !== this.config?.allowedUserId) return Promise.resolve({ accepted: false, busy: true });
-              return this.handleInboundText(msg.text, ctx, msg.messageId, msg.mode);
+              return this.handleInboundText(msg.text, ctx, msg.messageId, msg.mode, msg.media, signal);
             });
             client.setAbortHandler(target => {
-              if (!this.isTargetCurrent(target, ctx) || !ctx.abort) return false;
+              if (!this.isTargetCurrent(target, ctx)) return false;
+              this.cancelInput();
+              if (!ctx.abort) return false;
               ctx.abort();
               return true;
             });
@@ -498,8 +522,14 @@ export class MuxRuntime {
       const target: OutputTarget = { sessionId, threadId, generation: this.generation };
       const ok = this.coordinator.registerLocalRoute({
         ...target, runtimeId: this.runtimeId,
-        dispatchInbound: (text, messageId) => this.isTargetCurrent(target, ctx) ? this.handleInboundText(text, ctx, messageId, this.coordinator?.getInputMode() ?? this.config?.inputMode ?? "followUp") : Promise.resolve({ accepted: false, busy: true }),
-        abortRun: () => { if (!this.isTargetCurrent(target, ctx) || !ctx.abort) return false; ctx.abort(); return true; },
+        dispatchInbound: (text, messageId, media, signal) => this.isTargetCurrent(target, ctx) ? this.handleInboundText(text, ctx, messageId, this.coordinator?.getInputMode() ?? this.config?.inputMode ?? "followUp", media, signal) : Promise.resolve({ accepted: false, busy: true }),
+        abortRun: () => {
+          if (!this.isTargetCurrent(target, ctx)) return false;
+          this.cancelInput();
+          if (!ctx.abort) return false;
+          ctx.abort();
+          return true;
+        },
       });
       if (!ok) ctx.ui?.notify("This topic is already occupied by another Pi instance. Please close duplicate sessions before reconnecting.", "warning");
       if (ok) this.registeredTarget = target;
@@ -536,61 +566,183 @@ export class MuxRuntime {
     throw new Error("No active transport to Telegram Leader");
   }
 
-  public async handleInboundText(text: string, ctx: ExtensionContext, messageId?: number, explicitMode?: BusyInputMode): Promise<InboundResult> {
+  public async handleInboundText(text: string, ctx: ExtensionContext, messageId?: number, explicitMode?: BusyInputMode, media?: InboundMedia | InboundMedia[], upstreamSignal?: AbortSignal): Promise<InboundResult> {
+    // Residual I/O is counted until physical completion, even after reconnect.
+    // Paths are borrowed from the creator. Runtime rejection or completion must
+    // never delete files that Pi may retain in history or queued input.
+    if (media && mediaWork.size + mobileAdmissions.size >= MAX_INPUT_WORK) return { accepted: false, busy: true };
+    const reservation = media ? Symbol() : undefined;
+    if (reservation) mediaWork.add(reservation);
+    try { return await this.processInboundText(text, ctx, messageId, explicitMode, media, upstreamSignal); }
+    finally { if (reservation) mediaWork.delete(reservation); }
+  }
+
+  private async processInboundText(text: string, ctx: ExtensionContext, messageId?: number, explicitMode?: BusyInputMode, media?: InboundMedia | InboundMedia[], upstreamSignal?: AbortSignal): Promise<InboundResult> {
+    const polling = (this.coordinator?.getStatus() ?? this.followerClient?.getStatus())?.polling;
+    if (polling === "error" || polling === "conflict") return { accepted: false, busy: false, statusReply: "Telegram transport has stopped. Reconnect before submitting input." };
+    const inputReference = crypto.randomUUID();
+    const generation = this.generation;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const config = this.config;
+    const inputSignal = upstreamSignal ? AbortSignal.any([upstreamSignal, this.inputCancellation.signal]) : this.inputCancellation.signal;
+    const images = media ? Array.isArray(media) ? media : [media] : [];
+    if (media) {
+      if (!images.length || images.length > 10 || images.some(image => !image || typeof image.path !== "string" || !IMAGE_MIME_TYPES.has(image.mimeType))) {
+        return { accepted: false, busy: false, statusReply: "Invalid image cache reference or unsupported format." };
+      }
+      try {
+        const cache = await fs.stat(await fs.realpath(getMediaDir(this.agentDir)), { bigint: true });
+        for (const image of images) {
+          const parent = await fs.stat(await fs.realpath(path.dirname(path.resolve(image.path))), { bigint: true });
+          if (!parent.isDirectory() || parent.dev !== cache.dev || parent.ino !== cache.ino) {
+            return { accepted: false, busy: false, statusReply: "Invalid image cache reference or unsupported format." };
+          }
+        }
+      } catch {
+        // Validation can finish after cancellation. Keep a redacted diagnostic
+        // even when its safe rejection can no longer be returned to Telegram.
+        console.error(`[pi-telegram-mux] MEDIA_VALIDATION_FAILED: reference ${inputReference}`);
+        // Input boundary: missing/inaccessible cache directories cannot produce a partial prompt.
+        return { accepted: false, busy: false, statusReply: "Failed to validate image cache on local machine." };
+      }
+    }
+    if (inputSignal.aborted) return { accepted: false, busy: false, statusReply: "Input cancelled." };
     if (this.rateLimitUntil > Date.now()) return { accepted: false, busy: true };
-    if (!this.active || this.configuring || this.getIsReconnecting() || this.bindingState !== "bound") return Promise.resolve({ accepted: false, busy: true });
-    if (this.outbox.error) return Promise.resolve({ accepted: false, busy: false, statusReply: "Telegram sync is paused. Please check errors on your computer and run /tg-connect to retry." });
+    if (!this.active || this.configuring || this.getIsReconnecting() || this.bindingState !== "bound") {
+      return Promise.resolve({ accepted: false, busy: true });
+    }
+    if (this.outbox.error) {
+      return Promise.resolve({ accepted: false, busy: false, statusReply: "Telegram sync is paused. Please check errors on your computer and run /tg-connect to retry." });
+    }
     const trimmed = text.trim();
-    if (!trimmed || trimmed.length > 4096) return Promise.resolve({ accepted: false, busy: true });
-    const settingsCommand = /^\/(model|thinking|inputmode)(?:@[a-z\d_]+)?(?:\s+([\s\S]*))?$/i.exec(trimmed);
-    if (settingsCommand) {
-      const commandName = settingsCommand[1].toLowerCase();
-      const commandArgs = settingsCommand[2]?.trim() ?? "";
-      if (this.settingsCommandInFlight || this.inputModeCommandInFlight || this.hasPendingModelChange(ctx) ||
-        (commandName !== "inputmode" && this.pendingInput)) {
-        return Promise.resolve({ accepted: false, busy: true });
+    if (!media && (!trimmed || trimmed.length > 4096)) return Promise.resolve({ accepted: false, busy: true });
+    if (media && trimmed.length > 4096) return Promise.resolve({ accepted: false, busy: true });
+    if (!media) {
+      const settingsCommand = /^\/(model|thinking|inputmode)(?:@[a-z\d_]+)?(?:\s+([\s\S]*))?$/i.exec(trimmed);
+      if (settingsCommand) {
+        const commandName = settingsCommand[1].toLowerCase();
+        const commandArgs = settingsCommand[2]?.trim() ?? "";
+        if (this.settingsCommandInFlight || this.inputModeCommandInFlight || this.hasPendingModelChange(ctx) ||
+          (commandName !== "inputmode" && this.pendingInput)) {
+          return Promise.resolve({ accepted: false, busy: true });
+        }
+        const reference = crypto.randomUUID();
+        const task = this.handleSettingsCommand(commandName, commandArgs, ctx, reference);
+        if (commandName === "inputmode") {
+          const pending = pendingInputModeChanges.get(this.agentDir) ?? new Set<Promise<InboundResult>>();
+          pendingInputModeChanges.set(this.agentDir, pending);
+          pending.add(task);
+          const clear = () => {
+            pending.delete(task);
+            if (!pending.size && pendingInputModeChanges.get(this.agentDir) === pending) pendingInputModeChanges.delete(this.agentDir);
+          };
+          void task.then(clear, clear);
+        }
+        let timer: NodeJS.Timeout;
+        const deadline = new Promise<InboundResult>(resolve => {
+          const notice = commandName === "inputmode" ? INPUT_MODE_PENDING_NOTICE : SETTINGS_PENDING_NOTICE;
+          timer = setTimeout(() => resolve({ accepted: false, busy: false, statusReply: `Settings update result unknown (reference ${reference}). Do not resend automatically. ${notice}` }), 2000);
+        });
+        // A slow provider or model-select hook must not block the bot-wide poller.
+        // Keep the settings reservation until the actual operation settles, even on timeout.
+        return Promise.race([task, deadline]).finally(() => clearTimeout(timer));
       }
-      const reference = crypto.randomUUID();
-      const task = this.handleSettingsCommand(commandName, commandArgs, ctx, reference);
-      if (commandName === "inputmode") {
-        const pending = pendingInputModeChanges.get(this.agentDir) ?? new Set<Promise<InboundResult>>();
-        pendingInputModeChanges.set(this.agentDir, pending);
-        pending.add(task);
-        const clear = () => {
-          pending.delete(task);
-          if (!pending.size && pendingInputModeChanges.get(this.agentDir) === pending) pendingInputModeChanges.delete(this.agentDir);
-        };
-        void task.then(clear, clear);
-      }
-      let timer: NodeJS.Timeout;
-      const deadline = new Promise<InboundResult>(resolve => {
-        const notice = commandName === "inputmode" ? INPUT_MODE_PENDING_NOTICE : SETTINGS_PENDING_NOTICE;
-        timer = setTimeout(() => resolve({ accepted: false, busy: false, statusReply: `Settings update result unknown (reference ${reference}). Do not resend automatically. ${notice}` }), 2000);
-      });
-      // A slow provider or model-select hook must not block the bot-wide poller.
-      // Keep the settings reservation until the actual operation settles, even on timeout.
-      return Promise.race([task, deadline]).finally(() => clearTimeout(timer));
     }
     if (this.settingsCommandInFlight || this.inputModeCommandInFlight || this.hasPendingModelChange(ctx) || this.pendingInput) {
       return Promise.resolve({ accepted: false, busy: true });
     }
+    if (media && ctx.model?.input && Array.isArray(ctx.model.input) && !ctx.model.input.includes("image")) {
+      return {
+        accepted: false,
+        busy: false,
+        statusReply: "The current model does not support image input. Please use /model to switch to a vision-capable model.",
+      };
+    }
+
+    let promptPayload: string | Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>;
+    let mediaBytes = 0;
+    if (media) {
+      if (this.mediaReading && !this.mediaReading.aborted) return { accepted: false, busy: true };
+      this.mediaReading = inputSignal;
+      try {
+        const stats = await Promise.all(images.map(image => fs.lstat(image.path)));
+        if (stats.some(stat => !stat.isFile())) throw new Error("Image cache is not a regular file");
+        const queuedBytes = [...this.queuedInputs.values()].reduce((sum, input) => sum + (input.mediaBytes ?? 0), 0);
+        mediaBytes = stats.reduce((sum, stat) => sum + Math.ceil(stat.size / 3) * 4, 0);
+        // Never reject an input solely for its size. Large inputs wait for an empty
+        // media queue, and pause further image admission until they are consumed.
+        if (queuedBytes > 0 && queuedBytes + mediaBytes > MEDIA_QUEUE_BUDGET_BYTES) {
+          return { accepted: false, busy: true };
+        }
+        // Keep labels in the text block so Pi can display attachments even without inline graphics.
+        const labels = images.map((_, index) => `[Image#${index + 1}]`).join(" ");
+        promptPayload = [{ type: "text", text: trimmed ? `${labels}\n\n${trimmed}` : labels }];
+        const readSignal = AbortSignal.any([inputSignal, AbortSignal.timeout(MEDIA_READ_TIMEOUT_MS)]);
+        for (let index = 0; index < images.length; index++) {
+          readSignal.throwIfAborted();
+          const buffer = await fs.readFile(images[index].path, { signal: readSignal });
+          if (buffer.length !== stats[index].size) throw new Error("Image cache changed during reading");
+          promptPayload.push({ type: "image", data: buffer.toString("base64"), mimeType: images[index].mimeType });
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException | null)?.code;
+        if (code !== "ABORT_ERR" && !(error instanceof DOMException && error.name === "AbortError")) {
+          console.error(`[pi-telegram-mux] MEDIA_READ_FAILED: reference ${inputReference}`);
+        }
+        // Input boundary: failed cache reads cannot submit a partial text-only task.
+        return { accepted: false, busy: false, statusReply: "Failed to read image cache on local machine." };
+      } finally {
+        if (this.mediaReading === inputSignal) this.mediaReading = undefined;
+      }
+    } else {
+      promptPayload = trimmed;
+    }
+
+    // /stop can arrive through either the local route or IPC while image I/O is pending.
+    if (inputSignal.aborted) return { accepted: false, busy: false, statusReply: "Input cancelled by /stop." };
+    // Image I/O must not grant authority to a replacement session or configuration.
+    if (media && (generation !== this.generation || sessionId !== ctx.sessionManager.getSessionId() ||
+        !this.isConfigCompatible(config) || !this.active || this.configuring || this.getIsReconnecting() ||
+        this.bindingState !== "bound" || this.outbox.error || this.rateLimitUntil > Date.now() || this.pendingInput ||
+        this.settingsCommandInFlight || this.inputModeCommandInFlight || this.hasPendingModelChange(ctx))) {
+      return { accepted: false, busy: true };
+    }
+    if (media && !ctx.model?.input?.includes("image")) {
+      return { accepted: false, busy: false, statusReply: "Select a vision-capable model with /model before sending images." };
+    }
     if (this.isIdle && ctx.isIdle()) {
+      if (mobileAdmissions.size >= MAX_INPUT_WORK) return { accepted: false, busy: true };
       // Reserve admission synchronously. Pi's void return is not an execution ACK.
       return new Promise(resolve => {
         const timer = setTimeout(() => {
+          if (this.pendingInput !== admission) return;
           // An ACK deadline cannot cancel Pi's asynchronous input hooks. Keep the
           // reservation until a real admission event, even after reporting uncertainty.
           this.finishInput({ accepted: false, busy: false, statusReply: "Task admission result unknown. Mobile input has been paused; please check local session and do not resend automatically. If unconfirmed, restart this Pi instance." }, false);
-        }, 2000);
-        const admission: Admission = { sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, consumed: false, messageId, resolve, timer };
+        }, INPUT_ADMISSION_TIMEOUT_MS);
+        const admission: Admission = { sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, consumed: false, signal: inputSignal, messageId, resolve, timer };
         this.pendingInput = admission;
+        mobileAdmissions.add(admission);
+        const cancelled = () => {
+          if (!admission.started && this.currentRun?.origin === admission) {
+            this.currentRun.suppressed = true;
+            this.currentRun.settle();
+            this.currentRun = null;
+            this.isIdle = true;
+          }
+          if (this.pendingInput === admission) this.finishInput({ accepted: false, busy: false, statusReply: "Input cancelled." });
+        };
+        admission.detach = () => inputSignal.removeEventListener("abort", cancelled);
+        inputSignal.addEventListener("abort", cancelled, { once: true });
+        if (inputSignal.aborted) { mobileAdmissions.delete(admission); cancelled(); return; }
         // Async context survives Pi's awaited input transformations. Neither origin
         // nor authority is inferred from mutable prompt text or a global pending slot.
-        try { this.inputOrigin.run(admission, () => this.pi.sendUserMessage(trimmed, { expandPromptTemplates: false })); }
+        try { this.inputOrigin.run(admission, () => this.pi.sendUserMessage(promptPayload, { expandPromptTemplates: false })); }
         catch (error) {
+          mobileAdmissions.delete(admission);
           // The public void API can reject synchronously (e.g. stale session API).
           // Translate that rejection at the inbound boundary, never claim acceptance.
-          this.finishInput({ accepted: false, busy: false, statusReply: "Pi rejected the task. Please check local errors." });
+          if (this.pendingInput === admission) this.finishInput({ accepted: false, busy: false, statusReply: "Pi rejected the task. Please check local errors." });
           ctx.ui?.notify(`Telegram input failed: ${error instanceof Error ? error.message : String(error)}`, "error");
         }
       });
@@ -599,7 +751,7 @@ export class MuxRuntime {
       if (this.queuedInputs.size >= MAX_QUEUED_INPUTS) return { accepted: false, busy: true };
       const mode: BusyInputMode = explicitMode ?? this.config?.inputMode ?? "followUp";
       const deliveryId = crypto.randomUUID();
-      this.queuedInputs.set(deliveryId, { run: this.currentRun, messageId });
+      this.queuedInputs.set(deliveryId, { run: this.currentRun, messageId, mediaBytes });
       try {
         // In Pi 0.85 an active run queues custom messages synchronously, before
         // any await. Keep the idle check and send together: sendUserMessage's
@@ -608,7 +760,7 @@ export class MuxRuntime {
         // model-visible text or guessing provenance from transformed input.
         this.pi.sendMessage({
           customType: TELEGRAM_INPUT_TYPE,
-          content: trimmed,
+          content: promptPayload,
           display: true,
           details: { runtimeId: this.runtimeId, deliveryId },
         }, { triggerTurn: true, deliverAs: mode });
@@ -792,18 +944,57 @@ export class MuxRuntime {
     return { accepted, busy: false, statusReply: reply, ...(menu ? { menu } : {}), ...(inputModeResult ? { inputMode: inputModeResult, inputModeRevision: this.inputModeRevision } : {}) };
   }
 
+  private transportStatusChanged(ctx?: ExtensionContext): void {
+    const polling = (this.coordinator?.getStatus() ?? this.followerClient?.getStatus())?.polling;
+    // A completed/unknown IPC admission may no longer have an active RPC slot.
+    // Terminal status also revokes those mobile origins, without aborting local work.
+    if (polling === "error" || polling === "conflict") this.cancelInput();
+    this.updateStatusBar(ctx);
+  }
+
+  private cancelInput(): void {
+    // Pi's void submission API can still be inside async hooks with no active run.
+    // Keep the aborted signal on its admission even after releasing the reservation.
+    this.inputCancellation.abort();
+    this.inputCancellation = new AbortController();
+    this.mediaReading = undefined;
+    this.finishInput({ accepted: false, busy: false, statusReply: "Input cancelled." });
+  }
+
+  public onAgentStart(ctx: ExtensionContext): void {
+    // input may have run before another extension's slow hook. Only agent_start
+    // guarantees that ctx.abort() has an active Pi abort controller to cancel.
+    const origin = this.inputOrigin.getStore();
+    if (origin) { origin.started = true; mobileAdmissions.delete(origin); }
+    if (origin && (origin.signal.aborted || origin.rejected)) {
+      if (this.currentRun?.origin === origin) this.currentRun.suppressed = true;
+      ctx.abort();
+    }
+  }
+
   private finishInput(result: InboundResult, release = true): void {
     const pending = this.pendingInput;
     if (!pending) return;
-    if (release) this.pendingInput = undefined;
+    if (release) { this.pendingInput = undefined; pending.detach?.(); }
     clearTimeout(pending.timer);
     pending.resolve?.(result);
     pending.resolve = undefined;
   }
 
   public onMessageStart(message: unknown, ctx: ExtensionContext): void {
+    if (!message || typeof message !== "object" || !("role" in message)) return;
+    const origin = this.inputOrigin.getStore();
+    if (message.role === "user" && origin && !origin.consumed && (origin.signal.aborted || origin.rejected)) {
+      // Pi still emits/persists the user message after agent_start aborts. Remove
+      // its payload at message_end, before it becomes durable provider context.
+      origin.consumed = true;
+      origin.discardUserMessage = true;
+      mobileAdmissions.delete(origin);
+      if (this.pendingInput === origin) this.finishInput({ accepted: false, busy: false, statusReply: "Input cancelled." });
+      return;
+    }
     const run = this.currentRun;
-    if (!run || !message || typeof message !== "object" || !("role" in message)) return;
+    if (!run || (origin && (origin.signal.aborted || origin.rejected) && run.origin !== origin)) return;
     if (message.role === "assistant") { run.text = ""; run.stopReason = undefined; run.replyQueued = false; return; }
     let queued: { run: MirrorRun; messageId?: number } | undefined;
     if (message.role === "custom" && "customType" in message && message.customType === TELEGRAM_INPUT_TYPE) {
@@ -833,6 +1024,7 @@ export class MuxRuntime {
       run.firstUserMessage = false;
       if (run.origin) {
         run.origin.consumed = true;
+        mobileAdmissions.delete(run.origin);
         if (this.pendingInput === run.origin) this.finishInput({ accepted: !run.suppressed, busy: false });
         return;
       }
@@ -951,6 +1143,14 @@ export class MuxRuntime {
 
   public async onBeforeAgentStart(eventOrCtx: { prompt?: string } | ExtensionContext, maybeCtx?: ExtensionContext): Promise<void> {
     const ctx = maybeCtx ?? eventOrCtx as ExtensionContext;
+    const origin = this.inputOrigin.getStore();
+    if (origin && (origin.signal.aborted || origin.rejected || origin.generation !== this.generation ||
+        origin.sessionId !== ctx.sessionManager.getSessionId() || !this.isConfigCompatible(origin.config))) {
+      // A delayed pre-start hook can resume while a replacement task is active.
+      // It owns neither the active run nor its idle flag, reactions or settlement.
+      origin.rejected = true;
+      return;
+    }
     this.activeCtx = ctx;
     this.isIdle = false;
     const oldRun = this.currentRun;
@@ -965,7 +1165,6 @@ export class MuxRuntime {
         }
       });
     }
-    const origin = this.inputOrigin.getStore();
     let settle!: () => void;
     const settled = new Promise<void>(resolve => { settle = resolve; });
     const promptMessageIds: number[] = [];
@@ -976,7 +1175,7 @@ export class MuxRuntime {
     const run: MirrorRun = {
       sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, ctx,
       target: null, origin: origin?.consumed ? undefined : origin, promptMessageIds,
-      suppressed: this.rateLimitUntil > Date.now() || this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
+      suppressed: this.rateLimitUntil > Date.now() || this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.signal.aborted || origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
       firstUserMessage: true, text: "", settled, settle,
     };
     this.currentRun = run;
@@ -1036,8 +1235,16 @@ export class MuxRuntime {
       this.isConfigCompatible(run.config) && run.sessionId === run.ctx.sessionManager.getSessionId();
   }
 
-  public onMessageEnd(message: unknown): void {
+  public onMessageEnd(message: unknown): { message: MessageEndEvent["message"] } | undefined {
+    const origin = this.inputOrigin.getStore();
+    if (origin?.discardUserMessage && message && typeof message === "object" && "role" in message && message.role === "user") {
+      origin.discardUserMessage = false;
+      // The public replacement hook updates Pi's agent state AND session record.
+      // Never copy cancelled text/images or extension-added fields into the tombstone.
+      return { message: { role: "user", content: "[Telegram input cancelled before execution.]", timestamp: (message as MessageEndEvent["message"]).timestamp } };
+    }
     const run = this.currentRun;
+    if (origin && (origin.signal.aborted || origin.rejected) && run?.origin !== origin) return;
     if (!run || !this.isRunCurrent(run) || !message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") return;
     // Always replace capture, including empty error/abort messages. Tool commentary
     // and streaming partials are never substituted for a failed terminal answer.
@@ -1049,6 +1256,8 @@ export class MuxRuntime {
 
   public onTurnEnd(message: unknown): void {
     const run = this.currentRun;
+    const origin = this.inputOrigin.getStore();
+    if (origin && (origin.signal.aborted || origin.rejected) && run?.origin !== origin) return;
     if (!run || run.replyQueued || !this.isRunCurrent(run) || !message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") return;
     // Pi has applied message_end replacements and persisted the assistant by now.
     // Deliver returned text even at the output limit. Tool commentary stays local,
@@ -1064,6 +1273,11 @@ export class MuxRuntime {
   }
 
   public async onAgentSettled(ctx: ExtensionContext): Promise<void> {
+    const origin = this.inputOrigin.getStore();
+    // Pi also emits settlement when a late prompt loses its concurrent-start
+    // race. Release only that admission; do not settle the surviving active run.
+    if (origin) mobileAdmissions.delete(origin);
+    if (origin && (origin.signal.aborted || origin.rejected) && this.currentRun?.origin !== origin) return;
     this.activeCtx = ctx;
     this.isIdle = true;
     const run = this.currentRun;
@@ -1212,12 +1426,16 @@ export class MuxRuntime {
 
   private invalidateRun(): void {
     this.generation++;
+    // Detach stale cache I/O; its finalizer cannot release a newer read reservation.
+    this.inputCancellation.abort();
+    this.inputCancellation = new AbortController();
+    this.mediaReading = undefined;
     this.rateLimitReopenTask = null;
     this.currentRun?.settle();
     this.currentRun = null;
     this.queuedInputs.clear();
     this.outbox.reset();
-    this.finishInput({ accepted: false, busy: false, statusReply: "Session changed; execution result unknown. Please check local status." }, false);
+    this.finishInput({ accepted: false, busy: false, statusReply: "Session changed; execution result unknown. Please check local status." });
   }
 
   private cleanupRunReactions(): Promise<void> | null {
@@ -1253,6 +1471,8 @@ export class MuxRuntime {
   }
 
   public onInput(ctx: ExtensionContext, interactiveText?: string): { action: "handled" } | undefined | Promise<{ action: "handled" } | undefined> {
+    const cancelledOrigin = this.inputOrigin.getStore();
+    if (cancelledOrigin?.signal.aborted) { mobileAdmissions.delete(cancelledOrigin); return { action: "handled" }; }
     // This only fences settings already in progress. Pi exposes no terminal input-preflight
     // event for downstream handled/failed inputs, so a full bidirectional lock needs SDK support.
     if (!this.settingsCommandInFlight && !this.hasPendingModelChange(ctx)) return undefined;

@@ -6,7 +6,10 @@ import { expect, it } from "vitest";
 import { saveConfig } from "../../src/config.js";
 import { testConfig } from "../helpers.js";
 
-it.each(["transformed", "config", "follow-up", "length-follow-up", "reconnect", "busy-follow-up-model", "busy-steer-model", "busy-concurrent-input-gate"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
+it.each([
+  ...["image", "text"].flatMap(kind => ["before", "after"].map(stage => `overlap-${kind}-${stage}`)),
+  ...["image", "text"].flatMap(kind => ["before-check", "after-check", "shutdown", "timeout"].map(stage => `reload-${kind}-${stage}`)),
+  "terminal-admission", "terminal-admission-unknown", "stop-input-before", "stop-input-after", "stop-start", "album", "transformed", "config", "follow-up", "length-follow-up", "reconnect", "busy-follow-up-model", "busy-steer-model", "busy-concurrent-input-gate"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-pi-lifecycle-"));
   let child: ChildProcess | undefined;
   try {
@@ -57,6 +60,9 @@ it.each(["transformed", "config", "follow-up", "length-follow-up", "reconnect", 
               child!.stdin!.write(JSON.stringify({ type: "extension_ui_response", id: message.id, value: reply.value, cancelled: reply.cancelled }) + "\n");
             }
             if (message.type === "extension_ui_request" && message.method === "notify" && message.message.startsWith('{"type":"mux_review_result"')) message = JSON.parse(message.message);
+            // Pi's void submission API reports the rejected obsolete start via
+            // this stable event. It must remain visible, not terminate the live run.
+            if (scenario.startsWith("overlap-") && message.type === "extension_error" && message.event === "send_user_message" && message.extensionPath === "<runtime>") continue;
             if (message.type === "extension_error" || (message.type === "response" && message.success === false)) throw new Error(JSON.stringify(message));
             if (message.type === "mux_review_result") { clearTimeout(timer); resolve(message); }
           } catch (error) {
@@ -73,8 +79,49 @@ it.each(["transformed", "config", "follow-up", "length-follow-up", "reconnect", 
     expect(result.error).toBeUndefined();
     expect(setupReplyIndex).toBe(scenario === "config" ? setupReplies.length : 0);
     expect(result.idle).toBe(true);
-    expect(result.starts).toBe(1);
-    if (scenario === "busy-concurrent-input-gate") {
+    if (scenario.startsWith("overlap-")) {
+      expect(result.keptRun).toBe(true);
+      expect(result.prematureIdle).toBe(false);
+      expect(result.providerStillPending).toBe(true);
+      expect(result.modelInputs).toEqual([["surviving task"]]);
+      expect(result.modelImageCounts).toEqual([0]);
+      expect(result.texts).toEqual(["answer 1"]);
+      expect(messages.filter((message: any) => message.type === "extension_error")).toHaveLength(1);
+      return;
+    }
+    if (scenario.startsWith("reload-")) {
+      expect(result.loads).toBe(2);
+      expect(result.cancelled).toBe(true);
+      expect(result.retainedBeforeResume).toBe(true);
+      expect(result.cancelledProviderCalls).toBe(0);
+      expect(result.isolated).toBe(true);
+      expect(result.freshAccepted).toBe(true);
+      expect(result.providerCalls).toBe(2);
+      expect(JSON.stringify(result.providerMessages)).not.toContain("cancelled image");
+      expect(JSON.stringify(result.providerMessages)).not.toContain("cancelled text");
+      expect(result.providerMessages.flatMap((messages: any[]) => messages).flatMap((message: any) => Array.isArray(message.content) ? message.content : []).filter((part: any) => part.type === "image")).toEqual([]);
+      expect(result.records).toBe(0);
+      return;
+    }
+    expect(result.starts).toBe(scenario.startsWith("stop-") ? (scenario === "stop-input-before" ? 1 : 2) : 1);
+    if (scenario.startsWith("stop-")) {
+      expect(result.cancelledProviderCalls).toBe(0);
+      expect(result.freshAccepted).toBe(true);
+      expect(result.modelImageCounts).toEqual([0]);
+      expect(JSON.stringify(result.modelInputs)).not.toContain("Compare these images");
+      expect(result.modelInputs[0].at(-1)).toBe("fresh after stop");
+      expect(result.texts).toEqual(["answer 1"]);
+      expect(result.feedback).toContain("Abort signal sent.");
+    } else if (scenario.startsWith("terminal-")) {
+      expect(result.modelInputs).toEqual([]);
+      expect(result.modelImageCounts).toEqual([]);
+      expect(result.texts).toEqual([]);
+    } else if (scenario === "album") {
+      expect(result.received).toEqual(["[Image#1] [Image#2]\n\nCompare these images"]);
+      expect(result.modelInputs).toEqual([["[Image#1] [Image#2]\n\nCompare these images"]]);
+      expect(result.modelImageCounts).toEqual([2]);
+      expect(result.texts).toEqual(["answer 1"]);
+    } else if (scenario === "busy-concurrent-input-gate") {
       expect(result.inputWaited).toBe(false);
       expect(result.admitted).toHaveLength(2);
       expect(result.admitted.every((admission: { accepted: boolean }) => admission.accepted)).toBe(true);

@@ -73,7 +73,7 @@ export interface TransportStatus {
   interactionError?: { code: string; message: string };
 }
 
-export const IPC_PROTOCOL_VERSION = 5;
+export const IPC_PROTOCOL_VERSION = 6;
 
 /**
  * Leader lock metadata stored in {agentDir}/pi-telegram-mux/runtime/leader.json
@@ -112,6 +112,35 @@ export interface TelegramMessageEntity {
   language?: string;
 }
 
+export interface TelegramPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
+export interface TelegramDocument {
+  file_id: string;
+  file_unique_id: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+}
+
+export interface TelegramFile {
+  file_id: string;
+  file_unique_id: string;
+  file_size?: number;
+  file_path?: string;
+}
+
+export interface InboundMedia {
+  path: string;
+  mimeType: string;
+  fileName?: string;
+}
+
 export interface TelegramMessage {
   message_id: number;
   message_thread_id?: number;
@@ -119,6 +148,10 @@ export interface TelegramMessage {
   chat: TelegramChat;
   date: number;
   text?: string;
+  caption?: string;
+  media_group_id?: string;
+  photo?: TelegramPhotoSize[];
+  document?: TelegramDocument;
 }
 
 export interface TelegramInlineKeyboardMarkup {
@@ -173,8 +206,11 @@ export type IpcMessage =
   | { type: "register_ack"; callId?: string; ok: boolean; error?: string }
   | { type: "release"; runtimeId: string; sessionId: string }
   | { type: "release_ack"; ok: boolean }
-  | { type: "inbound"; requestId: string; messageId: number; target: OutputTarget; fromId: number; text: string; mode?: BusyInputMode }
+  | { type: "inbound"; requestId: string; messageId: number; target: OutputTarget; fromId: number; text: string; mode?: BusyInputMode; media?: InboundMedia | InboundMedia[] }
   | ({ type: "inbound_ack"; requestId: string } & InboundResult)
+  // cancel_input revokes one input's submission rights; it never stops a local run.
+  | { type: "cancel_input"; requestId: string }
+  | { type: "cancel_input_ack"; requestId: string; ok: boolean }
   | { type: "abort"; requestId: string; target: OutputTarget }
   | { type: "abort_ack"; requestId: string; ok: boolean }
   | { type: "reload_config"; callId: string }

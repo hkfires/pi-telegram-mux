@@ -79,13 +79,13 @@ export default function (pi: ExtensionAPI): void {
     await runtime.onBeforeAgentStart(event, ctx);
   });
 
+  pi.on("agent_start", (_event, ctx) => runtime.onAgentStart(ctx));
+
   pi.on("message_start", async (event, ctx) => {
     runtime.onMessageStart(event.message, ctx);
   });
 
-  pi.on("message_end", async (event) => {
-    runtime.onMessageEnd(event.message);
-  });
+  pi.on("message_end", (event) => runtime.onMessageEnd(event.message));
 
   pi.on("turn_end", (event) => {
     runtime.onTurnEnd(event.message);

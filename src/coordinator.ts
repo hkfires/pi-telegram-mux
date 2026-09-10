@@ -1,16 +1,39 @@
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as net from "node:net";
+import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { configFingerprint, loadConfig } from "./config.js";
+import { cleanupStaleMedia, configFingerprint, ensureMediaDir, loadConfig } from "./config.js";
 import { encodeFrame, FrameParser, tryAcquireLeaderLock } from "./ipc.js";
+import { IMAGE_MIME_TYPES, INPUT_CLEANUP_NOTICE_MS, MAX_INPUT_WORK, MEDIA_IPC_TIMEOUT_MS, removeMedia } from "./media.js";
 import { BoundedOutbox } from "./outbox.js";
 import { ConflictError, isRecoverableTelegramError, RateLimitError, TelegramApiError, TelegramClient } from "./telegram.js";
-import { IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundResult, type IpcMessage, type MuxConfig, type OutputTarget, type RuntimeRegistration, type TelegramUpdate, type TransportStatus } from "./types.js";
+import { IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundMedia, type InboundResult, type IpcMessage, type MuxConfig, type OutputTarget, type RuntimeRegistration, type TelegramMessage, type TelegramUpdate, type TransportStatus } from "./types.js";
+
+const inputWorkKey = Symbol.for("pi-telegram-mux.coordinator-input-work.v1");
+const workState = globalThis as typeof globalThis & { [inputWorkKey]?: Set<Promise<void>> };
+const physicalInputWork = workState[inputWorkKey] ??= new Set<Promise<void>>();
 
 export interface RouteEntry extends OutputTarget {
   runtimeId: string;
-  dispatchInbound: (text: string, messageId: number) => Promise<InboundResult>;
+  dispatchInbound: (text: string, messageId: number, media?: InboundMedia | InboundMedia[], signal?: AbortSignal) => Promise<InboundResult>;
   abortRun?: () => boolean | void | Promise<boolean | void>;
+}
+
+interface MediaAlbum {
+  messages: TelegramMessage[];
+  route: RouteEntry;
+  generation: number;
+  client: TelegramClient;
+  inputSignal: AbortSignal;
+  ready: Promise<void>;
+  finish: () => void;
+  timer?: NodeJS.Timeout;
+  deadline: number;
+  sealed: boolean;
+  rejected?: string;
+  lateNoticeSent?: boolean;
+  work?: Promise<void>;
 }
 
 interface SettingsMenu {
@@ -31,6 +54,7 @@ interface FollowerConnection {
 
 export interface CoordinatorOptions {
   requestTimeoutMs?: number;
+  albumDelayMs?: number;
   onConfigChange?: (config: MuxConfig) => void | Promise<void>;
   onStatusChange?: () => void;
 }
@@ -42,6 +66,15 @@ export class LeaderCoordinator {
   private server: net.Server | null = null;
   private releaseLock?: () => Promise<void>;
   private running = false;
+  private readonly albums = new Map<string, MediaAlbum>();
+  private readonly rejectedAlbums = new Set<string>();
+  private readonly inputQueues = new Map<number, Promise<void>>();
+  private readonly inputWork = new Set<Promise<void>>();
+  private readonly topicInputs = new WeakMap<RouteEntry, AbortController>();
+  private pendingUpdates = 0;
+  private nextOverloadNoticeAt = 0;
+  private mediaCleanupTimer?: NodeJS.Timeout;
+  private mediaCleanupTask?: Promise<void>;
   private capability = "";
   private configuration: string;
   private epoch = 0;
@@ -60,7 +93,7 @@ export class LeaderCoordinator {
   private readonly menus = new Map<string, SettingsMenu>();
   private callbackAnswersInFlight = 0;
   private readonly connections = new Map<net.Socket, FollowerConnection>();
-  private readonly pending = new Map<string, { socket: net.Socket; resolve: (value: InboundResult | boolean) => void; timer: NodeJS.Timeout; kind: "inbound" | "abort" }>();
+  private readonly pending = new Map<string, { socket: net.Socket; resolve: (value: InboundResult | boolean) => void; timer: NodeJS.Timeout; kind: "inbound" | "abort"; detach?: () => void; cancelRequested?: boolean; cancelConfirmed?: boolean }>();
 
   constructor(private config: MuxConfig, private readonly agentDir: string, client?: TelegramClient, private readonly options: CoordinatorOptions = {}) {
     this.client = client ?? new TelegramClient({ botToken: config.botToken });
@@ -122,7 +155,7 @@ export class LeaderCoordinator {
   private claimRoute(route: RouteEntry, socket?: net.Socket): boolean {
     const existing = this.routes.get(route.threadId);
     if (existing && (existing.runtimeId !== route.runtimeId || this.routeOwners.get(route.threadId) !== socket || existing.generation > route.generation)) return false;
-    if (existing?.sessionId === route.sessionId) {
+    if (existing?.sessionId === route.sessionId && existing.generation === route.generation) {
       // Preserve lease identity for ordinary registration refreshes. Queued
       // feedback also checks generation to reject navigation/configuration changes.
       Object.assign(existing, route);
@@ -130,10 +163,7 @@ export class LeaderCoordinator {
     }
     // A Runtime can own only one Topic, including when it explicitly rebinds.
     for (const [threadId, current] of this.routes) {
-      if (current.runtimeId === route.runtimeId && this.routeOwners.get(threadId) === socket) {
-        this.routes.delete(threadId);
-        this.routeOwners.delete(threadId);
-      }
+      if (current.runtimeId === route.runtimeId && this.routeOwners.get(threadId) === socket) this.releaseRoute(threadId);
     }
     this.routes.set(route.threadId, route);
     if (socket) this.routeOwners.set(route.threadId, socket);
@@ -141,7 +171,7 @@ export class LeaderCoordinator {
   }
 
   public unregisterLocalRoute(threadId: number, runtimeId: string): void {
-    if (this.routes.get(threadId)?.runtimeId === runtimeId && !this.routeOwners.has(threadId)) this.routes.delete(threadId);
+    if (this.routes.get(threadId)?.runtimeId === runtimeId && !this.routeOwners.has(threadId)) this.releaseRoute(threadId);
   }
 
   /** Bind the real endpoint first, then acquire and publish leadership exactly once. */
@@ -166,6 +196,16 @@ export class LeaderCoordinator {
       this.capability = result.lockData.capability;
       this.epoch = result.lockData.epoch;
       this.running = true;
+      const cleanup = () => {
+        if (this.mediaCleanupTask) return;
+        // Maintenance boundary: expose failures without stopping unrelated sessions.
+        this.mediaCleanupTask = cleanupStaleMedia(this.agentDir).catch(error => {
+          this.publishStatus({ ...this.status, feedbackError: { code: "MEDIA_CLEANUP_FAILED", message: this.describeError(error).message } });
+        }).finally(() => { this.mediaCleanupTask = undefined; });
+      };
+      cleanup();
+      this.mediaCleanupTimer = setInterval(cleanup, 60_000);
+      this.mediaCleanupTimer.unref();
       this.startPolling();
       return { leader: true, port, capability: this.capability, epoch: this.epoch };
     } catch (err) {
@@ -201,12 +241,23 @@ export class LeaderCoordinator {
     });
   }
 
+  private cancelRouteInputs(route: RouteEntry): void {
+    this.topicInputs.get(route)?.abort();
+    this.topicInputs.delete(route);
+    // Only the current lease may detach the thread's waiting tail.
+    if (this.routes.get(route.threadId) === route) this.inputQueues.delete(route.threadId);
+  }
+
+  private releaseRoute(threadId: number): void {
+    const route = this.routes.get(threadId);
+    if (route) this.cancelRouteInputs(route);
+    this.routes.delete(threadId);
+    this.routeOwners.delete(threadId);
+  }
+
   private removeSocketRoutes(socket: net.Socket): void {
     for (const [threadId, owner] of this.routeOwners) {
-      if (owner === socket) {
-        this.routes.delete(threadId);
-        this.routeOwners.delete(threadId);
-      }
+      if (owner === socket) this.releaseRoute(threadId);
     }
   }
 
@@ -239,11 +290,25 @@ export class LeaderCoordinator {
       return;
     }
 
+    if (msg.type === "cancel_input_ack") {
+      if (typeof msg.requestId !== "string" || !msg.requestId || msg.requestId.length > 128 || typeof msg.ok !== "boolean") throw new Error("Invalid input cancellation acknowledgement");
+      const pending = this.pending.get(msg.requestId);
+      if (pending?.socket === socket && pending.kind === "inbound" && pending.cancelRequested && !pending.cancelConfirmed && msg.ok) {
+        pending.cancelConfirmed = true;
+        clearTimeout(pending.timer);
+        // Submission rights are revoked, not I/O completion. Retain the request
+        // and its capacity until inbound_ack/close, without killing a healthy peer.
+        pending.timer = setTimeout(() => console.error(`[pi-telegram-mux] INPUT_CLEANUP_PENDING: request ${msg.requestId}`), INPUT_CLEANUP_NOTICE_MS);
+        pending.timer.unref();
+      }
+      return;
+    }
     if (msg.type === "inbound_ack" || msg.type === "abort_ack") {
       const pending = this.pending.get(msg.requestId);
       if (pending?.socket === socket && (msg.type === "inbound_ack" ? pending.kind === "inbound" : pending.kind === "abort")) {
         this.pending.delete(msg.requestId);
         clearTimeout(pending.timer);
+        pending.detach?.();
         if (msg.type === "abort_ack") {
           pending.resolve(msg.ok === true);
           return;
@@ -256,7 +321,7 @@ export class LeaderCoordinator {
           inputMode: msg.inputMode === "steer" || msg.inputMode === "followUp" ? msg.inputMode : undefined,
           inputModeRevision: typeof msg.inputModeRevision === "number" ? msg.inputModeRevision : undefined,
         };
-        if (result.inputMode) {
+        if (result.inputMode && !pending.cancelRequested) {
           this.updateInputMode(result.inputMode, socket, result.inputModeRevision);
         }
         pending.resolve(result);
@@ -331,7 +396,7 @@ export class LeaderCoordinator {
           ok = this.claimRoute({
             ...target,
             runtimeId: reg.runtimeId,
-            dispatchInbound: (text, messageId) => this.requestFollower(socket, {
+            dispatchInbound: (text, messageId, media, signal) => this.requestFollower(socket, {
               type: "inbound",
               requestId: "",
               messageId,
@@ -339,7 +404,8 @@ export class LeaderCoordinator {
               fromId: this.config.allowedUserId,
               text,
               mode: this.config.inputMode ?? "followUp",
-            }) as Promise<InboundResult>,
+              media,
+            }, signal) as Promise<InboundResult>,
             abortRun: () => this.requestFollower(socket, { type: "abort", requestId: "", target }) as Promise<boolean>,
           }, socket);
         }
@@ -373,14 +439,27 @@ export class LeaderCoordinator {
     }
   }
 
-  private requestFollower(socket: net.Socket, msg: Extract<IpcMessage, { type: "inbound" | "abort" }>): Promise<InboundResult | boolean> {
+  private requestFollower(socket: net.Socket, msg: Extract<IpcMessage, { type: "inbound" | "abort" }>, signal?: AbortSignal): Promise<InboundResult | boolean> {
     const unavailable = msg.type === "abort" ? false : { accepted: false, busy: false, statusReply: "Execution result unknown. Please check local session; do not resend automatically." };
-    if (socket.destroyed || socket.writableEnded || this.pending.size >= 128) return Promise.resolve(unavailable);
+    if (signal?.aborted || socket.destroyed || socket.writableEnded || this.pending.size >= 128) return Promise.resolve(unavailable);
     const requestId = crypto.randomUUID();
+    const timeoutMs = this.options.requestTimeoutMs ?? (msg.type === "inbound" && msg.media ? MEDIA_IPC_TIMEOUT_MS : 5000);
     return new Promise(resolve => {
-      const timer = setTimeout(() => { this.pending.delete(requestId); resolve(unavailable); socket.destroy(); }, this.options.requestTimeoutMs ?? 5000);
-      this.pending.set(requestId, { socket, resolve, timer, kind: msg.type });
+      const cancel = () => {
+        const pending = this.pending.get(requestId);
+        if (!pending || pending.cancelRequested) return;
+        pending.cancelRequested = true;
+        if (!socket.destroyed && !socket.writableEnded) socket.write(encodeFrame({ type: "cancel_input", requestId }));
+      };
+      const detach = () => signal?.removeEventListener("abort", cancel);
+      const timer = setTimeout(() => {
+        if (this.pending.get(requestId)?.cancelRequested) console.error(`[pi-telegram-mux] INPUT_CANCEL_UNCONFIRMED: request ${requestId}; execution result unknown`);
+        detach(); this.pending.delete(requestId); resolve(unavailable); socket.destroy();
+      }, timeoutMs);
+      this.pending.set(requestId, { socket, resolve, timer, kind: msg.type, detach });
       socket.write(encodeFrame({ ...msg, requestId }));
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
     });
   }
 
@@ -388,6 +467,7 @@ export class LeaderCoordinator {
     for (const [id, pending] of this.pending) {
       if (!socket || pending.socket === socket) {
         clearTimeout(pending.timer);
+        pending.detach?.();
         this.pending.delete(id);
         pending.resolve(pending.kind === "abort" ? false : { accepted: false, busy: false, statusReply: "Execution result unknown. Please check local session; do not resend automatically." });
       }
@@ -438,6 +518,10 @@ export class LeaderCoordinator {
       // Poll supervisor boundary: shutdown/reload cancellation is expected. Every
       // other failure becomes a persistent, broadcast error state; no silent retry.
       if (controller.signal.aborted) return;
+      // A terminal poll failure removes the Telegram stop channel. Fence pending
+      // inputs and release their queue reservations before publishing the failure.
+      controller.abort();
+      for (const route of this.routes.values()) this.cancelRouteInputs(route);
       this.publishStatus({ ...this.status, polling: error instanceof ConflictError ? "conflict" : "error", error: this.describeError(error) });
     });
   }
@@ -480,7 +564,8 @@ export class LeaderCoordinator {
         for (const update of updates) {
           if (signal.aborted || !this.running) return;
           this.offset = update.update_id + 1;
-          await this.processUpdate(update);
+          // Admission is bounded and per-topic ordered; downloads never block polling /stop.
+          void this.processUpdate(update);
         }
       } catch (error) {
         // Only known transient polling failures are recoverable. Decoding errors,
@@ -495,39 +580,318 @@ export class LeaderCoordinator {
   }
 
   public async processUpdate(update: TelegramUpdate): Promise<void> {
+    if (!this.running || this.reloading || this.pollController?.signal.aborted) return;
+    const query = update.callback_query;
+    const msg = query ? undefined : update.message;
+    // Authenticate both update variants before reserving shared input capacity.
+    if (query) {
+      if (!query.message || query.message.chat.id !== this.config.chatId ||
+          query.from?.id !== this.config.allowedUserId || query.from.is_bot) return;
+    } else if (!msg || msg.chat.id !== this.config.chatId || msg.from?.id !== this.config.allowedUserId || msg.from.is_bot) return;
+    const thread = msg?.message_thread_id;
+    const route = thread === undefined ? undefined : this.routes.get(thread);
+    const albumKey = msg?.media_group_id ? JSON.stringify([msg.chat.id, thread, msg.from!.id, msg.media_group_id]) : undefined;
+    if (albumKey && this.rejectedAlbums.has(albumKey)) return;
+    // Never let queued input acquire a destination that did not exist at admission.
+    if (msg && !route) {
+      if (albumKey) {
+        if (this.rejectedAlbums.size >= 128) this.rejectedAlbums.delete(this.rejectedAlbums.values().next().value!);
+        this.rejectedAlbums.add(albumKey);
+      }
+      return;
+    }
+    const generation = route?.generation;
+    const client = this.client;
+    const signal = this.pollController?.signal;
+    if (albumKey) {
+      const existing = this.albums.get(albumKey);
+      if (existing) {
+        if (existing.client !== client || existing.inputSignal.aborted || existing.route !== route || existing.generation !== generation) return;
+        if (existing.messages.some(item => item.message_id === msg!.message_id)) return;
+        if (existing.sealed) {
+          // Telegram has no album-complete event. Never silently split a late member into another task.
+          if (!existing.lateNoticeSent) {
+            existing.lateNoticeSent = true;
+            this.enqueueSettingsFeedback(route!, generation!, "An album image arrived after collection finished and was not submitted. Check the earlier task before resending the album.");
+          }
+          return;
+        }
+        if (existing.messages.length >= 10) {
+          existing.rejected = "Albums are limited to 10 images; no images were submitted.";
+          existing.finish();
+        } else {
+          existing.messages.push(msg!);
+          clearTimeout(existing.timer);
+          existing.timer = setTimeout(existing.finish, Math.max(0, Math.min(this.options.albumDelayMs ?? 1000, existing.deadline - performance.now())));
+        }
+        return existing.work;
+      }
+    }
+    const bypass = !msg || (!msg.photo && !msg.document && /^\/(stop|status)(?:@[a-z\d_]+)?(?:\s|$)/i.test(msg.text?.trim() ?? ""));
+    if (this.pendingUpdates >= (bypass ? 32 : 16) || (!bypass && physicalInputWork.size >= MAX_INPUT_WORK)) {
+      // A rejected first member rejects the album, even if capacity recovers before later members.
+      if (albumKey) {
+        if (this.rejectedAlbums.size >= 128) this.rejectedAlbums.delete(this.rejectedAlbums.values().next().value!);
+        this.rejectedAlbums.add(albumKey);
+      }
+      // Coalesce overload notices globally; optional feedback must not exhaust the outbox.
+      const now = performance.now();
+      if (route && now >= this.nextOverloadNoticeAt && this.feedback.size === 0 && !this.feedback.error) {
+        this.nextOverloadNoticeAt = now + 5000;
+        this.enqueueSettingsFeedback(route, route.generation, "Input queue is full. Please try again later.");
+      }
+      return;
+    }
+    let inputSignal: AbortSignal | undefined;
+    if (route && !bypass) {
+      let controller = this.topicInputs.get(route);
+      if (!controller) {
+        controller = new AbortController();
+        this.topicInputs.set(route, controller);
+      }
+      inputSignal = controller.signal;
+    }
+    let album: MediaAlbum | undefined;
+    if (albumKey && msg && route && inputSignal) {
+      // Pending albums consume ordinary input capacity; completed IDs retain no message content.
+      while (this.albums.size >= 128) {
+        const oldest = [...this.albums].find(([, value]) => value.sealed && !value.work);
+        if (!oldest) break;
+        this.albums.delete(oldest[0]);
+      }
+      let settle!: () => void;
+      const ready = new Promise<void>(resolve => { settle = resolve; });
+      const collectionSignal = signal ? AbortSignal.any([signal, inputSignal]) : inputSignal;
+      album = { messages: [msg], route, generation: generation!, client, inputSignal, ready,
+        deadline: performance.now() + 5000, sealed: false, finish: () => {
+          if (album!.sealed) return;
+          album!.sealed = true;
+          clearTimeout(album!.timer);
+          collectionSignal.removeEventListener("abort", album!.finish);
+          settle();
+        } };
+      this.albums.set(albumKey, album);
+      collectionSignal.addEventListener("abort", album.finish, { once: true });
+      album.timer = setTimeout(album.finish, this.options.albumDelayMs ?? 1000);
+    }
+    this.pendingUpdates++;
+    const previous = !bypass && thread !== undefined ? this.inputQueues.get(thread) : undefined;
+    const cancellation = inputSignal && signal ? AbortSignal.any([inputSignal, signal]) : inputSignal ?? signal;
+    let cancel!: () => void;
+    const cancelled = new Promise<void>(resolve => { cancel = resolve; });
+    cancellation?.addEventListener("abort", cancel, { once: true });
+    if (cancellation?.aborted) cancel();
+    const operation = (async () => {
+      if (previous) await previous;
+      if (album) await album.ready;
+      if (inputSignal?.aborted || client !== this.client || signal?.aborted || (route && (this.routes.get(thread!) !== route || route.generation !== generation))) return;
+      if (album?.rejected) {
+        this.enqueueSettingsFeedback(route!, generation!, album.rejected);
+        return;
+      }
+      await this.processUpdateNow(update, route, inputSignal, album?.messages);
+    })().catch(error => {
+      // Command/input boundary: abort and cleanup failures must not terminate the poller.
+      if (!this.running || client !== this.client || cancellation?.aborted) {
+        // Detached cleanup still has an observable failure boundary, but cannot
+        // poison the replacement transport or report success for stale work.
+        console.error("[pi-telegram-mux] INPUT_CLEANUP_FAILED:", this.describeError(error));
+        return;
+      }
+      this.publishStatus({ ...this.status, feedbackError: this.describeError(error) });
+      if (route) this.enqueueSettingsFeedback(route, generation!, "Operation failed; execution result unknown. Check local Pi errors before retrying.");
+    });
+    this.inputWork.add(operation);
+    physicalInputWork.add(operation);
+    const residualDeadline = setTimeout(() => console.error(`[pi-telegram-mux] INPUT_WORK_PENDING: update ${update.update_id}`), INPUT_CLEANUP_NOTICE_MS);
+    residualDeadline.unref();
+    void operation.then(() => { clearTimeout(residualDeadline); this.inputWork.delete(operation); physicalInputWork.delete(operation); });
+    // Cancellation releases capacity and topic ordering without waiting for OS
+    // I/O. The detached operation still owns cleanup and is fenced before dispatch.
+    const work = Promise.race([operation, cancelled]).finally(() => {
+      cancellation?.removeEventListener("abort", cancel);
+      this.pendingUpdates--;
+      if (album) { album.messages = []; album.work = undefined; }
+      if (thread !== undefined && this.inputQueues.get(thread) === work) this.inputQueues.delete(thread);
+    });
+    if (album) album.work = work;
+    if (!bypass && thread !== undefined) this.inputQueues.set(thread, work);
+    await work;
+  }
+
+  private async processUpdateNow(update: TelegramUpdate, admittedRoute?: RouteEntry, inputSignal?: AbortSignal, albumMessages?: TelegramMessage[]): Promise<void> {
     if (update.callback_query) return this.processSettingsCallback(update.callback_query);
-    const msg = update.message;
+    const messages = albumMessages ? [...albumMessages].sort((a, b) => a.message_id - b.message_id) : update.message ? [update.message] : [];
+    const msg = messages[0];
     if (!this.running || this.reloading || !msg || msg.chat.id !== this.config.chatId || msg.message_thread_id === undefined ||
-        msg.from?.id !== this.config.allowedUserId || msg.from.is_bot || typeof msg.text !== "string" || !msg.text.trim() || msg.text.length > 4096) return;
-    const route = this.routes.get(msg.message_thread_id);
-    if (!route) return;
-    const text = msg.text.trim();
-    const command = /^\/([a-z\d_]+)(?:@([a-z\d_]+))?(?:\s|$)/i.exec(text);
-    if (command?.[2] && command[2].toLowerCase() !== this.botUsername) return;
-    const name = command?.[1].toLowerCase();
+        msg.from?.id !== this.config.allowedUserId || msg.from.is_bot) return;
+
+    const hasPhoto = Array.isArray(msg.photo) && msg.photo.length > 0;
+    const hasDocImage = Boolean(msg.document && typeof msg.document.mime_type === "string" && msg.document.mime_type.startsWith("image/"));
+    const hasImage = hasPhoto || hasDocImage || albumMessages !== undefined;
+    const rawText = albumMessages ? messages.map(item => item.caption?.trim() ?? "").filter(Boolean).join("\n\n")
+      : (typeof msg.text === "string" ? msg.text : hasImage && typeof msg.caption === "string" ? msg.caption : "").trim();
+
+    if (!hasImage && (!rawText || rawText.length > 4096)) return;
+    if (hasImage && rawText.length > 4096) {
+      if (admittedRoute) this.enqueueSettingsFeedback(admittedRoute, admittedRoute.generation, "Image captions exceed 4096 characters; no images were submitted.");
+      return;
+    }
+
+    const route = admittedRoute;
+    if (!route || this.routes.get(msg.message_thread_id) !== route) return;
     const generation = route.generation;
+    const sessionId = route.sessionId;
+    const client = this.client;
+    const pollSignal = this.pollController?.signal;
+    const signal = inputSignal && pollSignal ? AbortSignal.any([inputSignal, pollSignal]) : inputSignal ?? pollSignal;
+    const dispatch = route.dispatchInbound;
+    if (hasImage && messages.some(item => !(item.photo?.length) && !IMAGE_MIME_TYPES.has(item.document?.mime_type ?? ""))) {
+      this.enqueueSettingsFeedback(route, generation, "Unsupported image format. Send JPEG, PNG, GIF or WebP.");
+      return;
+    }
+
+    if (!hasImage) {
+      const command = /^\/([a-z\d_]+)(?:@([a-z\d_]+))?(?:\s|$)/i.exec(rawText);
+      if (command?.[2] && command[2].toLowerCase() !== this.botUsername) return;
+      const name = command?.[1].toLowerCase();
+      if (name === "status") {
+        this.enqueueSettingsFeedback(route, generation, `Topic: Online\nSession: ${route.sessionId.slice(-6)}\nRoute: Active`);
+        return;
+      }
+      if (name === "stop") {
+        // Invalidate queued work synchronously, even if aborting the active Pi run fails.
+        this.cancelRouteInputs(route);
+        const stopped = route.abortRun ? (await route.abortRun()) !== false : false;
+        const reply = stopped ? "Abort signal sent." : "Could not confirm abort; please check local session.";
+        this.enqueueSettingsFeedback(route, generation, reply);
+        return;
+      }
+    }
+
+    const mediaItems: InboundMedia[] = [];
+    const downloadedPaths = new Set<string>();
+    let mediaHandedOff = false;
+
+    try {
+    if (hasImage) {
+      try {
+        for (const imageMessage of messages) {
+        if (signal?.aborted || client !== this.client) return;
+        let fileId: string;
+        let mimeType = "image/jpeg";
+        let fileName: string | undefined;
+
+        if (imageMessage.photo?.length) {
+          const photo = imageMessage.photo[imageMessage.photo.length - 1];
+          fileId = photo.file_id;
+        } else {
+          fileId = imageMessage.document!.file_id;
+          mimeType = imageMessage.document!.mime_type!;
+          fileName = imageMessage.document!.file_name;
+        }
+
+        const fileInfo = await client.getFile(fileId, signal);
+        if (!fileInfo.file_path) throw new Error("Telegram file_path is missing");
+
+        const buffer = await client.downloadFile(fileInfo.file_path, signal);
+        const mediaDir = await ensureMediaDir(this.agentDir);
+        const ext = mimeType === "image/png" ? ".png" : mimeType === "image/webp" ? ".webp" : mimeType === "image/gif" ? ".gif" : ".jpg";
+        const downloadedPath = path.resolve(mediaDir, `${crypto.randomUUID()}${ext}`);
+        const stagingPath = `${downloadedPath}.part`;
+        // Own the path only after exclusive creation succeeds. A failed open
+        // must never make cleanup delete an existing file belonging to someone else.
+        const file = await fs.open(stagingPath, "wx", 0o600);
+        downloadedPaths.add(stagingPath);
+        try { await file.writeFile(buffer); }
+        finally { await file.close(); }
+        mediaItems.push({ path: downloadedPath, mimeType, fileName });
+        }
+        if (!this.running || this.reloading || signal?.aborted || client !== this.client ||
+            this.routes.get(msg.message_thread_id) !== route || route.generation !== generation || route.sessionId !== sessionId) return;
+        // Publish complete images at their final, stable paths before handing
+        // out references. Until then the creator still owns whole-album cleanup.
+        for (const media of mediaItems) {
+          // The exclusively created sibling .part file reserves this random
+          // basename against other mux writers until publication finishes.
+          try {
+            await fs.lstat(media.path);
+            throw Object.assign(new Error("Image cache destination already exists"), { code: "EEXIST" });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+          const stagingPath = `${media.path}.part`;
+          await fs.rename(stagingPath, media.path);
+          downloadedPaths.delete(stagingPath);
+          downloadedPaths.add(media.path);
+        }
+        if (this.running && !signal?.aborted && client === this.client && this.status.interactionError?.code === "MEDIA_DOWNLOAD_FAILED") {
+          this.publishStatus({ ...this.status, interactionError: undefined });
+        }
+      } catch (error) {
+        // Download boundary: no task has been submitted; report a definite failure.
+        if (!this.running || signal?.aborted || client !== this.client) {
+          const code = (error as { code?: string } | null)?.code;
+          if (code !== "TELEGRAM_ABORTED" && code !== "TELEGRAM_RELOADING") {
+            console.error(`[pi-telegram-mux] MEDIA_DOWNLOAD_FAILED: update ${update.update_id}`, this.describeError(error));
+          }
+          return;
+        }
+        const fileRefused = error instanceof TelegramApiError && (error.errorCode === 400 || error.errorCode === 404);
+        if (fileRefused || isRecoverableTelegramError(error)) {
+          // Download boundary: file-level 400/404 refusals and transient failures submitted no task.
+          // Authentication and malformed-protocol failures must still signal a shared operational error.
+          const failure = this.describeError(error);
+          this.publishStatus({ ...this.status, interactionError: { code: "MEDIA_DOWNLOAD_FAILED", message: `Image download failed (${failure.code}); no task was submitted.` } });
+        } else {
+          // Unexpected decoding/I/O failures remain visible as operational errors.
+          this.publishStatus({ ...this.status, feedbackError: this.describeError(error) });
+        }
+        this.enqueueSettingsFeedback(route, generation, "Failed to download image from Telegram. Please check network and try again.");
+        return;
+      }
+    }
+
     let reply: string | undefined;
     let menu: InboundResult["menu"];
     try {
-      if (name === "status") reply = `Topic: Online\nSession: ${route.sessionId.slice(-6)}\nRoute: Active`;
-      else if (name === "stop") {
-        const stopped = route.abortRun ? (await route.abortRun()) !== false : false;
-        reply = stopped ? "Abort signal sent." : "Could not confirm abort; please check local session.";
-      } else {
-        const result = await route.dispatchInbound(text, msg.message_id);
-        if (result.inputMode) {
-          this.updateInputMode(result.inputMode, undefined, result.inputModeRevision);
-        }
-        reply = result.busy ? "Current session is busy. Please try again later." : result.statusReply;
-        menu = result.busy ? undefined : result.menu;
+      if (!this.running || this.reloading || signal?.aborted || client !== this.client ||
+          this.routes.get(msg.message_thread_id) !== route || route.generation !== generation || route.sessionId !== sessionId) return;
+      // Like native clipboard images, handed-off files outlive the operation.
+      // A rejection, timeout or lost acknowledgement cannot prove that a path
+      // is no longer referenced; never make retention depend on an execution ACK.
+      mediaHandedOff = mediaItems.length > 0;
+      const result = await dispatch(rawText, msg.message_id, mediaItems.length > 1 ? mediaItems : mediaItems[0], signal);
+      if (!this.running || this.reloading || signal?.aborted || client !== this.client ||
+          this.routes.get(msg.message_thread_id) !== route || route.generation !== generation || route.sessionId !== sessionId) return;
+      if (result.inputMode) {
+        this.updateInputMode(result.inputMode, undefined, result.inputModeRevision);
       }
+      reply = result.busy ? "Current session is busy. Please try again later." : result.statusReply;
+      menu = result.busy ? undefined : result.menu;
     } catch (error) {
       // Inbound dispatch boundary: execution may already have started. Return an
       // explicit unknown result, expose the failure, and never resubmit the input.
+      if (!this.running || this.reloading || signal?.aborted || client !== this.client ||
+          this.routes.get(msg.message_thread_id) !== route || route.generation !== generation || route.sessionId !== sessionId) return;
       this.publishStatus({ ...this.status, feedbackError: this.describeError(error) });
       reply = "Execution result unknown. Please check local Pi errors; do not resend automatically.";
     }
     if (reply) this.enqueueSettingsFeedback(route, generation, reply, menu);
+    } finally {
+      // Only the creator cleans files that never reached the handoff boundary.
+      // No consumer, run finalizer or maintenance sweep owns completed images.
+      if (!mediaHandedOff && downloadedPaths.size) {
+        try { await removeMedia([...downloadedPaths]); }
+        catch (error) {
+          // Cache ownership boundary: deletion failure is operationally significant even after reload.
+          if (this.running && client === this.client && !signal?.aborted) {
+            this.publishStatus({ ...this.status, feedbackError: { code: "MEDIA_CLEANUP_FAILED", message: "Temporary image deletion failed; check local media directory permissions." } });
+          } else console.error("[pi-telegram-mux] MEDIA_CLEANUP_FAILED: temporary image deletion failed after transport shutdown/reset.");
+          throw error;
+        }
+      }
+    }
   }
 
   private async processSettingsCallback(query: NonNullable<TelegramUpdate["callback_query"]>): Promise<void> {
@@ -716,8 +1080,7 @@ export class LeaderCoordinator {
       this.settlePending();
       await this.pollingTask;
       if (!this.running) throw new Error("Coordinator stopped during configuration update");
-      this.routes.clear();
-      this.routeOwners.clear();
+      for (const threadId of this.routes.keys()) this.releaseRoute(threadId);
       this.menus.clear();
       // Authentication can finish while the old poller is draining. Reset those
       // peers too, before publishing the new configuration without another await.
@@ -755,6 +1118,10 @@ export class LeaderCoordinator {
   public stop(): Promise<void> {
     if (this.stopping) return this.stopping;
     this.running = false;
+    for (const album of this.albums.values()) album.finish();
+    this.albums.clear();
+    this.rejectedAlbums.clear();
+    clearInterval(this.mediaCleanupTimer);
     clearTimeout(this.rateLimitTimer);
     this.rateLimitTimer = undefined;
     this.client.onRateLimit = undefined;
@@ -763,11 +1130,18 @@ export class LeaderCoordinator {
     this.client.abortAll();
     this.settlePending();
     for (const [socket, state] of this.connections) { clearTimeout(state.authTimer); socket.destroy(); }
-    this.routes.clear();
-    this.routeOwners.clear();
+    for (const threadId of this.routes.keys()) this.releaseRoute(threadId);
     this.menus.clear();
     this.stopping = (async () => {
       await this.pollingTask;
+      // File I/O cannot always be cancelled by the OS. Late input is fenced by running/signal checks;
+      // it must not retain the IPC listener and leadership lock during shutdown or /reload.
+      let timer: NodeJS.Timeout | undefined;
+      const timedOut = await Promise.race([
+        Promise.all([...this.inputWork, this.mediaCleanupTask]).then(() => false),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(true), 250); }),
+      ]).finally(() => clearTimeout(timer));
+      if (timedOut) console.error("[pi-telegram-mux] MEDIA_SHUTDOWN_PENDING: cancelled media cleanup is still finishing in the background.");
       if (this.server) await new Promise<void>(resolve => this.server!.close(() => resolve()));
       this.server = null;
       if (this.releaseLock) { await this.releaseLock(); this.releaseLock = undefined; }

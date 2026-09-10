@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { getRuntimeDir, replaceFile } from "./config.js";
 import { getProcessIdentity } from "./process-identity.js";
+import { MAX_INPUT_WORK } from "./media.js";
 import { IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundResult, type IpcMessage, type LeaderLockData, type OutputTarget, type RuntimeRegistration, type TransportStatus } from "./types.js";
 
 const MAX_FRAME_BYTES = 1024 * 1024;
@@ -249,7 +250,10 @@ export class IpcFollowerClient {
   }
   private closed = false;
   private readonly pendingCalls = new Map<string, { resolve: (value: unknown) => void; reject: (err: unknown) => void }>();
-  private onInboundHandler?: (msg: Extract<IpcMessage, { type: "inbound" }>) => Promise<InboundResult>;
+  private readonly inboundRequests = new Map<string, AbortController>();
+  // Handlers must permanently revoke submission rights when the signal aborts,
+  // including while Pi's asynchronous admission hooks are still pending.
+  private onInboundHandler?: (msg: Extract<IpcMessage, { type: "inbound" }>, signal: AbortSignal) => Promise<InboundResult>;
   private onAbortHandler?: (target: OutputTarget) => boolean | Promise<boolean>;
   private onDisconnectHandler?: (reason?: IpcError) => void;
   private onInputModeHandler?: (mode: BusyInputMode, revision?: number) => void;
@@ -309,6 +313,13 @@ export class IpcFollowerClient {
                   pending.reject(error);
                 }
               }
+            } else if (msg.type === "cancel_input") {
+              if (typeof msg.requestId !== "string" || !msg.requestId || msg.requestId.length > 128) throw new Error("Invalid input cancellation ID");
+              const controller = this.inboundRequests.get(msg.requestId);
+              controller?.abort();
+              // Abort dispatch is synchronous; the handler now has a permanently
+              // aborted signal. Acknowledgement says nothing about residual I/O.
+              socket.write(encodeFrame({ type: "cancel_input_ack", requestId: msg.requestId, ok: Boolean(controller) }));
             } else if (msg.type === "inbound" || msg.type === "abort") {
               // Do not block parsing later acknowledgements while Pi handles an input.
               void this.handleRequest(msg, socket).catch(() => socket.destroy());
@@ -335,26 +346,37 @@ export class IpcFollowerClient {
           pending.reject(new IpcError("IPC_CLOSED", "IPC socket closed"));
         }
         this.pendingCalls.clear();
+        for (const controller of this.inboundRequests.values()) controller.abort();
         if (!this.closed && wasConnected) this.onDisconnectHandler?.();
       });
     });
   }
 
   private async handleRequest(msg: Extract<IpcMessage, { type: "inbound" | "abort" }>, socket: net.Socket): Promise<void> {
+    if (typeof msg.requestId !== "string" || !msg.requestId || msg.requestId.length > 128 || this.inboundRequests.has(msg.requestId)) throw new Error("Invalid or duplicate input request ID");
+    if (msg.type === "inbound" && this.inboundRequests.size >= MAX_INPUT_WORK) {
+      socket.write(encodeFrame({ type: "inbound_ack", requestId: msg.requestId, accepted: false, busy: true }));
+      return;
+    }
+    const controller = msg.type === "inbound" ? new AbortController() : undefined;
+    if (controller) this.inboundRequests.set(msg.requestId, controller);
     let reply: IpcMessage;
     try {
       if (msg.type === "inbound") {
-        const result = await this.onInboundHandler?.(msg) ?? { accepted: false, busy: true };
+        const result = await this.onInboundHandler?.(msg, controller!.signal) ?? { accepted: false, busy: true };
         reply = { type: "inbound_ack", requestId: msg.requestId, ...result };
       } else {
         reply = { type: "abort_ack", requestId: msg.requestId, ok: await this.onAbortHandler?.(msg.target) ?? false };
       }
     } catch {
+      console.error(`[pi-telegram-mux] INPUT_HANDLER_FAILED: request ${msg.requestId}; inspect local Pi errors`);
       // Pi request boundary: a thrown handler has an unknown outcome, not a busy
       // rejection. Send an explicit safe failure without exposing private details.
       reply = msg.type === "inbound"
         ? { type: "inbound_ack", requestId: msg.requestId, accepted: false, busy: false, statusReply: "Execution result unknown. Please check local Pi errors; do not resend automatically." }
         : { type: "abort_ack", requestId: msg.requestId, ok: false };
+    } finally {
+      if (controller) this.inboundRequests.delete(msg.requestId);
     }
     if (!this.closed && !socket.destroyed) socket.write(encodeFrame(reply));
   }

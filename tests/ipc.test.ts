@@ -54,6 +54,16 @@ describe("IPC protocol regressions", () => {
     return socket;
   }
 
+  it("rejects a legacy v5 peer before it can register a media route", async () => {
+    const socket = net.createConnection({ host: "127.0.0.1", port: info.port });
+    sockets.push(socket);
+    await once(socket, "connect");
+    const closed = once(socket, "close");
+    socket.write(encodeFrame({ type: "auth", protocolVersion: 5, runtimeId: "legacy", capability: info.capability }));
+    await closed;
+    expect(coordinator.getRoutes().size).toBe(0);
+  });
+
   it("rejects an incorrect capability before any Bot API call", async () => {
     const api = vi.spyOn(coordinator.getTelegramClient(), "callApi");
     await expect(connect("wrong", "wrong-capability")).rejects.toThrow("closed");

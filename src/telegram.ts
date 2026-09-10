@@ -2,6 +2,7 @@ import type {
   TelegramApiResponse,
   TelegramChat,
   TelegramChatMember,
+  TelegramFile,
   TelegramForumTopic,
   TelegramInlineKeyboardMarkup,
   TelegramMessage,
@@ -14,6 +15,28 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024; // 5MB
 const RELOAD_ABORT = Symbol("Telegram configuration reload");
 const REQUEST_TIMEOUT = Symbol("Telegram request timeout");
+
+async function readDownloadBody(response: Response, maxBytes: number, controller: AbortController): Promise<Buffer> {
+  if (!response.body) throw new TelegramDecodeError("Empty Telegram download body");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        controller.abort();
+        throw new TelegramDecodeError("Telegram response size exceeded limit");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, size);
+}
 
 export class TelegramApiError extends Error {
   readonly code: string;
@@ -331,6 +354,119 @@ export class TelegramClient {
       return await this.callApi<boolean>("setMessageReaction", params, undefined, signal, { ignoreRateLimit: true });
     } catch {
       return false;
+    }
+  }
+
+  public async getFile(fileId: string, signal?: AbortSignal): Promise<TelegramFile> {
+    const file = await this.callApi<TelegramFile>("getFile", { file_id: fileId }, undefined, signal);
+    if (!file || typeof file !== "object" || typeof file.file_id !== "string") {
+      throw new TelegramDecodeError("Invalid Telegram getFile result");
+    }
+    return file;
+  }
+
+  public async downloadFile(filePath: string, signal?: AbortSignal): Promise<Buffer> {
+    if (this.isRateLimited()) {
+      const waitSec = Math.ceil(this.getRemainingPauseMs() / 1000);
+      throw new RateLimitError(waitSec);
+    }
+
+    if (!/^[a-zA-Z0-9_/-]+\.[a-zA-Z0-9]+$/.test(filePath) || filePath.split("/").some(part => part === ".." || !part)) {
+      throw new TelegramDecodeError("Invalid Telegram file path");
+    }
+    const url = `${this.apiBase}/file/bot${this.botToken}/${filePath}`;
+    const timeout = this.defaultTimeoutMs;
+
+    const controller = new AbortController();
+    this.requests.add(controller);
+    const requestSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal;
+    const timer = setTimeout(() => controller.abort(REQUEST_TIMEOUT), timeout);
+
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        signal: requestSignal,
+        redirect: "error",
+      });
+
+      if (response.status === 408 || (response.status >= 500 && response.status <= 599)) {
+        throw new TelegramApiError(`HTTP ${response.status}`, response.status);
+      }
+
+      if (response.status === 429) {
+        // Record a conservative floor even if the server's error body is malformed.
+        this.recordRateLimit(5);
+        let retryAfter = 5;
+        const header = response.headers.get("retry-after");
+        if (header) {
+          const seconds = /^\d+$/.test(header) ? Number(header) : Math.ceil((Date.parse(header) - Date.now()) / 1000);
+          if (!Number.isSafeInteger(seconds) || seconds <= 0) throw new TelegramDecodeError("Invalid download Retry-After");
+          retryAfter = Math.max(retryAfter, seconds);
+          this.recordRateLimit(retryAfter);
+        }
+        if (response.headers.get("content-type")?.includes("application/json")) {
+          const body = (await readDownloadBody(response, 8192, controller)).toString("utf8");
+          let error: unknown;
+          try { error = JSON.parse(body); }
+          catch (cause) {
+            // Decoding boundary: SyntaxError excerpts can contain private response
+            // data. Propagate a body-free fatal error, never a parsed fallback.
+            if (!(cause instanceof SyntaxError)) throw cause;
+            throw new TelegramDecodeError(`Invalid JSON from Telegram download: HTTP ${response.status}`);
+          }
+          if (!error || typeof error !== "object" || !("ok" in error) || error.ok !== false) throw new TelegramDecodeError("Invalid download error envelope");
+          const parameters = "parameters" in error ? error.parameters : undefined;
+          if (parameters !== undefined) {
+            if (!parameters || typeof parameters !== "object" || !("retry_after" in parameters) ||
+                !Number.isSafeInteger(parameters.retry_after) || (parameters.retry_after as number) <= 0) throw new TelegramDecodeError("Invalid download retry_after");
+            retryAfter = Math.max(retryAfter, parameters.retry_after as number);
+            this.recordRateLimit(retryAfter);
+          }
+        }
+        throw new RateLimitError(retryAfter);
+      }
+
+      if (!response.ok) {
+        throw new TelegramApiError(`Download failed with HTTP ${response.status}`, response.status);
+      }
+
+      // File-size acceptance belongs to Telegram and the selected model, not the mux.
+      if (!response.body) throw new TelegramDecodeError("Empty Telegram download body");
+      return Buffer.from(await response.arrayBuffer());
+    } catch (err: unknown) {
+      if (err instanceof TelegramApiError || err instanceof TelegramDecodeError) throw err;
+      const failure = err as { code?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
+      const identifier = failure?.cause?.code ?? failure?.code;
+      const timedOut = requestSignal.aborted && requestSignal.reason === REQUEST_TIMEOUT;
+      const code = timedOut ? "TELEGRAM_TIMEOUT" : requestSignal.aborted ? requestSignal.reason === RELOAD_ABORT ? "TELEGRAM_RELOADING" : "TELEGRAM_ABORTED"
+        : typeof identifier === "string" ? identifier : "TELEGRAM_REQUEST_FAILED";
+      let detail: string;
+      if (timedOut) {
+        detail = "request timed out";
+      } else if (code === "ECONNRESET") {
+        detail = "connection reset";
+      } else if (code === "ECONNREFUSED") {
+        detail = "connection refused";
+      } else if (code === "ETIMEDOUT") {
+        detail = "connection timed out";
+      } else if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
+        detail = "network unreachable";
+      } else if (code === "TELEGRAM_ABORTED") {
+        detail = "request aborted";
+      } else if (code === "TELEGRAM_RELOADING") {
+        detail = "request cancelled for configuration reload";
+      } else {
+        const raw = typeof failure?.cause?.message === "string" ? failure.cause.message
+          : err instanceof Error ? err.message : String(err);
+        detail = this.redact(raw);
+      }
+      const message = `Telegram file download failed: ${detail}`;
+      throw new TelegramRequestError(code, message, err);
+    } finally {
+      // Abort unread bodies on every early HTTP rejection before dropping supervision.
+      controller.abort();
+      clearTimeout(timer);
+      this.requests.delete(controller);
     }
   }
 

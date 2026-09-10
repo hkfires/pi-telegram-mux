@@ -6,6 +6,7 @@ import {
   configFingerprint,
   getConfigDir,
   getConfigPath,
+  getMediaDir,
   getRuntimeDir,
   loadConfig,
   loadConfigSync,
@@ -34,6 +35,7 @@ describe("config module", () => {
     expect(getConfigDir(tempDir)).toBe(path.join(tempDir, "pi-telegram-mux"));
     expect(getConfigPath(tempDir)).toBe(path.join(tempDir, "pi-telegram-mux", "config.json"));
     expect(getRuntimeDir(tempDir)).toBe(path.join(tempDir, "pi-telegram-mux", "runtime"));
+    expect(getMediaDir(tempDir)).toBe(path.join(tempDir, "pi-telegram-mux", "media"));
   });
 
   describe("validateConfig", () => {

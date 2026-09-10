@@ -89,6 +89,21 @@ For an existing session with history that is not yet bound to a topic, run `/tg-
 
 If the original topic has been deleted, restoring the session displays a warning. The extension waits for your next prompt in Pi before creating a replacement and syncing that prompt and its response. Restoring or viewing the session, or running `/tg-connect`, does not immediately recreate the topic. This pending replacement is saved with the session, so reopening Pi does not restore the deleted topic's binding.
 
+### Image Input
+
+Send a photo or image file in the bound Telegram topic and write your request in the caption. You can also send it without a caption; no default prompt is added.
+
+To ask about several images together, send them as a Telegram album (up to 10 images). They are submitted as one task and numbered `[Image#1]`, `[Image#2]`, etc. Separate uploads are not merged.
+
+**Notes:**
+
+- Use `/model` to select a vision-capable model. JPEG, PNG, GIF, and WebP are supported; other attachments are not.
+- The extension does not limit single-image or album file sizes, but Telegram and the model service may reject them. New inputs may be temporarily refused when the session is busy.
+- If an album image cannot be downloaded or read, the whole album is rejected. Late-arriving images produce a notice rather than starting another task.
+- Images sent to Pi are kept locally and are not automatically deleted. The default folder is `~/.pi/agent/pi-telegram-mux/media/`; if `PI_CODING_AGENT_DIR` is set, use `pi-telegram-mux/media/` under that directory. Delete unneeded images manually to free disk space. Deleted files can no longer be opened using their old paths.
+
+**Restart all Pi instances after upgrading to avoid mixing old and new versions.**
+
 ### Telegram Commands
 
 Send text in a topic to submit a task. These commands automatically appear in the authorized user's Telegram `/` menu—just select one:

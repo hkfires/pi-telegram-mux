@@ -4,6 +4,7 @@ import * as fsSync from "node:fs";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { getProcessIdentity } from "./process-identity.js";
+import { MEDIA_STAGING_FILE_PATTERN } from "./media.js";
 import type { MuxConfig } from "./types.js";
 
 /**
@@ -25,6 +26,49 @@ export function getConfigPath(agentDir: string): string {
  */
 export function getRuntimeDir(agentDir: string): string {
   return path.join(getConfigDir(agentDir), "runtime");
+}
+
+/**
+ * Get directory for downloaded images and unfinished staging files.
+ */
+export function getMediaDir(agentDir: string): string {
+  return path.join(getConfigDir(agentDir), "media");
+}
+
+/**
+ * Ensure media directory exists with restrictive permissions.
+ */
+export async function ensureMediaDir(agentDir: string): Promise<string> {
+  const dir = getMediaDir(agentDir);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+/**
+ * Clean up only stale unfinished staging files (defaults to 1 hour).
+ * Completed image paths remain usable until explicitly removed by the user.
+ */
+export async function cleanupStaleMedia(agentDir: string, maxAgeMs = 3600_000): Promise<void> {
+  const dir = getMediaDir(agentDir);
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const now = Date.now();
+    for (const entry of entries) {
+      if (!entry.isFile() || !MEDIA_STAGING_FILE_PATTERN.test(entry.name)) continue;
+      const fullPath = path.join(dir, entry.name);
+      try {
+        const stat = await fs.lstat(fullPath);
+        if (stat.isFile() && now - stat.mtimeMs > maxAgeMs) {
+          await fs.unlink(fullPath);
+        }
+      } catch (error) {
+        // The creator may have published or removed this staging file already.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
 }
 
 /**
