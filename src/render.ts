@@ -2,9 +2,9 @@ export { renderTelegramMarkdown, splitTelegramMessage } from "./render-core.mjs"
 export type { FormattedMessageChunk } from "./render-core.mjs";
 
 /**
- * Extract plain text from an assistant message.
+ * Extract plain text from a message with the given role.
  */
-export function extractAssistantText(message: unknown): string {
+function extractRoleText(message: unknown, role: "assistant" | "user"): string {
   if (!message || typeof message !== "object") {
     return "";
   }
@@ -12,7 +12,7 @@ export function extractAssistantText(message: unknown): string {
   const msg = message as Record<string, unknown>;
 
   // Check role if present
-  if (msg.role && msg.role !== "assistant") {
+  if (msg.role && msg.role !== role) {
     return "";
   }
 
@@ -39,40 +39,17 @@ export function extractAssistantText(message: unknown): string {
 }
 
 /**
+ * Extract plain text from an assistant message.
+ */
+export function extractAssistantText(message: unknown): string {
+  return extractRoleText(message, "assistant");
+}
+
+/**
  * Extract plain text from a user message.
  */
 export function extractUserText(message: unknown): string {
-  if (!message || typeof message !== "object") {
-    return "";
-  }
-
-  const msg = message as Record<string, unknown>;
-
-  // Check role if present
-  if (msg.role && msg.role !== "user") {
-    return "";
-  }
-
-  if (typeof msg.content === "string") {
-    return msg.content;
-  }
-
-  if (Array.isArray(msg.content)) {
-    const textParts: string[] = [];
-    for (const part of msg.content) {
-      if (typeof part === "string") {
-        textParts.push(part);
-      } else if (typeof part === "object" && part !== null) {
-        const p = part as Record<string, unknown>;
-        if (p.type === "text" && typeof p.text === "string") {
-          textParts.push(p.text);
-        }
-      }
-    }
-    return textParts.join("");
-  }
-
-  return "";
+  return extractRoleText(message, "user");
 }
 
 /**

@@ -9,10 +9,10 @@ import type { MuxConfig, TelegramUpdate } from "../src/types.js";
 export const testConfig: MuxConfig = { version: 1, botToken: "fake-regression-token", chatId: -100123, allowedUserId: 123 };
 
 /** A Pi fixture with mutable history, real lifecycle hooks and explicit cleanup. */
-export async function runtimeFixture(agentDir: string, id: string, threadId: number | null = 50, reason?: "startup" | "resume" | "reload" | "new" | "fork") {
+export async function runtimeFixture(agentDir: string, id: string, threadId: number | null = 50, reason?: "startup" | "resume" | "reload" | "new" | "fork", config: MuxConfig = testConfig) {
   try { await fs.access(getConfigPath(agentDir)); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; await saveConfig(agentDir, testConfig); }
-  const entries: any[] = threadId === null ? [] : [{ type: "custom", customType: "pi-telegram-mux.binding", data: { version: 1, sessionId: id, chatId: testConfig.chatId, threadId } }];
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; await saveConfig(agentDir, config); }
+  const entries: any[] = threadId === null ? [] : [{ type: "custom", customType: "pi-telegram-mux.binding", data: { version: 1, sessionId: id, chatId: config.chatId, threadId } }];
   const ui = { notify: vi.fn(), setStatus: vi.fn(), confirm: vi.fn(async () => true), input: vi.fn(), select: vi.fn(async (_title: string, _options: string[]): Promise<string | undefined> => undefined) };
   const ctx = {
     mode: "tui", cwd: agentDir, ui, isIdle: vi.fn(() => true), abort: vi.fn(),
@@ -20,7 +20,10 @@ export async function runtimeFixture(agentDir: string, id: string, threadId: num
   } as unknown as ExtensionContext;
   let inputContext: ReturnType<typeof AsyncLocalStorage.snapshot> | undefined;
   const pi = {
-    sendUserMessage: vi.fn(() => { inputContext = AsyncLocalStorage.snapshot(); }),
+    // Mux forwards plain-text prompts, including image paths.
+    sendUserMessage: vi.fn((_text: string, _options?: Parameters<ExtensionAPI["sendUserMessage"]>[1]) => {
+      inputContext = AsyncLocalStorage.snapshot();
+    }),
     sendMessage: vi.fn(),
     appendEntry: vi.fn((customType, data) => entries.push({ type: "custom", customType, data })),
   };

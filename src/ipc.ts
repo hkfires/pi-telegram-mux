@@ -5,7 +5,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { getRuntimeDir, replaceFile } from "./config.js";
-import { getProcessIdentity } from "./process-identity.js";
+import { getProcessIdentity, isProcessAlive } from "./process-identity.js";
 import { MAX_INPUT_WORK } from "./media.js";
 import { IMAGE_INPUT_MODE, IPC_PROTOCOL_VERSION, type BusyInputMode, type InboundResult, type IpcMessage, type LeaderLockData, type OutputTarget, type RuntimeRegistration, type TransportStatus } from "./types.js";
 
@@ -89,15 +89,8 @@ async function acquireElectionMutex(runtimeDir: string): Promise<() => Promise<v
   }
 }
 
-export function isProcessAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: unknown) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
+// Keep the public export stable for existing consumers of this module.
+export { isProcessAlive };
 
 export function encodeFrame(message: IpcMessage): Buffer {
   const payload = Buffer.from(JSON.stringify(message), "utf-8");

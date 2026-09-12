@@ -8,6 +8,7 @@ import {
   getTgStatusText,
   MuxRuntime,
   TG_STATUS_KEY,
+  type TgStatusInfo,
 } from "../src/runtime.js";
 import type { MuxConfig } from "../src/types.js";
 
@@ -20,137 +21,64 @@ describe("Status Bar module", () => {
   };
 
   describe("getTgStatusText", () => {
-    it("returns unconfigured status when config is missing", () => {
-      const res = getTgStatusText({
-        config: null,
-        isReconnecting: false,
-        isConflict: false,
-        hasActiveTransport: false,
-        bindingState: "unbound",
-        threadId: null,
-      });
-      expect(res).toEqual({ text: "tg: unconfigured", color: "dim" });
-    });
-
-    it("returns reconnecting status when isReconnecting is true", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: true,
-        isConflict: false,
-        hasActiveTransport: false,
-        bindingState: "bound",
-        threadId: 101,
-      });
-      expect(res).toEqual({ text: "tg: reconnecting", color: "muted" });
-    });
-
-    it("returns conflict status when 409 conflict is detected", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: false,
-        isConflict: true,
-        hasActiveTransport: true,
-        bindingState: "bound",
-        threadId: 101,
-      });
-      expect(res).toEqual({ text: "tg: conflict (409)", color: "muted" });
-    });
-
-    it("returns offline status when active transport is unavailable", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: false,
-        isConflict: false,
-        hasActiveTransport: false,
-        bindingState: "bound",
-        threadId: 101,
-      });
-      expect(res).toEqual({ text: "tg: offline", color: "muted" });
-    });
-
-    it("returns connected status with shortId when bound", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: false,
-        isConflict: false,
-        hasActiveTransport: true,
-        bindingState: "bound",
-        threadId: 101,
-        shortId: "a1b2c3",
-      });
-      expect(res).toEqual({ text: "tg: connected (a1b2c3)", color: "muted" });
-    });
-
-    it("returns connected status with threadId fallback when bound and shortId missing", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: false,
-        isConflict: false,
-        hasActiveTransport: true,
-        bindingState: "bound",
-        threadId: 101,
-      });
-      expect(res).toEqual({ text: "tg: connected (#101)", color: "muted" });
-    });
-
-    it("returns connected status without threadId when bound but threadId is null", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: false,
-        isConflict: false,
-        hasActiveTransport: true,
-        bindingState: "bound",
-        threadId: null,
-      });
-      expect(res).toEqual({ text: "tg: connected", color: "muted" });
-    });
-
-    it("returns ready status when transport is active and state is unbound (blank session ready for first prompt)", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: false,
-        isConflict: false,
-        hasActiveTransport: true,
-        bindingState: "unbound",
-        threadId: null,
-      });
-      expect(res).toEqual({ text: "tg: ready", color: "dim" });
-    });
-
-    it("returns disconnected status when state is disconnected", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: false,
-        isConflict: false,
-        hasActiveTransport: true,
-        bindingState: "disconnected",
-        threadId: null,
-      });
-      expect(res).toEqual({ text: "tg: disconnected", color: "dim" });
-    });
-
-    it("returns topic deleted status when state is topic-missing", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: false,
-        isConflict: false,
-        hasActiveTransport: true,
-        bindingState: "topic-missing",
-        threadId: null,
-      });
-      expect(res).toEqual({ text: "tg: topic deleted", color: "dim" });
-    });
-
-    it("returns error status when state is create-unknown", () => {
-      const res = getTgStatusText({
-        config: mockConfig,
-        isReconnecting: false,
-        isConflict: false,
-        hasActiveTransport: true,
-        bindingState: "create-unknown",
-        threadId: null,
-      });
-      expect(res).toEqual({ text: "tg: error", color: "muted" });
+    it.each([
+      {
+        name: "unconfigured status when config is missing",
+        options: { config: null, isReconnecting: false, isConflict: false, hasActiveTransport: false, bindingState: "unbound", threadId: null },
+        expected: { text: "tg: unconfigured", color: "dim" },
+      },
+      {
+        name: "reconnecting status when isReconnecting is true",
+        options: { config: mockConfig, isReconnecting: true, isConflict: false, hasActiveTransport: false, bindingState: "bound", threadId: 101 },
+        expected: { text: "tg: reconnecting", color: "muted" },
+      },
+      {
+        name: "conflict status when 409 conflict is detected",
+        options: { config: mockConfig, isReconnecting: false, isConflict: true, hasActiveTransport: true, bindingState: "bound", threadId: 101 },
+        expected: { text: "tg: conflict (409)", color: "muted" },
+      },
+      {
+        name: "offline status when active transport is unavailable",
+        options: { config: mockConfig, isReconnecting: false, isConflict: false, hasActiveTransport: false, bindingState: "bound", threadId: 101 },
+        expected: { text: "tg: offline", color: "muted" },
+      },
+      {
+        name: "connected status with shortId when bound",
+        options: { config: mockConfig, isReconnecting: false, isConflict: false, hasActiveTransport: true, bindingState: "bound", threadId: 101, shortId: "a1b2c3" },
+        expected: { text: "tg: connected (a1b2c3)", color: "muted" },
+      },
+      {
+        name: "connected status with threadId fallback when bound and shortId missing",
+        options: { config: mockConfig, isReconnecting: false, isConflict: false, hasActiveTransport: true, bindingState: "bound", threadId: 101 },
+        expected: { text: "tg: connected (#101)", color: "muted" },
+      },
+      {
+        name: "connected status without threadId when bound but threadId is null",
+        options: { config: mockConfig, isReconnecting: false, isConflict: false, hasActiveTransport: true, bindingState: "bound", threadId: null },
+        expected: { text: "tg: connected", color: "muted" },
+      },
+      {
+        name: "ready status when transport is active and state is unbound (blank session ready for first prompt)",
+        options: { config: mockConfig, isReconnecting: false, isConflict: false, hasActiveTransport: true, bindingState: "unbound", threadId: null },
+        expected: { text: "tg: ready", color: "dim" },
+      },
+      {
+        name: "disconnected status when state is disconnected",
+        options: { config: mockConfig, isReconnecting: false, isConflict: false, hasActiveTransport: true, bindingState: "disconnected", threadId: null },
+        expected: { text: "tg: disconnected", color: "dim" },
+      },
+      {
+        name: "topic deleted status when state is topic-missing",
+        options: { config: mockConfig, isReconnecting: false, isConflict: false, hasActiveTransport: true, bindingState: "topic-missing", threadId: null },
+        expected: { text: "tg: topic deleted", color: "dim" },
+      },
+      {
+        name: "error status when state is create-unknown",
+        options: { config: mockConfig, isReconnecting: false, isConflict: false, hasActiveTransport: true, bindingState: "create-unknown", threadId: null },
+        expected: { text: "tg: error", color: "muted" },
+      },
+    ] as { name: string; options: Parameters<typeof getTgStatusText>[0]; expected: TgStatusInfo }[])("returns $name", ({ options, expected }) => {
+      expect(getTgStatusText(options)).toEqual(expected);
     });
   });
 

@@ -7,6 +7,17 @@ import { promisify } from "node:util";
 const execute = promisify(execFile);
 let ownIdentity: Promise<string | undefined> | undefined;
 
+/** Probe liveness without signalling; EPERM still proves the process exists. */
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: unknown) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 /** A kernel-provided process start identity, independent of the caller's clock. */
 export function getProcessIdentity(pid: number): Promise<string | undefined> {
   if (!Number.isSafeInteger(pid) || pid <= 0) return Promise.resolve(undefined);

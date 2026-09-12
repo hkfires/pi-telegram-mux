@@ -11,6 +11,7 @@ import {
 } from "../src/render.js";
 import { MuxRuntime, formatTransportNotice } from "../src/runtime.js";
 import type { MuxConfig } from "../src/types.js";
+import { runtimeFixture } from "./helpers.js";
 
 describe("formatTransportNotice", () => {
   it.each([
@@ -501,42 +502,12 @@ describe("runtime module", () => {
     });
 
     it("mirrors local user prompt before assistant text in bound session", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: {
-            version: 1,
-            sessionId: "sess-mirror-1",
-            chatId: mockConfig.chatId,
-            threadId: 777,
-          },
-        },
-        {
-          type: "message",
-          message: { role: "user", content: "What is 1 + 1?" },
-        },
-      ];
-
-      const mockCtx = {
-        mode: "tui",
-        sessionManager: {
-          getSessionId: () => "sess-mirror-1",
-          getEntries: () => entries,
-          getSessionFile: () => "/tmp/sess.jsonl",
-        },
-      } as any;
-
-      await runtime.onSessionStart(mockCtx);
-      expect(runtime.getBindingState()).toBe("bound");
+      const f = await runtimeFixture(tempDir, "sess-mirror-1", 777, undefined, mockConfig);
+      f.entries.push({ type: "message", message: { role: "user", content: "What is 1 + 1?" } });
+      expect(f.runtime.getBindingState()).toBe("bound");
 
       const sentMessages: string[] = [];
-      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
+      vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (method, params: any) => {
         if (method === "sendMessage") {
           sentMessages.push(params.text);
         }
@@ -544,15 +515,15 @@ describe("runtime module", () => {
       });
 
       // Mirror actual user admission on the background FIFO, not in before_agent_start.
-      await runtime.onBeforeAgentStart(mockCtx);
-      runtime.onMessageStart({ role: "user", content: "What is 1 + 1?" }, mockCtx);
-      await runtime.outbox.whenIdle();
+      await f.runtime.onBeforeAgentStart(f.ctx);
+      f.runtime.onMessageStart({ role: "user", content: "What is 1 + 1?" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
       expect(sentMessages.length).toBe(1);
       expect(sentMessages[0]).toBe("🧑‍💻 [Prompt]\nWhat is 1 + 1?");
 
-      runtime.onMessageEnd({ role: "assistant", content: "It is 2." });
-      await runtime.onAgentSettled(mockCtx);
-      await runtime.outbox.whenIdle();
+      f.runtime.onMessageEnd({ role: "assistant", content: "It is 2." });
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
 
       // Verify assistant reply was sent after agent settled
       expect(sentMessages.length).toBe(2);
@@ -560,45 +531,17 @@ describe("runtime module", () => {
     });
 
     it("does NOT mirror prompt if the run was initiated from Telegram inbound", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-        sendUserMessage: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: {
-            version: 1,
-            sessionId: "sess-tg-inbound",
-            chatId: mockConfig.chatId,
-            threadId: 777,
-          },
-        },
-      ];
-
-      const mockCtx = {
-        mode: "tui",
-        sessionManager: {
-          getSessionId: () => "sess-tg-inbound",
-          getEntries: () => entries,
-          getSessionFile: () => "/tmp/sess.jsonl",
-        },
-      } as any;
-
-      await runtime.onSessionStart(mockCtx);
+      const f = await runtimeFixture(tempDir, "sess-tg-inbound", 777, undefined, mockConfig);
+      const { runtime, ctx, pi } = f;
 
       // The simulated Pi pipeline preserves the submission's asynchronous context.
-      mockCtx.isIdle = () => true;
-      mockPi.sendUserMessage.mockImplementation((text: string) => {
-        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      pi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, ctx).then(() => runtime.onMessageStart({ role: "user", content: text }, ctx));
       });
-      const admission = runtime.handleInboundText("Hello from Telegram!", mockCtx);
+      const admission = runtime.handleInboundText("Hello from Telegram!", ctx);
 
       // Simulate entry added by Pi after sendUserMessage
-      entries.push({
+      f.entries.push({
         type: "message",
         message: { role: "user", content: "Hello from Telegram!" },
       });
@@ -614,7 +557,7 @@ describe("runtime module", () => {
         return { message_id: 100 } as any;
       });
 
-      await runtime.onAgentSettled(mockCtx);
+      await runtime.onAgentSettled(ctx);
       await runtime.outbox.whenIdle();
 
       // Only working placeholder and assistant reply should be sent, NO prompt echo
@@ -622,56 +565,26 @@ describe("runtime module", () => {
     });
 
     it("mirrors admitted user text rather than stale session history", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: {
-            version: 1,
-            sessionId: "sess-pref",
-            chatId: mockConfig.chatId,
-            threadId: 888,
-          },
-        },
-        {
-          type: "message",
-          message: { role: "user", content: "stale prompt in entries" },
-        },
-      ];
-
-      const mockCtx = {
-        mode: "tui",
-        sessionManager: {
-          getSessionId: () => "sess-pref",
-          getEntries: () => entries,
-          getSessionFile: () => "/tmp/sess.jsonl",
-        },
-      } as any;
-
-      await runtime.onSessionStart(mockCtx);
+      const f = await runtimeFixture(tempDir, "sess-pref", 888, undefined, mockConfig);
+      f.entries.push({ type: "message", message: { role: "user", content: "stale prompt in entries" } });
 
       const sentMessages: string[] = [];
-      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
+      vi.spyOn(f.runtime, "callTelegram").mockImplementation(async (method, params: any) => {
         if (method === "sendMessage") {
           sentMessages.push(params.text);
         }
         return {} as any;
       });
 
-      await runtime.onBeforeAgentStart({ prompt: "fresh prompt from event" }, mockCtx);
-      runtime.onMessageStart({ role: "user", content: "fresh prompt from event" }, mockCtx);
-      await runtime.outbox.whenIdle();
+      await f.runtime.onBeforeAgentStart({ prompt: "fresh prompt from event" }, f.ctx);
+      f.runtime.onMessageStart({ role: "user", content: "fresh prompt from event" }, f.ctx);
+      await f.runtime.outbox.whenIdle();
       expect(sentMessages.length).toBe(1);
       expect(sentMessages[0]).toBe("🧑‍💻 [Prompt]\nfresh prompt from event");
 
-      runtime.onMessageEnd({ role: "assistant", content: "Reply to fresh" });
-      await runtime.onAgentSettled(mockCtx);
-      await runtime.outbox.whenIdle();
+      f.runtime.onMessageEnd({ role: "assistant", content: "Reply to fresh" });
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
 
       expect(sentMessages.length).toBe(2);
       expect(sentMessages[1]).toBe("Reply to fresh");
@@ -773,31 +686,8 @@ describe("runtime module", () => {
     });
 
     it("automatically reopens forum topic on session resume when bound", async () => {
-      const mockPi = { appendEntry: vi.fn() } as any;
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: {
-            version: 1,
-            sessionId: "sess-resume-1",
-            chatId: mockConfig.chatId,
-            threadId: 777,
-          },
-        },
-      ];
-      const mockCtx = {
-        mode: "tui",
-        sessionManager: {
-          getSessionId: () => "sess-resume-1",
-          getEntries: () => entries,
-          getSessionFile: () => "/tmp/sess-resume-1.jsonl",
-        },
-      } as any;
-
-      const spyCall = vi.spyOn(runtime, "callTelegram").mockResolvedValue({} as any);
-      await runtime.onSessionStart({ reason: "resume" }, mockCtx);
+      const spyCall = vi.spyOn(MuxRuntime.prototype, "callTelegram").mockResolvedValue({} as any);
+      await runtimeFixture(tempDir, "sess-resume-1", 777, "resume", mockConfig);
 
       expect(spyCall).toHaveBeenCalledWith(
         "reopenForumTopic",
@@ -811,31 +701,8 @@ describe("runtime module", () => {
     });
 
     it("reopens the existing forum topic on CLI startup", async () => {
-      const mockPi = { appendEntry: vi.fn() } as any;
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: {
-            version: 1,
-            sessionId: "sess-startup-1",
-            chatId: mockConfig.chatId,
-            threadId: 777,
-          },
-        },
-      ];
-      const mockCtx = {
-        mode: "tui",
-        sessionManager: {
-          getSessionId: () => "sess-startup-1",
-          getEntries: () => entries,
-          getSessionFile: () => "/tmp/sess-startup-1.jsonl",
-        },
-      } as any;
-
-      const spyCall = vi.spyOn(runtime, "callTelegram").mockResolvedValue({} as any);
-      await runtime.onSessionStart({ reason: "startup" }, mockCtx);
+      const spyCall = vi.spyOn(MuxRuntime.prototype, "callTelegram").mockResolvedValue({} as any);
+      await runtimeFixture(tempDir, "sess-startup-1", 777, "startup", mockConfig);
 
       expect(spyCall).toHaveBeenCalledWith("reopenForumTopic", expect.objectContaining({ message_thread_id: 777 }), expect.objectContaining({ sessionId: "sess-startup-1", threadId: 777 }), expect.any(AbortSignal));
     });
@@ -905,36 +772,8 @@ describe("runtime module", () => {
     });
 
     it("sends working message placeholder on inbound task and deletes it on completion", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-        sendUserMessage: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: {
-            version: 1,
-            sessionId: "sess-working-inbound",
-            chatId: mockConfig.chatId,
-            threadId: 777,
-          },
-        },
-      ];
-
-      const mockCtx = {
-        mode: "tui",
-        isIdle: () => true,
-        sessionManager: {
-          getSessionId: () => "sess-working-inbound",
-          getEntries: () => entries,
-          getSessionFile: () => "/tmp/sess.jsonl",
-        },
-      } as any;
-
-      await runtime.onSessionStart(mockCtx);
+      const f = await runtimeFixture(tempDir, "sess-working-inbound", 777, undefined, mockConfig);
+      const { runtime, ctx, pi } = f;
 
       const calls: Array<{ method: string; params: any }> = [];
       vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
@@ -942,11 +781,11 @@ describe("runtime module", () => {
         return { message_id: 100 } as any;
       });
 
-      mockPi.sendUserMessage.mockImplementation((text: string) => {
-        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      pi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, ctx).then(() => runtime.onMessageStart({ role: "user", content: text }, ctx));
       });
 
-      const admission = runtime.handleInboundText("Do a calculation", mockCtx, 999);
+      const admission = runtime.handleInboundText("Do a calculation", ctx, 999);
       expect((await admission).accepted).toBe(true);
       await runtime.outbox.whenIdle();
 
@@ -960,7 +799,7 @@ describe("runtime module", () => {
 
       // Complete agent run
       runtime.onMessageEnd({ role: "assistant", content: "Result is 42", stopReason: "stop" });
-      await runtime.onAgentSettled(mockCtx);
+      await runtime.onAgentSettled(ctx);
       await runtime.outbox.whenIdle();
 
       // Working placeholder should be deleted, followed by final answer
@@ -977,36 +816,8 @@ describe("runtime module", () => {
     });
 
     it("deletes working message placeholder on error or abort for inbound message", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-        sendUserMessage: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: {
-            version: 1,
-            sessionId: "sess-working-error",
-            chatId: mockConfig.chatId,
-            threadId: 777,
-          },
-        },
-      ];
-
-      const mockCtx = {
-        mode: "tui",
-        isIdle: () => true,
-        sessionManager: {
-          getSessionId: () => "sess-working-error",
-          getEntries: () => entries,
-          getSessionFile: () => "/tmp/sess.jsonl",
-        },
-      } as any;
-
-      await runtime.onSessionStart(mockCtx);
+      const f = await runtimeFixture(tempDir, "sess-working-error", 777, undefined, mockConfig);
+      const { runtime, ctx, pi } = f;
 
       const calls: Array<{ method: string; params: any }> = [];
       vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params: any) => {
@@ -1014,15 +825,15 @@ describe("runtime module", () => {
         return { message_id: 100 } as any;
       });
 
-      mockPi.sendUserMessage.mockImplementation((text: string) => {
-        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      pi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, ctx).then(() => runtime.onMessageStart({ role: "user", content: text }, ctx));
       });
 
-      await runtime.handleInboundText("Fail task", mockCtx, 888);
+      await runtime.handleInboundText("Fail task", ctx, 888);
       await runtime.outbox.whenIdle();
 
       runtime.onMessageEnd({ role: "assistant", content: "", stopReason: "error" });
-      await runtime.onAgentSettled(mockCtx);
+      await runtime.onAgentSettled(ctx);
       await runtime.outbox.whenIdle();
 
       expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
@@ -1033,36 +844,8 @@ describe("runtime module", () => {
     });
 
     it("mirrors local prompt without working placeholder and delivers final reply", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-        sendUserMessage: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: {
-            version: 1,
-            sessionId: "sess-local-prompt",
-            chatId: mockConfig.chatId,
-            threadId: 777,
-          },
-        },
-      ];
-
-      const mockCtx = {
-        mode: "tui",
-        isIdle: () => true,
-        sessionManager: {
-          getSessionId: () => "sess-local-prompt",
-          getEntries: () => entries,
-          getSessionFile: () => "/tmp/sess.jsonl",
-        },
-      } as any;
-
-      await runtime.onSessionStart(mockCtx);
+      const f = await runtimeFixture(tempDir, "sess-local-prompt", 777, undefined, mockConfig);
+      const { runtime, ctx } = f;
 
       const calls: Array<{ method: string; params: any }> = [];
       let sentCount = 0;
@@ -1076,8 +859,8 @@ describe("runtime module", () => {
       });
 
       // Local terminal prompt
-      await runtime.onBeforeAgentStart(mockCtx);
-      runtime.onMessageStart({ role: "user", content: "Run tests locally" }, mockCtx);
+      await runtime.onBeforeAgentStart(ctx);
+      runtime.onMessageStart({ role: "user", content: "Run tests locally" }, ctx);
       await runtime.outbox.whenIdle();
 
       // Mirrored prompt was sent (msg 501), no working placeholder for local prompt
@@ -1087,7 +870,7 @@ describe("runtime module", () => {
 
       // Complete agent run
       runtime.onMessageEnd({ role: "assistant", content: "All tests pass", stopReason: "stop" });
-      await runtime.onAgentSettled(mockCtx);
+      await runtime.onAgentSettled(ctx);
       await runtime.outbox.whenIdle();
 
       // No deleteMessage needed since no working placeholder was sent
@@ -1099,24 +882,8 @@ describe("runtime module", () => {
     });
 
     it("continues final and subsequent delivery when placeholder ownership was evicted", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-        sendUserMessage: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: { version: 1, sessionId: "sess-benign-delete", chatId: mockConfig.chatId, threadId: 777 },
-        },
-      ];
-      const mockCtx = {
-        mode: "tui", isIdle: () => true,
-        sessionManager: { getSessionId: () => "sess-benign-delete", getEntries: () => entries, getSessionFile: () => "/tmp/sess.jsonl" },
-      } as any;
-      await runtime.onSessionStart(mockCtx);
+      const f = await runtimeFixture(tempDir, "sess-benign-delete", 777, undefined, mockConfig);
+      const { runtime, ctx, pi } = f;
 
       const calls: Array<{ method: string; params: any }> = [];
       vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params) => {
@@ -1125,25 +892,25 @@ describe("runtime module", () => {
         return { message_id: 100 } as any;
       });
 
-      mockPi.sendUserMessage.mockImplementation((text: string) => {
-        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      pi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, ctx).then(() => runtime.onMessageStart({ role: "user", content: text }, ctx));
       });
 
-      await runtime.handleInboundText("Task", mockCtx, 999);
+      await runtime.handleInboundText("Task", ctx, 999);
       await runtime.outbox.whenIdle();
 
       const run = (runtime as any).currentRun;
       runtime.onMessageEnd({ role: "assistant", content: "Result", stopReason: "stop" });
-      await runtime.onAgentSettled(mockCtx);
+      await runtime.onAgentSettled(ctx);
       await runtime.outbox.whenIdle();
 
       expect(runtime.outbox.error).toBeNull();
       expect(run.workingMessageId).toBeUndefined();
       expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
-      await runtime.onBeforeAgentStart({ prompt: "Later task" }, mockCtx);
-      runtime.onMessageStart({ role: "user", content: "Later task" }, mockCtx);
+      await runtime.onBeforeAgentStart({ prompt: "Later task" }, ctx);
+      runtime.onMessageStart({ role: "user", content: "Later task" }, ctx);
       runtime.onMessageEnd({ role: "assistant", content: "Later result", stopReason: "stop" });
-      await runtime.onAgentSettled(mockCtx);
+      await runtime.onAgentSettled(ctx);
       await runtime.outbox.whenIdle();
       expect(runtime.outbox.error).toBeNull();
       expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual([
@@ -1154,93 +921,37 @@ describe("runtime module", () => {
       ]);
     });
 
-    it("continues final delivery after an unexpected placeholder deletion failure", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-        sendUserMessage: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: { version: 1, sessionId: "sess-fail-delete", chatId: mockConfig.chatId, threadId: 777 },
-        },
-      ];
-      const mockCtx = {
-        mode: "tui", isIdle: () => true,
-        sessionManager: { getSessionId: () => "sess-fail-delete", getEntries: () => entries, getSessionFile: () => "/tmp/sess.jsonl" },
-      } as any;
-      await runtime.onSessionStart(mockCtx);
+    it.each([
+      {
+        name: "an unexpected placeholder deletion failure",
+        session: "sess-fail-delete",
+        makeFailure: () => Object.assign(new Error("Telegram connection timeout"), { code: "TELEGRAM_TIMEOUT" }),
+      },
+      {
+        name: "Telegram refusing placeholder deletion",
+        session: "sess-cant-delete",
+        makeFailure: () => Object.assign(new Error("Bad Request: message can't be deleted"), { code: "TELEGRAM_HTTP_400", errorCode: 400 }),
+      },
+    ])("continues final delivery after $name", async ({ session, makeFailure }) => {
+      const f = await runtimeFixture(tempDir, session, 777, undefined, mockConfig);
+      const { runtime, ctx, pi } = f;
 
       const calls: Array<{ method: string; params: any }> = [];
       vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params) => {
         calls.push({ method, params });
-        if (method === "deleteMessage") {
-          const err = new Error("Telegram connection timeout");
-          Object.assign(err, { code: "TELEGRAM_TIMEOUT" });
-          throw err;
-        }
+        if (method === "deleteMessage") throw makeFailure();
         return { message_id: 100 } as any;
       });
 
-      mockPi.sendUserMessage.mockImplementation((text: string) => {
-        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      pi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, ctx).then(() => runtime.onMessageStart({ role: "user", content: text }, ctx));
       });
 
-      await runtime.handleInboundText("Task", mockCtx, 999);
+      await runtime.handleInboundText("Task", ctx, 999);
       await runtime.outbox.whenIdle();
 
       runtime.onMessageEnd({ role: "assistant", content: "Result", stopReason: "stop" });
-      await runtime.onAgentSettled(mockCtx);
-      await runtime.outbox.whenIdle();
-
-      expect(runtime.outbox.error).toBeNull();
-      expect(calls.filter(c => c.method === "deleteMessage")).toHaveLength(1);
-      expect(calls.filter(c => c.method === "sendMessage").map(c => c.params.text)).toEqual(["⏳ Working...", "Result"]);
-    });
-
-    it("continues final delivery when Telegram refuses placeholder deletion", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-        sendUserMessage: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: { version: 1, sessionId: "sess-cant-delete", chatId: mockConfig.chatId, threadId: 777 },
-        },
-      ];
-      const mockCtx = {
-        mode: "tui", isIdle: () => true,
-        sessionManager: { getSessionId: () => "sess-cant-delete", getEntries: () => entries, getSessionFile: () => "/tmp/sess.jsonl" },
-      } as any;
-      await runtime.onSessionStart(mockCtx);
-
-      const calls: Array<{ method: string; params: any }> = [];
-      vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params) => {
-        calls.push({ method, params });
-        if (method === "deleteMessage") {
-          const err = new Error("Bad Request: message can't be deleted");
-          Object.assign(err, { code: "TELEGRAM_HTTP_400", errorCode: 400 });
-          throw err;
-        }
-        return { message_id: 100 } as any;
-      });
-
-      mockPi.sendUserMessage.mockImplementation((text: string) => {
-        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
-      });
-
-      await runtime.handleInboundText("Task", mockCtx, 999);
-      await runtime.outbox.whenIdle();
-
-      runtime.onMessageEnd({ role: "assistant", content: "Result", stopReason: "stop" });
-      await runtime.onAgentSettled(mockCtx);
+      await runtime.onAgentSettled(ctx);
       await runtime.outbox.whenIdle();
 
       expect(runtime.outbox.error).toBeNull();
@@ -1249,24 +960,8 @@ describe("runtime module", () => {
     });
 
     it("awaits active configuration dialog before deleting working placeholder and sending reply", async () => {
-      const mockPi = {
-        appendEntry: vi.fn(),
-        sendUserMessage: vi.fn(),
-      } as any;
-
-      const runtime = new MuxRuntime(mockPi, tempDir);
-      const entries: any[] = [
-        {
-          type: "custom",
-          customType: "pi-telegram-mux.binding",
-          data: { version: 1, sessionId: "sess-config-dialog", chatId: mockConfig.chatId, threadId: 777 },
-        },
-      ];
-      const mockCtx = {
-        mode: "tui", isIdle: () => true,
-        sessionManager: { getSessionId: () => "sess-config-dialog", getEntries: () => entries, getSessionFile: () => "/tmp/sess.jsonl" },
-      } as any;
-      await runtime.onSessionStart(mockCtx);
+      const f = await runtimeFixture(tempDir, "sess-config-dialog", 777, undefined, mockConfig);
+      const { runtime, ctx, pi } = f;
 
       const calls: Array<{ method: string; params: any }> = [];
       vi.spyOn(runtime, "callTelegram").mockImplementation(async (method, params) => {
@@ -1275,11 +970,11 @@ describe("runtime module", () => {
         return true as any;
       });
 
-      mockPi.sendUserMessage.mockImplementation((text: string) => {
-        void runtime.onBeforeAgentStart({ prompt: text }, mockCtx).then(() => runtime.onMessageStart({ role: "user", content: text }, mockCtx));
+      pi.sendUserMessage.mockImplementation((text: string) => {
+        void runtime.onBeforeAgentStart({ prompt: text }, ctx).then(() => runtime.onMessageStart({ role: "user", content: text }, ctx));
       });
 
-      await runtime.handleInboundText("Task", mockCtx, 999);
+      await runtime.handleInboundText("Task", ctx, 999);
       await runtime.outbox.whenIdle();
 
       // Simulate opening configuration dialog
@@ -1290,7 +985,7 @@ describe("runtime module", () => {
 
       // Agent settles while configuration dialog is still open
       runtime.onMessageEnd({ role: "assistant", content: "Final Answer", stopReason: "stop" });
-      await runtime.onAgentSettled(mockCtx);
+      await runtime.onAgentSettled(ctx);
 
       // Outbox task should wait for configuration dialog, not fail
       expect(runtime.outbox.error).toBeNull();

@@ -641,7 +641,7 @@ it("allows 3.5-second image validation followed by 1.7-second admission over fol
   const captureInput = follower.pi.sendUserMessage.getMockImplementation()!;
   let lifecycle: Promise<void> | undefined;
   follower.pi.sendUserMessage.mockImplementation((content: any) => {
-    captureInput();
+    captureInput(content);
     lifecycle = (async () => {
       await new Promise(resolve => setTimeout(resolve, 1700));
       await follower.inInput(async () => {

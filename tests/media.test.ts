@@ -22,7 +22,6 @@ describe("media handling and image-path prompts", () => {
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-tg-mux-media-"));
-    await saveConfig(tempDir, testConfig);
   });
 
   afterEach(async () => {
@@ -288,6 +287,11 @@ describe("media handling and image-path prompts", () => {
   });
 
   describe("MuxRuntime - inbound media processing", () => {
+    // MuxRuntime reads its configuration from disk; Coordinator tests above pass it directly.
+    beforeEach(async () => {
+      await saveConfig(tempDir, testConfig);
+    });
+
     it("retains the image and passes its numbered absolute path to sendUserMessage", async () => {
       const mediaDir = await ensureMediaDir(tempDir);
       const testImagePath = path.join(mediaDir, `${crypto.randomUUID()}.png`);

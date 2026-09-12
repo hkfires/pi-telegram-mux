@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { getProcessIdentity } from "./process-identity.js";
+import { getProcessIdentity, isProcessAlive } from "./process-identity.js";
 import { MEDIA_STAGING_FILE_PATTERN } from "./media.js";
 import type { MuxConfig } from "./types.js";
 
@@ -194,16 +194,6 @@ export async function replaceFile(source: string, destination: string): Promise<
       if (attempt >= 40 || !["EPERM", "EACCES", "EBUSY"].includes((err as NodeJS.ErrnoException).code ?? "")) throw err;
       await delay(25);
     }
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: unknown) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 

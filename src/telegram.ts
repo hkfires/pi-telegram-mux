@@ -124,6 +124,41 @@ export class TelegramClient {
   }
 
   /**
+   * HTTP boundary: normalize fetch/timeout failures using identifiers, not
+   * message text. Unclassified errors remain fatal to the polling supervisor.
+   */
+  private normalizeRequestError(err: unknown, requestSignal: AbortSignal): { code: string; detail: string; timedOut: boolean } {
+    const failure = err as { code?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
+    const identifier = failure?.cause?.code ?? failure?.code;
+    // The combined signal retains the first cancellation cause, even if another
+    // cancellation source fires before fetch finishes unwinding.
+    const timedOut = requestSignal.aborted && requestSignal.reason === REQUEST_TIMEOUT;
+    const code = timedOut ? "TELEGRAM_TIMEOUT" : requestSignal.aborted ? requestSignal.reason === RELOAD_ABORT ? "TELEGRAM_RELOADING" : "TELEGRAM_ABORTED"
+      : typeof identifier === "string" ? identifier : "TELEGRAM_REQUEST_FAILED";
+    let detail: string;
+    if (timedOut) {
+      detail = "request timed out";
+    } else if (code === "ECONNRESET") {
+      detail = "connection reset";
+    } else if (code === "ECONNREFUSED") {
+      detail = "connection refused";
+    } else if (code === "ETIMEDOUT") {
+      detail = "connection timed out";
+    } else if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
+      detail = "network unreachable";
+    } else if (code === "TELEGRAM_ABORTED") {
+      detail = "request aborted";
+    } else if (code === "TELEGRAM_RELOADING") {
+      detail = "request cancelled for configuration reload";
+    } else {
+      const raw = typeof failure?.cause?.message === "string" ? failure.cause.message
+        : err instanceof Error ? err.message : String(err);
+      detail = this.redact(raw);
+    }
+    return { code, detail, timedOut };
+  }
+
+  /**
    * Check if client is currently in a 429 pause.
    */
   public isRateLimited(): boolean {
@@ -233,35 +268,7 @@ export class TelegramClient {
       return parsed.result as T;
     } catch (err: unknown) {
       if (err instanceof TelegramApiError || err instanceof TelegramDecodeError) throw err;
-      // HTTP boundary: normalize fetch/timeout failures using identifiers, not
-      // message text. Unclassified errors remain fatal to the polling supervisor.
-      const failure = err as { code?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
-      const identifier = failure?.cause?.code ?? failure?.code;
-      // The combined signal retains the first cancellation cause, even if another
-      // cancellation source fires before fetch finishes unwinding.
-      const timedOut = requestSignal.aborted && requestSignal.reason === REQUEST_TIMEOUT;
-      const code = timedOut ? "TELEGRAM_TIMEOUT" : requestSignal.aborted ? requestSignal.reason === RELOAD_ABORT ? "TELEGRAM_RELOADING" : "TELEGRAM_ABORTED"
-        : typeof identifier === "string" ? identifier : "TELEGRAM_REQUEST_FAILED";
-      let detail: string;
-      if (timedOut) {
-        detail = "request timed out";
-      } else if (code === "ECONNRESET") {
-        detail = "connection reset";
-      } else if (code === "ECONNREFUSED") {
-        detail = "connection refused";
-      } else if (code === "ETIMEDOUT") {
-        detail = "connection timed out";
-      } else if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
-        detail = "network unreachable";
-      } else if (code === "TELEGRAM_ABORTED") {
-        detail = "request aborted";
-      } else if (code === "TELEGRAM_RELOADING") {
-        detail = "request cancelled for configuration reload";
-      } else {
-        const raw = typeof failure?.cause?.message === "string" ? failure.cause.message
-          : err instanceof Error ? err.message : String(err);
-        detail = this.redact(raw);
-      }
+      const { code, detail, timedOut } = this.normalizeRequestError(err, requestSignal);
       const message = timedOut || code === "ECONNRESET" || code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "TELEGRAM_ABORTED" || code === "TELEGRAM_RELOADING"
         ? `Telegram ${detail} (${method})`
         : `Telegram request failed (${method}): ${detail}`;
@@ -453,31 +460,7 @@ export class TelegramClient {
       return Buffer.from(await response.arrayBuffer());
     } catch (err: unknown) {
       if (err instanceof TelegramApiError || err instanceof TelegramDecodeError) throw err;
-      const failure = err as { code?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
-      const identifier = failure?.cause?.code ?? failure?.code;
-      const timedOut = requestSignal.aborted && requestSignal.reason === REQUEST_TIMEOUT;
-      const code = timedOut ? "TELEGRAM_TIMEOUT" : requestSignal.aborted ? requestSignal.reason === RELOAD_ABORT ? "TELEGRAM_RELOADING" : "TELEGRAM_ABORTED"
-        : typeof identifier === "string" ? identifier : "TELEGRAM_REQUEST_FAILED";
-      let detail: string;
-      if (timedOut) {
-        detail = "request timed out";
-      } else if (code === "ECONNRESET") {
-        detail = "connection reset";
-      } else if (code === "ECONNREFUSED") {
-        detail = "connection refused";
-      } else if (code === "ETIMEDOUT") {
-        detail = "connection timed out";
-      } else if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
-        detail = "network unreachable";
-      } else if (code === "TELEGRAM_ABORTED") {
-        detail = "request aborted";
-      } else if (code === "TELEGRAM_RELOADING") {
-        detail = "request cancelled for configuration reload";
-      } else {
-        const raw = typeof failure?.cause?.message === "string" ? failure.cause.message
-          : err instanceof Error ? err.message : String(err);
-        detail = this.redact(raw);
-      }
+      const { code, detail } = this.normalizeRequestError(err, requestSignal);
       const message = `Telegram file download failed: ${detail}`;
       throw new TelegramRequestError(code, message, err);
     } finally {
