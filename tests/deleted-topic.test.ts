@@ -14,6 +14,7 @@ describe.each(["leader", "follower"])("deleted topic recovery on %s", role => {
   let f: Fixture;
   let reopenError: Error | null;
   let createError: Error | null;
+  let sendError: Error | null;
   const fixtures: Fixture[] = [];
   const requests: { method: string; params: Record<string, unknown> }[] = [];
 
@@ -21,6 +22,7 @@ describe.each(["leader", "follower"])("deleted topic recovery on %s", role => {
     dir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-deleted-topic-"));
     reopenError = new TelegramApiError("Bad Request: TOPIC_ID_INVALID", 400);
     createError = null;
+    sendError = null;
     requests.length = 0;
     const original = TelegramClient.prototype.callApi;
     vi.spyOn(TelegramClient.prototype, "callApi").mockImplementation(async function (method, params, ...args) {
@@ -32,7 +34,10 @@ describe.each(["leader", "follower"])("deleted topic recovery on %s", role => {
         if (createError) throw createError;
         return { message_thread_id: 208, name: "Replacement", icon_color: 1 } as any;
       }
-      if (method === "sendMessage") return { message_id: 1 } as any;
+      if (method === "sendMessage") {
+        if (sendError) throw sendError;
+        return { message_id: 1 } as any;
+      }
       return original.call(this, method, params, ...args);
     });
     if (role === "follower") fixtures.push(await runtimeFixture(dir, "host", 10));
@@ -135,6 +140,37 @@ describe.each(["leader", "follower"])("deleted topic recovery on %s", role => {
     expect(f.runtime.getBindingState()).toBe("topic-missing");
   });
 
+  it.each(["TOPIC_ID_INVALID", "Bad Request: message thread not found"])("detects a topic deleted during delivery and rebuilds it on the next prompt: %s", async message => {
+    reopenError = null;
+    sendError = new TelegramApiError(message, 400);
+    await f.runtime.onSessionStart(f.ctx);
+
+    await f.runtime.onBeforeAgentStart({ prompt: "lost prompt" }, f.ctx);
+    f.runtime.onMessageStart({ role: "user", content: "lost prompt" }, f.ctx);
+    await f.runtime.outbox.whenIdle();
+
+    expect(f.runtime.getBindingState()).toBe("topic-missing");
+    expect(f.runtime.getCurrentThreadId()).toBeNull();
+    expect(f.runtime.outbox.error).toBeNull();
+    expect(f.ui.setStatus).toHaveBeenLastCalledWith("tg", "tg: topic deleted");
+    expect(requests.filter(request => request.method === "createForumTopic")).toHaveLength(0);
+
+    sendError = null;
+    await f.runtime.onBeforeAgentStart({ prompt: "replacement prompt" }, f.ctx);
+    f.runtime.onMessageStart({ role: "user", content: "replacement prompt" }, f.ctx);
+    f.runtime.onMessageEnd({ role: "assistant", content: "replacement answer", stopReason: "stop" });
+    await f.runtime.onAgentSettled(f.ctx);
+    await f.runtime.outbox.whenIdle();
+
+    expect(f.runtime.getBindingState()).toBe("bound");
+    expect(requests.filter(request => request.method === "createForumTopic")).toHaveLength(1);
+    expect(requests.filter(request => request.method === "sendMessage").map(request => [request.params.message_thread_id, request.params.text])).toEqual([
+      [108, "🧑‍💻 [Prompt]\nlost prompt"],
+      [208, "🧑‍💻 [Prompt]\nreplacement prompt"],
+      [208, "replacement answer"],
+    ]);
+  });
+
   it.each([
     new TelegramApiError("Forbidden: missing topic permission", 403),
     new TelegramApiError("Bad Request: CHAT_ID_INVALID", 400),
@@ -147,6 +183,25 @@ describe.each(["leader", "follower"])("deleted topic recovery on %s", role => {
     expect(f.runtime.getCurrentThreadId()).toBe(108);
     expect(f.pi.appendEntry).not.toHaveBeenCalled();
     expect(f.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("next prompt in Pi"), "warning");
+  });
+
+  it.each([
+    new Error("Bad Request: TOPIC_ID_INVALID"),
+    Object.assign(new Error("message thread not found"), { code: "TELEGRAM_TIMEOUT" }),
+    new TelegramApiError("Bad Request: TOPIC_ID_INVALID", 403),
+    new TelegramApiError("message thread not found", 500),
+  ])("does not reset a binding for an unverified send failure: %s", async error => {
+    reopenError = null;
+    sendError = error;
+    await f.runtime.onSessionStart(f.ctx);
+    await f.runtime.onBeforeAgentStart({ prompt: "keep binding" }, f.ctx);
+    f.runtime.onMessageStart({ role: "user", content: "keep binding" }, f.ctx);
+    await f.runtime.outbox.whenIdle();
+    expect(f.runtime.getBindingState()).toBe("bound");
+    expect(f.runtime.getCurrentThreadId()).toBe(108);
+    expect(f.pi.appendEntry).not.toHaveBeenCalled();
+    expect(f.runtime.outbox.error?.message).toBe(error.message);
+    expect(requests.filter(request => request.method === "createForumTopic")).toHaveLength(0);
   });
 
   it("reports a failed reset write and retries it before forgetting the original binding", async () => {

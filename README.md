@@ -10,7 +10,7 @@ English | [简体中文](README.zh-CN.md)
 
 - **Bi-directional Interaction**: Send prompts on your computer and sync prompts along with final responses to Telegram. Reply directly inside a topic on Telegram to dispatch new tasks to Pi on your computer.
 - **Multi-session Multiplexing**: Multiple running Pi instances share a single Telegram Bot. Each Pi session maps to its own dedicated Forum Topic without requiring external servers or background daemons.
-- **Automatic Binding & Lifecycle**: Creates a topic on the first prompt in a new session and reuses it when the session is restored.
+- **Automatic Binding & Lifecycle**: Creates a topic on the first prompt in a new session and reuses it when the session is restored. Automatic connection for new sessions can be disabled when you prefer manual control.
 - **Remote Control**: Query session status or abort currently running tasks directly from Telegram.
 - **Restricted Access**: Accepts tasks only from the configured Telegram User ID for security.
 
@@ -75,19 +75,20 @@ Run this command in Pi to open the settings menu:
 | --- | --- |
 | Connection settings | Set the Bot Token, group Chat ID, and allowed User ID |
 | Auto-close topics | Automatically close topics when leaving sessions; off by default |
+| Auto-connect new sessions | Connect and create topics for new, unbound sessions automatically; on by default. When off, use `/tg-connect` to connect the session and create its topic. Existing bound sessions and pending deleted-topic replacements still reconnect normally. |
 
 Configuration is stored in `~/.pi/agent/pi-telegram-mux/config.json` by default (or under `PI_CODING_AGENT_DIR` if defined).
 
 ## Daily Usage
 
 1. In a fresh Pi session on your computer, ask a question (e.g., "Analyze the project directory structure").
-2. The extension automatically creates a Telegram topic (e.g., `Pi: my-project [a1b2c3]`) and syncs the prompt.
+2. By default, the extension automatically creates a Telegram topic (e.g., `Pi: my-project [a1b2c3]`) and syncs the prompt. If **Auto-connect new sessions** is off, the session stays local until you run `/tg-connect`; no Telegram connection or topic is created before then.
 3. Once Pi completes the task, the final assistant response appears in the topic.
 4. Send a text message in that topic to submit the next task. Pi on your computer must remain running.
 
 For an existing session with history that is not yet bound to a topic, run `/tg-connect` to bind manually.
 
-If the original topic has been deleted, restoring the session displays a warning. The extension waits for your next prompt in Pi before creating a replacement and syncing that prompt and its response. Restoring or viewing the session, or running `/tg-connect`, does not immediately recreate the topic. This pending replacement is saved with the session, so reopening Pi does not restore the deleted topic's binding.
+If the original topic has been deleted, restoring the session displays a warning. The extension waits for your next prompt in Pi before creating a replacement and syncing that prompt and its response. Restoring or viewing the session, or running `/tg-connect`, does not immediately recreate the topic. If deletion is discovered while delivering output, the failed delivery is discarded, the status changes to `tg: topic deleted`, and the next local prompt creates the replacement automatically. This pending replacement is saved with the session, so reopening Pi does not restore the deleted topic's binding.
 
 ### Image Input
 

@@ -46,7 +46,10 @@ export class TelegramApiError extends Error {
   constructor(message: string, errorCode?: number, retryAfter?: number) {
     super(message);
     this.name = "TelegramApiError";
-    this.code = errorCode === undefined ? "TELEGRAM_API_ERROR" : `TELEGRAM_HTTP_${errorCode}`;
+    // Bot API exposes topic identifiers in description, not a separate field.
+    // Normalize only confirmed HTTP/API 400 responses at this error boundary.
+    const topicMissing = errorCode === 400 && /^(?:Bad Request:\s*)?(?:TOPIC_ID_INVALID|message thread not found)\.?$/i.test(message.trim());
+    this.code = topicMissing ? "TELEGRAM_TOPIC_MISSING" : errorCode === undefined ? "TELEGRAM_API_ERROR" : `TELEGRAM_HTTP_${errorCode}`;
     this.errorCode = errorCode;
     this.retryAfter = retryAfter;
   }

@@ -94,6 +94,12 @@ describe("config module", () => {
       );
     });
 
+    it.each([null, "false", "true", 0, 1, [], {}])("rejects invalid autoConnect: %j", autoConnect => {
+      expect(() => validateConfig({ version: 1, botToken: "x", chatId: 1, allowedUserId: 1, autoConnect })).toThrow(
+        "autoConnect must be a boolean"
+      );
+    });
+
     it.each([null, "false", "true", 0, 1, [], {}, "invalid", "follow_up", "steering"])("rejects invalid inputMode: %j", inputMode => {
       expect(() => validateConfig({ version: 1, botToken: "x", chatId: 1, allowedUserId: 1, inputMode })).toThrow(
         "inputMode must be 'followUp' or 'steer'"
@@ -106,6 +112,12 @@ describe("config module", () => {
       expect(configFingerprint(config)).not.toBe(configFingerprint({ ...config, autoCloseTopics: true }));
     });
 
+    it("includes the effective auto-connect setting in the configuration fingerprint", () => {
+      const config: MuxConfig = { version: 1, botToken: "x", chatId: 1, allowedUserId: 1 };
+      expect(configFingerprint(config)).toBe(configFingerprint({ ...config, autoConnect: true }));
+      expect(configFingerprint(config)).not.toBe(configFingerprint({ ...config, autoConnect: false }));
+    });
+
     it("includes the effective input-mode setting in the configuration fingerprint", () => {
       const config: MuxConfig = { version: 1, botToken: "x", chatId: 1, allowedUserId: 1 };
       expect(configFingerprint(config)).toBe(configFingerprint({ ...config, inputMode: "followUp" }));
@@ -115,7 +127,7 @@ describe("config module", () => {
     it("excludes input mode and revision from the connection fingerprint", () => {
       const config: MuxConfig = { version: 1, botToken: "x", chatId: 1, allowedUserId: 1 };
       expect(configFingerprint(config, "connection")).toBe(configFingerprint({ ...config, inputMode: "steer", inputModeRevision: 10 }, "connection"));
-      for (const changes of [{ botToken: "y" }, { chatId: 2 }, { allowedUserId: 2 }, { autoCloseTopics: true }]) {
+      for (const changes of [{ botToken: "y" }, { chatId: 2 }, { allowedUserId: 2 }, { autoCloseTopics: true }, { autoConnect: false }]) {
         expect(configFingerprint(config, "connection")).not.toBe(configFingerprint({ ...config, ...changes }, "connection"));
       }
     });
@@ -155,6 +167,22 @@ describe("config module", () => {
       expect(loaded).toEqual(config);
       expect(loadConfigSync(tempDir)).toEqual(config);
       expect(JSON.parse(await fs.readFile(getConfigPath(tempDir), "utf-8"))).toEqual(config);
+    });
+
+    it.each([false, true])("saves and loads configuration with autoConnect=%s", async autoConnect => {
+      const config: MuxConfig = {
+        version: 1,
+        botToken: "123456:TOKEN",
+        chatId: -100987654321,
+        allowedUserId: 12345,
+        autoConnect,
+      };
+
+      await saveConfig(tempDir, config);
+      const expected = { ...config, autoCloseTopics: false };
+      expect(await loadConfig(tempDir)).toEqual(expected);
+      expect(loadConfigSync(tempDir)).toEqual(expected);
+      expect(JSON.parse(await fs.readFile(getConfigPath(tempDir), "utf-8"))).toEqual(expected);
     });
 
     it.each(["followUp", "steer"] as const)("saves and loads configuration with inputMode=%s", async inputMode => {
@@ -253,6 +281,20 @@ describe("config module", () => {
 
       const disk = await loadConfig(tempDir);
       expect(disk?.chatId).toBe(99);
+    });
+
+    it("rejects saveConfig when auto-connect changes during check-and-replace", async () => {
+      const initial = await saveConfig(tempDir, { version: 1, botToken: "tok", chatId: 10, allowedUserId: 1 });
+      const configPath = getConfigPath(tempDir);
+
+      await expect(saveConfig(tempDir, { ...initial, inputMode: "steer" }, {
+        expectedBase: initial,
+        onChecked: async () => {
+          await fs.writeFile(configPath, JSON.stringify({ ...initial, autoConnect: false }, null, 2) + "\n");
+        },
+      })).rejects.toThrow("Connection configuration was modified concurrently on disk");
+
+      expect((await loadConfig(tempDir))?.autoConnect).toBe(false);
     });
 
     it.each(["EACCES", "EPERM", "EIO"])("does not overwrite a newer mode after a configuration read fails with %s", async code => {
@@ -577,7 +619,7 @@ describe("config module", () => {
     });
 
     it.each([
-      { autoCloseTopics: "ON" }, { autoCloseTopics: null }, { version: 2 },
+      { autoCloseTopics: "ON" }, { autoCloseTopics: null }, { autoConnect: "ON" }, { autoConnect: null }, { version: 2 },
       { inputModeRevision: 0 }, { inputModeRevision: null }, { inputModeRevision: "2" },
       { inputModeRevision: 1.5 }, { inputModeRevision: Number.MAX_SAFE_INTEGER + 1 },
     ])("rejects explicitly supplied invalid updates: %j", async invalid => {
@@ -588,7 +630,7 @@ describe("config module", () => {
       await expect(saveConfig(tempDir, { updates })).rejects.toThrow("Invalid config");
     });
 
-    it.each([{ autoCloseTopics: true }, { botToken: "replacement-token" }])("does not rebuild malformed JSON from an incomplete update: %j", async updates => {
+    it.each([{ autoCloseTopics: true }, { autoConnect: false }, { botToken: "replacement-token" }])("does not rebuild malformed JSON from an incomplete update: %j", async updates => {
       await fs.mkdir(getConfigDir(tempDir), { recursive: true });
       await fs.writeFile(getConfigPath(tempDir), "{");
       await expect(loadConfig(tempDir, updates)).rejects.toBeInstanceOf(SyntaxError);

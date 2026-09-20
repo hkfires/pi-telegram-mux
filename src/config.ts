@@ -105,6 +105,10 @@ export function validateConfig(data: unknown): MuxConfig {
     throw new Error("Invalid config: autoCloseTopics must be a boolean");
   }
 
+  if (obj.autoConnect !== undefined && typeof obj.autoConnect !== "boolean") {
+    throw new Error("Invalid config: autoConnect must be a boolean");
+  }
+
   if (obj.inputMode !== undefined && obj.inputMode !== "followUp" && obj.inputMode !== "steer") {
     throw new Error("Invalid config: inputMode must be 'followUp' or 'steer'");
   }
@@ -120,6 +124,7 @@ export function validateConfig(data: unknown): MuxConfig {
     chatId: obj.chatId,
     allowedUserId: obj.allowedUserId,
     autoCloseTopics: obj.autoCloseTopics ?? false,
+    ...(obj.autoConnect !== undefined ? { autoConnect: obj.autoConnect as boolean } : {}),
     ...(obj.inputMode !== undefined ? { inputMode: obj.inputMode } : {}),
     ...(obj.inputModeRevision !== undefined ? { inputModeRevision: obj.inputModeRevision as number } : {}),
   };
@@ -132,6 +137,7 @@ export function configFingerprint(config: MuxConfig, scope: "all" | "connection"
     config.chatId,
     config.allowedUserId,
     config.autoCloseTopics ?? false,
+    config.autoConnect ?? true,
     ...(scope === "all" ? [config.inputMode ?? "followUp", config.inputModeRevision ?? 0] : []),
   ])).digest("hex");
 }
@@ -178,6 +184,7 @@ export async function loadConfig(agentDir: string, updates?: Partial<MuxConfig>)
     if (canRebuild) {
       if (updates.version === undefined) merged.version = 1;
       if (updates.autoCloseTopics === undefined && typeof merged.autoCloseTopics !== "boolean") merged.autoCloseTopics = false;
+      if (updates.autoConnect === undefined && typeof merged.autoConnect !== "boolean") delete merged.autoConnect;
       if (updates.inputMode === undefined && merged.inputMode !== "followUp" && merged.inputMode !== "steer") delete merged.inputMode;
       if (updates.inputModeRevision === undefined && (!Number.isSafeInteger(merged.inputModeRevision) || (merged.inputModeRevision ?? 0) <= 0)) delete merged.inputModeRevision;
     }
@@ -322,11 +329,14 @@ export async function saveConfig(agentDir: string, input: MuxConfig | { updates:
       if (options?.expectedBase && currentConfig) {
         const currentAutoClose = currentConfig.autoCloseTopics ?? false;
         const expectedAutoClose = options.expectedBase.autoCloseTopics ?? false;
+        const currentAutoConnect = currentConfig.autoConnect ?? true;
+        const expectedAutoConnect = options.expectedBase.autoConnect ?? true;
         if (
           currentConfig.chatId !== options.expectedBase.chatId ||
           currentConfig.botToken !== options.expectedBase.botToken ||
           currentConfig.allowedUserId !== options.expectedBase.allowedUserId ||
-          currentAutoClose !== expectedAutoClose
+          currentAutoClose !== expectedAutoClose ||
+          currentAutoConnect !== expectedAutoConnect
         ) {
           throw new Error("Connection configuration was modified concurrently on disk");
         }
@@ -385,11 +395,14 @@ export async function saveConfig(agentDir: string, input: MuxConfig | { updates:
         const recheckConfig = validateConfig(JSON.parse(currentDisk));
         const recheckAutoClose = recheckConfig.autoCloseTopics ?? false;
         const expectedAutoClose = options.expectedBase.autoCloseTopics ?? false;
+        const recheckAutoConnect = recheckConfig.autoConnect ?? true;
+        const expectedAutoConnect = options.expectedBase.autoConnect ?? true;
         if (
           recheckConfig.chatId !== options.expectedBase.chatId ||
           recheckConfig.botToken !== options.expectedBase.botToken ||
           recheckConfig.allowedUserId !== options.expectedBase.allowedUserId ||
-          recheckAutoClose !== expectedAutoClose
+          recheckAutoClose !== expectedAutoClose ||
+          recheckAutoConnect !== expectedAutoConnect
         ) {
           throw new Error("Connection configuration was modified concurrently on disk");
         }

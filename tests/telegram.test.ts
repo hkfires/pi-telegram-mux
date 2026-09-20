@@ -57,6 +57,20 @@ describe("telegram client module", () => {
     expect(redacted).toBe("Request failed: https://api.telegram.org/bot<redacted>/sendMessage?text=hi");
   });
 
+  it.each([
+    { status: 400, description: "Bad Request: TOPIC_ID_INVALID", code: "TELEGRAM_TOPIC_MISSING" },
+    { status: 400, description: "Bad Request: message thread not found", code: "TELEGRAM_TOPIC_MISSING" },
+    { status: 403, description: "Bad Request: TOPIC_ID_INVALID", code: "TELEGRAM_HTTP_403" },
+    { status: 400, description: "Bad Request: CHAT_ID_INVALID", code: "TELEGRAM_HTTP_400" },
+  ])("normalizes verified API failures: $status / $description", async ({ status, description, code }) => {
+    const client = new TelegramClient({ botToken: mockToken, apiBase: mockApiBase });
+    nextHandler = (_req, res) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error_code: status, description }));
+    };
+    await expect(client.sendMessage(-100123, "test", { message_thread_id: 50 })).rejects.toMatchObject({ code, errorCode: status });
+  });
+
   it("calls getMe successfully", async () => {
     const client = new TelegramClient({
       botToken: mockToken,

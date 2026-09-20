@@ -15,6 +15,7 @@ export interface MuxConfig {
   chatId: number; // numeric ID of Forum Supergroup
   allowedUserId: number; // numeric Telegram user ID
   autoCloseTopics?: boolean; // Close topics when leaving a session; defaults to false.
+  autoConnect?: boolean; // Connect and create topics for unbound new sessions automatically; defaults to true.
   inputMode?: BusyInputMode; // How messages sent while Pi is working should be handled; defaults to "followUp".
   inputModeRevision?: number; // Monotonic revision of the global input mode setting.
 }

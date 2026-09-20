@@ -71,7 +71,7 @@ describe("optional automatic topic closure", () => {
       });
       await f.runtime.handleTgSetup(f.ctx);
       expect(f.ui.select).toHaveBeenCalledTimes(3);
-      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", `Auto-close Topics: ${autoCloseTopics ? "On" : "Off"}`]);
+      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", `Auto-close Topics: ${autoCloseTopics ? "On" : "Off"}`, "Auto-connect New Sessions: On"]);
       expect(f.ui.input).not.toHaveBeenCalled();
       expect(TelegramClient.prototype.getChat).not.toHaveBeenCalled();
       expect(TelegramClient.prototype.getChatMember).not.toHaveBeenCalled();
@@ -87,7 +87,7 @@ describe("optional automatic topic closure", () => {
       f.ui.select.mockImplementationOnce(async (_title, options) => options[1]).mockResolvedValueOnce(undefined);
       await f.runtime.handleTgSetup(f.ctx);
       expect(f.ui.select).toHaveBeenCalledTimes(3);
-      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: Off"]);
+      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: Off", "Auto-connect New Sessions: On"]);
       expect(await fs.readFile(getConfigPath(dir), "utf-8")).toBe(original);
       expect(TelegramClient.prototype.getChat).not.toHaveBeenCalled();
       expect(f.ui.input).not.toHaveBeenCalled();
@@ -108,7 +108,7 @@ describe("optional automatic topic closure", () => {
         ["Auto-close Topics (Current: On)", options],
       ]);
       expect((await loadConfig(dir))?.autoCloseTopics).toBe(false);
-      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: Off"]);
+      expect(f.ui.select).toHaveBeenLastCalledWith("Telegram Settings", ["Connection Settings", "Auto-close Topics: Off", "Auto-connect New Sessions: On"]);
     });
 
     describe.each(["leader", "follower"])("configured by the %s", role => {

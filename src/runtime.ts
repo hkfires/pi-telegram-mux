@@ -150,6 +150,7 @@ export class MuxRuntime {
   private recovering = false;
   private activeCtx: ExtensionContext | null = null;
   private config: MuxConfig | null = null;
+  private manualConnectionSessionId: string | null = null;
   private coordinator: LeaderCoordinator | null = null;
   private followerClient: IpcFollowerClient | null = null;
   private transportVersion = 0;
@@ -204,6 +205,16 @@ export class MuxRuntime {
   }
   public getGeneration(): number { return this.generation; }
   public hasActiveTransport(): boolean { return Boolean(this.coordinator?.isRunning() || this.followerClient?.isConnected()); }
+
+  /** Automatic connection can be disabled for unbound sessions, then enabled by /tg-connect. */
+  private isConnectionEnabledFor(ctx: ExtensionContext): boolean {
+    return this.config !== null && (
+      this.config.autoConnect !== false ||
+      this.bindingState === "bound" ||
+      this.bindingState === "topic-missing" ||
+      this.manualConnectionSessionId === ctx.sessionManager.getSessionId()
+    );
+  }
 
   public updateStatusBar(explicitCtx?: ExtensionContext): void {
     const ctx = explicitCtx ?? this.activeCtx;
@@ -301,8 +312,8 @@ export class MuxRuntime {
   }
 
   /** Only one connection attempt may be in flight, and shutdown invalidates it. */
-  public setupTransport(ctx: ExtensionContext): Promise<void> {
-    if (!this.active || this.configuring || !this.config) return Promise.resolve();
+  public setupTransport(ctx: ExtensionContext, force = false): Promise<void> {
+    if (!this.active || this.configuring || !this.config || (!force && !this.isConnectionEnabledFor(ctx))) return Promise.resolve();
     if (this.setupTask) return this.setupTask;
     if (this.hasActiveTransport()) {
       clearTimeout(this.reconnectTimer);
@@ -325,6 +336,15 @@ export class MuxRuntime {
           this.config.inputMode = config.inputMode;
           this.config.inputModeRevision = config.inputModeRevision;
           this.inputModeRevision = config.inputModeRevision ?? 0;
+        }
+        // A reconnect queued before another process disabled automatic connection
+        // must not create a transport after it has loaded the newer configuration.
+        if (!force && !this.isConnectionEnabledFor(ctx)) {
+          clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = undefined;
+          this.isReconnecting = false;
+          this.updateStatusBar(ctx);
+          return;
         }
         const candidate = new LeaderCoordinator(this.config ?? config, this.agentDir, undefined, {
           onConfigChange: async next => {
@@ -474,7 +494,7 @@ export class MuxRuntime {
   }
 
   private scheduleReconnect(ctx: ExtensionContext): void {
-    if (!this.active || this.configuring || this.reconnectTimer) return;
+    if (!this.active || this.configuring || this.reconnectTimer || !this.isConnectionEnabledFor(ctx)) return;
     this.isReconnecting = true;
     this.updateStatusBar(ctx);
     this.reconnectTimer = setTimeout(() => {
@@ -569,6 +589,11 @@ export class MuxRuntime {
         throw new Error("No active transport to Telegram Leader");
       } catch (error) {
         const failure = error as { code?: string; retryAfter?: number } | null;
+        // A rejected send to a deleted topic is definitive. Persist the reset and
+        // cancel dependent output so the next local prompt safely creates one replacement.
+        if (method === "sendMessage" && target && this.activeCtx && failure?.code === "TELEGRAM_TOPIC_MISSING" && this.markTopicMissing(this.activeCtx, target)) {
+          throw error;
+        }
         // Delivery boundary: only a pre-HTTP pause or a definite 429 rejection
         // is safe to retry. Unknown outcomes (timeouts, decoding, network errors)
         // still propagate. Deletion is best-effort; reopening owns its own timer.
@@ -1038,18 +1063,40 @@ export class MuxRuntime {
     if (!this.active || version !== this.transportVersion) return;
     if (config) {
       this.applyConfig(config, ctx);
-      try { await this.setupTransport(ctx); }
-      catch (error) { this.connectionFailed(error, ctx); }
+      const shouldReopen = this.bindingState === "bound" && (event?.reason === "startup" || event?.reason === "resume" || event?.reason === "reload");
+      if (this.isConnectionEnabledFor(ctx)) {
+        try { await this.setupTransport(ctx); }
+        catch (error) { this.connectionFailed(error, ctx); }
+      }
+      // Preserve the existing one-attempt reopen boundary for restored bindings.
+      if (shouldReopen) this.topicNeedsReopen = true;
     } else this.config = null;
     if (this.active && version === this.transportVersion) {
       this.updateStatusBar(ctx);
-      if (this.bindingState === "bound" && (event?.reason === "startup" || event?.reason === "resume" || event?.reason === "reload")) {
-        this.topicNeedsReopen = true;
+      if (this.bindingState === "bound" && this.topicNeedsReopen && this.isConnectionEnabledFor(ctx)) {
         await this.reopenTopic(ctx);
       } else if (this.bindingState === "topic-missing") {
         ctx.ui?.notify(TOPIC_MISSING_NOTICE, "warning");
       }
     }
+  }
+
+  /** Persist a known deletion before invalidating output that still targets the removed topic. */
+  private markTopicMissing(ctx: ExtensionContext, target: OutputTarget): boolean {
+    const config = this.config;
+    if (!config || this.bindingState !== "bound" || this.currentThreadId !== target.threadId || !this.isTargetCurrent(target, ctx)) return false;
+    if (!appendBindingEntry(this.pi, ctx, config.chatId, null, "topic-missing")) return false;
+    this.unregisterRoute(ctx);
+    this.invalidateRun();
+    this.bindingState = "topic-missing";
+    this.currentThreadId = null;
+    this.lastValidThreadId = null;
+    this.topicNeedsReopen = false;
+    this.rateLimitReopenTarget = null;
+    this.connectionError = null;
+    ctx.ui?.notify(TOPIC_MISSING_NOTICE, "warning");
+    this.updateStatusBar(ctx);
+    return true;
   }
 
   /** Reopening has a bounded deadline and reports non-idempotent failures without failing Pi startup. */
@@ -1069,21 +1116,9 @@ export class MuxRuntime {
         // ownership is checked again before retrying after the transport is ready.
         return false;
       }
-      // Match the specific Telegram response, whose text is also preserved over IPC.
-      if (error instanceof Error && /^(?:Bad Request: )?(?:TOPIC_ID_INVALID|message thread not found)$/i.test(error.message)) {
-        if (appendBindingEntry(this.pi, ctx, config.chatId, null, "topic-missing")) {
-          this.invalidateRun();
-          this.unregisterRoute(ctx);
-          this.bindingState = "topic-missing";
-          this.currentThreadId = null;
-          this.lastValidThreadId = null;
-          this.topicNeedsReopen = false;
-          this.rateLimitReopenTarget = null;
-          this.connectionError = null;
-          ctx.ui?.notify(TOPIC_MISSING_NOTICE, "warning");
-          this.updateStatusBar(ctx);
-          return false;
-        }
+      // The Telegram boundary verifies deletion; IPC preserves its stable code.
+      if ((error as { code?: string } | null)?.code === "TELEGRAM_TOPIC_MISSING") {
+        if (this.markTopicMissing(ctx, target)) return false;
         error = new Error("Telegram topic is no longer available, but saving the binding reset failed", { cause: error });
       }
       // Telegram returns this error when the topic is already open, including through IPC.
@@ -1142,7 +1177,8 @@ export class MuxRuntime {
     const run: MirrorRun = {
       sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, ctx,
       target: null, origin: origin?.consumed ? undefined : origin,
-      suppressed: this.getIsReconnecting() || this.configuring || Boolean(origin && (origin.signal.aborted || origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
+      suppressed: this.getIsReconnecting() || this.configuring || !this.isConnectionEnabledFor(ctx) || !this.hasActiveTransport() ||
+        Boolean(origin && (origin.signal.aborted || origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
       firstUserMessage: true, text: "", settled, settle,
     };
     this.currentRun = run;
@@ -1191,7 +1227,8 @@ export class MuxRuntime {
       this.config.chatId === other.chatId &&
       this.config.botToken === other.botToken &&
       this.config.allowedUserId === other.allowedUserId &&
-      this.config.autoCloseTopics === other.autoCloseTopics
+      this.config.autoCloseTopics === other.autoCloseTopics &&
+      (this.config.autoConnect ?? true) === (other.autoConnect ?? true)
     );
   }
 
@@ -1516,7 +1553,7 @@ export class MuxRuntime {
     this.invalidateRun();
     // before_* can be cancelled by another extension; release ownership at shutdown.
     // Only enabled integration needs registration; configured transport failures remain errors.
-    if (this.active && this.config) this.outbox.enqueue(async signal => {
+    if (this.active && this.config && this.isConnectionEnabledFor(ctx)) this.outbox.enqueue(async signal => {
       if (cleanup) await cleanup;
       if (!signal.aborted && !await this.registerRoute(ctx, signal)) throw new Error("Failed to update Telegram navigation route.");
     });
@@ -1537,7 +1574,7 @@ export class MuxRuntime {
     const cleanup = this.cleanupRun();
     this.invalidateRun();
     const ctx = this.activeCtx;
-    if (ctx && this.active && this.config) this.outbox.enqueue(async signal => {
+    if (ctx && this.active && this.config && this.isConnectionEnabledFor(ctx)) this.outbox.enqueue(async signal => {
       if (cleanup) await cleanup;
       if (!signal.aborted && !await this.registerRoute(ctx, signal)) throw new Error("Failed to update Telegram navigation route.");
     });
@@ -1604,6 +1641,7 @@ export class MuxRuntime {
       `Binding: ${binding}`,
       `Thread ID: ${this.currentThreadId ?? "None"}`,
       `Auto-close Topics: ${this.config?.autoCloseTopics ? "On" : "Off"}`,
+      `Auto-connect New Sessions: ${this.config?.autoConnect !== false ? "On" : "Off"}`,
       `Busy Input Mode: ${this.config?.inputMode === "steer" ? "Steering" : "Follow-up"}`,
       `Runtime: ${this.getIsIdle() && ctx.isIdle() ? "Idle" : "Busy"}`,
       `Polling: ${polling}`,
@@ -1621,11 +1659,13 @@ export class MuxRuntime {
     if (!this.config) { ctx.ui?.notify("Please run /tg-setup first.", "warning"); return; }
     if (this.rateLimitUntil > Date.now()) { this.updateStatusBar(ctx); return; }
     if (this.configuring || this.recovering || this.rateLimitReopenTask || this.createInFlight) { ctx.ui?.notify("Telegram configuration, connection, or topic creation is in progress. Please try again later.", "warning"); return; }
+    const sessionId = ctx.sessionManager.getSessionId();
+    const manualOnly = this.config.autoConnect === false && this.manualConnectionSessionId !== sessionId;
     try {
       const status = this.coordinator?.getStatus() ?? this.followerClient?.getStatus();
       // Keep new runs out of the old transport for the entire recovery command,
       // including the interval after stopTransport clears its reconnect timer state.
-      this.recovering = Boolean(this.outbox.error || status?.error || status?.feedbackError || this.rateLimitReopenTarget || !this.hasActiveTransport());
+      this.recovering = Boolean(this.outbox.error || status?.error || status?.feedbackError || this.rateLimitReopenTarget || !this.hasActiveTransport() || manualOnly);
       if (this.recovering) this.updateStatusBar(ctx);
       if (this.outbox.error || status?.error || status?.feedbackError) {
         // Reset the failed dependency chain, including unfinished Pi runs, before
@@ -1642,14 +1682,17 @@ export class MuxRuntime {
           await this.stopTransport();
         }
       }
-      await this.setupTransport(ctx);
+      await this.setupTransport(ctx, true);
       if (this.bindingState === "topic-missing") {
+        if (this.config?.autoConnect === false) this.manualConnectionSessionId = sessionId;
         ctx.ui?.notify(TOPIC_MISSING_NOTICE, "warning");
         this.updateStatusBar(ctx);
         return;
       }
       if (this.bindingState === "bound") {
-        if (await this.registerRoute(ctx) && this.active && (!this.topicNeedsReopen || (!this.connectionError && await this.reopenTopic(ctx)))) {
+        const registered = await this.registerRoute(ctx);
+        if (registered && this.config?.autoConnect === false) this.manualConnectionSessionId = sessionId;
+        if (registered && this.active && (!this.topicNeedsReopen || (!this.connectionError && await this.reopenTopic(ctx)))) {
           this.updateStatusBar(ctx);
           ctx.ui?.notify(`Connected to topic ${this.currentThreadId}; will not duplicate.`, "info");
         }
@@ -1660,17 +1703,21 @@ export class MuxRuntime {
         this.invalidateRun();
         this.bindingState = "bound";
         this.currentThreadId = this.lastValidThreadId;
-        if (await this.registerRoute(ctx) && this.topicNeedsReopen) await this.reopenTopic(ctx);
+        const registered = await this.registerRoute(ctx);
+        if (registered && this.config?.autoConnect === false) this.manualConnectionSessionId = sessionId;
+        if (registered && this.topicNeedsReopen) await this.reopenTopic(ctx);
         this.updateStatusBar(ctx);
         return;
       }
       const generation = this.generation;
-      const sessionId = ctx.sessionManager.getSessionId();
       if (!await ctx.ui.confirm("Connect Telegram", "Create a new topic for current session? If the previous result was unknown, an unbound topic may already exist.")) return;
       if (!this.active || generation !== this.generation || sessionId !== ctx.sessionManager.getSessionId() || this.createInFlight) return;
       this.invalidateRun();
       const target = await this.createTopic(ctx, this.generation);
-      if (target) ctx.ui.notify(`Connected to new topic ${target.threadId}.`, "info");
+      if (target) {
+        if (this.config?.autoConnect === false) this.manualConnectionSessionId = sessionId;
+        ctx.ui.notify(`Connected to new topic ${target.threadId}.`, "info");
+      }
     } catch (err) {
       // Command boundary: creation/registration may fail with an unknown remote
       // outcome. Report the failure without claiming success or retrying the request.
@@ -1687,6 +1734,7 @@ export class MuxRuntime {
     if (!this.active || ctx.mode !== "tui" || !this.config || this.configuring || this.recovering) return;
     if (this.bindingState === "disconnected") return;
     if (!appendBindingEntry(this.pi, ctx, this.config.chatId, null)) { ctx.ui?.notify("Failed to write disconnect record.", "error"); return; }
+    if (this.manualConnectionSessionId === ctx.sessionManager.getSessionId()) this.manualConnectionSessionId = null;
     const cleanup = this.cleanupRun();
     this.invalidateRun();
     if (cleanup) {
@@ -1718,7 +1766,8 @@ export class MuxRuntime {
         try {
           const connectionOption = "Connection Settings";
           const autoCloseOption = `Auto-close Topics: ${this.config?.autoCloseTopics ? "On" : "Off"}`;
-          const setting = await ctx.ui.select("Telegram Settings", [connectionOption, autoCloseOption]);
+          const autoConnectOption = `Auto-connect New Sessions: ${this.config?.autoConnect !== false ? "On" : "Off"}`;
+          const setting = await ctx.ui.select("Telegram Settings", [connectionOption, autoCloseOption, autoConnectOption]);
           if (setting === undefined || !this.active) return;
           let changes: Partial<MuxConfig>;
           if (setting === connectionOption) {
@@ -1744,6 +1793,15 @@ export class MuxRuntime {
             const selected = await ctx.ui.select(`Auto-close Topics (Current: ${this.config.autoCloseTopics ? "On" : "Off"})`, options);
             if (selected === undefined) continue;
             changes = { autoCloseTopics: selected === options[1] };
+          } else if (setting === autoConnectOption) {
+            if (!this.config) {
+              ctx.ui.notify("Configure the Telegram connection first.", "warning");
+              continue;
+            }
+            const options = ["Off - Connect only with /tg-connect", "On - Connect new sessions automatically"];
+            const selected = await ctx.ui.select(`Auto-connect New Sessions (Current: ${this.config.autoConnect !== false ? "On" : "Off"})`, options);
+            if (selected === undefined) continue;
+            changes = { autoConnect: selected === options[1] };
           } else return;
           if (!this.active) return;
           // Read and merge selected fields under the persistence lock, including
@@ -1765,7 +1823,7 @@ export class MuxRuntime {
             this.applyConfig(config, ctx);
           }
           this.configuring = false;
-          await this.setupTransport(ctx);
+          if (this.isConnectionEnabledFor(ctx)) await this.setupTransport(ctx);
           this.updateStatusBar(ctx);
           ctx.ui.notify("Telegram configuration saved and applied.", "info");
         } catch (err) {
@@ -1784,7 +1842,7 @@ export class MuxRuntime {
       if (this.active) {
         // A Leader can disappear while the setup dialog is open. Cancellation or
         // validation failure must resume the recovery suppressed during setup.
-        if (!saved && this.config && !this.hasActiveTransport()) this.scheduleReconnect(ctx);
+        if (!saved && this.config && this.isConnectionEnabledFor(ctx) && !this.hasActiveTransport()) this.scheduleReconnect(ctx);
         this.updateStatusBar(ctx);
       }
     }
