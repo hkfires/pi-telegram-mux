@@ -44,6 +44,7 @@ const MAX_MIRRORED_TEXT_LENGTH = 65_536;
 const MAX_QUEUED_INPUTS = 64;
 const MAX_PENDING_PLACEHOLDERS = 128;
 const TELEGRAM_INPUT_TYPE = "Telegram";
+const WITHHELD_REPLY_NOTICE = "⚠️ A Telegram request was delivered to Pi, but its reply was not synced. Check the local Pi session before resending.";
 const TOPIC_MISSING_NOTICE = "Telegram topic is no longer available. A new topic will be created when you send your next prompt in Pi.";
 
 export const TG_STATUS_KEY = "tg";
@@ -106,6 +107,7 @@ interface Admission {
   generation: number;
   config: MuxConfig | null;
   consumed: boolean;
+  settled?: boolean;
   started?: boolean;
   rejected?: boolean;
   discardUserMessage?: boolean;
@@ -124,6 +126,10 @@ interface MirrorRun {
   target: OutputTarget | null;
   origin?: Admission;
   suppressed: boolean;
+  canAttachOnConnect: boolean;
+  attachGeneration?: number;
+  staleInput?: "awaiting-reply" | "length-ended" | "replied";
+  hasDeliveredTelegramInput?: boolean;
   firstUserMessage: boolean;
   text: string;
   stopReason?: string;
@@ -169,6 +175,7 @@ export class MuxRuntime {
   private createInFlight = false;
   private readonly unknownCreates = new Set<string>();
   private currentRun: MirrorRun | null = null;
+  private awaitingRunTrigger = false;
   private readonly pendingPlaceholders = new Set<MirrorRun>();
   private cleanupTask: Promise<void> | null = null;
   private pendingInput?: Admission;
@@ -456,8 +463,12 @@ export class MuxRuntime {
           // the transport still exists when this continuation resumes.
           if (!this.hasActiveTransport()) throw new IpcError("IPC_CLOSED", "IPC reset during registration");
           this.connectionError = null;
-          // Reconnection must finish a restored session's pending topic reopen before accepting input.
-          if (registered && this.topicNeedsReopen) await this.reopenTopic(ctx);
+          // Finish a pending reopen or a manual binding whose registration ACK
+          // was lost before letting the restored route accept input.
+          if (registered) {
+            if (this.topicNeedsReopen) await this.reopenTopic(ctx);
+            else if (this.registeredTarget) this.attachLocalRun(this.registeredTarget);
+          }
           if (!this.active || version !== this.transportVersion) return;
           if (!this.hasActiveTransport()) throw new IpcError("IPC_CLOSED", "IPC reset during topic reopening");
           this.isReconnecting = false;
@@ -751,11 +762,12 @@ export class MuxRuntime {
         }
       });
     }
-    if (this.currentRun !== null && !this.isIdle && !ctx.isIdle()) {
+    const run = this.currentRun;
+    if (run && this.isRunCurrent(run) && !this.isIdle && !ctx.isIdle()) {
       if (this.queuedInputs.size >= MAX_QUEUED_INPUTS) return { accepted: false, busy: true };
       const mode: BusyInputMode = explicitMode ?? this.config?.inputMode ?? "followUp";
       const deliveryId = crypto.randomUUID();
-      this.queuedInputs.set(deliveryId, { run: this.currentRun, messageId });
+      this.queuedInputs.set(deliveryId, { run, messageId });
       try {
         // In Pi 0.85 an active run queues custom messages synchronously, before
         // any await. Keep the idle check and send together: sendUserMessage's
@@ -968,14 +980,25 @@ export class MuxRuntime {
     this.finishInput({ accepted: false, busy: false, statusReply: "Input cancelled." });
   }
 
+  private getLiveInputOrigin(): Admission | undefined {
+    const origin = this.inputOrigin.getStore();
+    // Timers inherit AsyncLocalStorage, but a settled delivery no longer owns new turns.
+    return origin?.settled ? undefined : origin;
+  }
+
   public onAgentStart(ctx: ExtensionContext): void {
     // input may have run before another extension's slow hook. Only agent_start
     // guarantees that ctx.abort() has an active Pi abort controller to cancel.
-    const origin = this.inputOrigin.getStore();
+    const origin = this.getLiveInputOrigin();
     if (origin) { origin.started = true; mobileAdmissions.delete(origin); }
     if (origin && (origin.signal.aborted || origin.rejected)) {
       if (this.currentRun?.origin === origin) this.currentRun.suppressed = true;
       ctx.abort();
+    } else if (!origin && this.active && this.isIdle && !this.currentRun) {
+      // No pre-start hook can also mean a user prompt resumed after /reload.
+      // Only its first message can establish an extension-triggered run.
+      this.isIdle = false;
+      this.awaitingRunTrigger = true;
     }
   }
 
@@ -990,7 +1013,7 @@ export class MuxRuntime {
 
   public onMessageStart(message: unknown, ctx: ExtensionContext): void {
     if (!message || typeof message !== "object" || !("role" in message)) return;
-    const origin = this.inputOrigin.getStore();
+    const origin = this.getLiveInputOrigin();
     if (message.role === "user" && origin && !origin.consumed && (origin.signal.aborted || origin.rejected)) {
       // Pi still emits/persists the user message after agent_start aborts. Remove
       // its payload at message_end, before it becomes durable provider context.
@@ -1000,24 +1023,41 @@ export class MuxRuntime {
       if (this.pendingInput === origin) this.finishInput({ accepted: false, busy: false, statusReply: "Input cancelled." });
       return;
     }
+    const customType = message.role === "custom" && "customType" in message && typeof message.customType === "string"
+      ? message.customType : undefined;
+    if (this.awaitingRunTrigger) {
+      this.awaitingRunTrigger = false;
+      if (!origin && customType !== undefined && customType !== TELEGRAM_INPUT_TYPE) {
+        this.startMirrorRun(ctx, undefined, false);
+      }
+    }
     const run = this.currentRun;
     if (!run || (origin && (origin.signal.aborted || origin.rejected) && run.origin !== origin)) return;
     if (message.role === "assistant") { run.text = ""; run.stopReason = undefined; run.replyQueued = false; return; }
     let queued: { run: MirrorRun; messageId?: number } | undefined;
-    if (message.role === "custom" && "customType" in message && message.customType === TELEGRAM_INPUT_TYPE) {
+    if (customType === TELEGRAM_INPUT_TYPE) {
       const details = "details" in message ? message.details : undefined;
-      if (!details || typeof details !== "object" || !("runtimeId" in details) || details.runtimeId !== this.runtimeId ||
+      if (!details || typeof details !== "object" || !("runtimeId" in details) || typeof details.runtimeId !== "string" ||
           !("deliveryId" in details) || typeof details.deliveryId !== "string") return;
-      queued = this.queuedInputs.get(details.deliveryId);
-      this.queuedInputs.delete(details.deliveryId);
-      // A queued input can outlive disconnect/setup. Its reply must never gain
-      // the authority of a newer run or a newly configured Telegram target.
-      if (!queued || queued.run !== run || !this.isRunCurrent(run)) { run.suppressed = true; return; }
-    } else if (message.role !== "user") return;
+      if (details.runtimeId === this.runtimeId) {
+        queued = this.queuedInputs.get(details.deliveryId);
+        this.queuedInputs.delete(details.deliveryId);
+      }
+      // A stale input must not authorize its reply on a new binding. Keep the
+      // run alive so a later, independently delivered input can still sync.
+      if (!queued || queued.run !== run || !this.isRunCurrent(run)) {
+        run.staleInput = "awaiting-reply";
+        return;
+      }
+    } else if (message.role !== "user" && (customType === undefined || run.staleInput !== "replied")) return;
+    // Pi can batch inputs before a single assistant response. An independent
+    // follow-up can lift isolation only after that response has finished.
+    if (run.staleInput === "replied") run.staleInput = undefined;
     run.text = "";
     run.stopReason = undefined;
     run.replyQueued = false;
     if (queued) {
+      run.hasDeliveredTelegramInput = true;
       this.outbox.enqueue(async signal => {
         if (this.isRunCurrent(run) && run.target && !signal.aborted) {
           await this.sendWorkingMessage(run, signal);
@@ -1025,10 +1065,12 @@ export class MuxRuntime {
       });
       return;
     }
+    if (message.role !== "user") return;
     if (run.firstUserMessage) {
       run.firstUserMessage = false;
       if (run.origin) {
         run.origin.consumed = true;
+        run.hasDeliveredTelegramInput = !run.suppressed;
         mobileAdmissions.delete(run.origin);
         if (this.pendingInput === run.origin) this.finishInput({ accepted: !run.suppressed, busy: false });
         return;
@@ -1146,6 +1188,8 @@ export class MuxRuntime {
       clearTimeout(timer);
     }
     if (!this.isTargetCurrent(target, ctx) || version !== this.transportVersion) return false;
+    // Complete a manual rebind before releasing the gate, including on a deferred retry.
+    this.attachLocalRun(target);
     this.topicNeedsReopen = false;
     this.rateLimitReopenTarget = null;
     this.connectionError = null;
@@ -1155,7 +1199,7 @@ export class MuxRuntime {
 
   public async onBeforeAgentStart(eventOrCtx: { prompt?: string } | ExtensionContext, maybeCtx?: ExtensionContext): Promise<void> {
     const ctx = maybeCtx ?? eventOrCtx as ExtensionContext;
-    const origin = this.inputOrigin.getStore();
+    const origin = this.getLiveInputOrigin();
     if (origin && (origin.signal.aborted || origin.rejected || origin.generation !== this.generation ||
         origin.sessionId !== ctx.sessionManager.getSessionId() || !this.isConfigCompatible(origin.config))) {
       // A delayed pre-start hook can resume while a replacement task is active.
@@ -1163,6 +1207,11 @@ export class MuxRuntime {
       origin.rejected = true;
       return;
     }
+    this.startMirrorRun(ctx, origin, true);
+  }
+
+  private startMirrorRun(ctx: ExtensionContext, origin: Admission | undefined, allowTopicCreation: boolean): void {
+    this.awaitingRunTrigger = false;
     this.activeCtx = ctx;
     this.isIdle = false;
     const oldRun = this.currentRun;
@@ -1174,19 +1223,22 @@ export class MuxRuntime {
     let settle!: () => void;
     const settled = new Promise<void>(resolve => { settle = resolve; });
     // Runs admitted during recovery/configuration must never gain a target later.
+    const transitioning = this.getIsReconnecting() || this.configuring;
     const run: MirrorRun = {
       sessionId: ctx.sessionManager.getSessionId(), generation: this.generation, config: this.config, ctx,
       target: null, origin: origin?.consumed ? undefined : origin,
-      suppressed: this.getIsReconnecting() || this.configuring || !this.isConnectionEnabledFor(ctx) || !this.hasActiveTransport() ||
+      suppressed: transitioning || !this.isConnectionEnabledFor(ctx) || !this.hasActiveTransport() ||
         Boolean(origin && (origin.signal.aborted || origin.generation !== this.generation || !this.isConfigCompatible(origin.config) || origin.sessionId !== ctx.sessionManager.getSessionId())),
+      canAttachOnConnect: !origin && !transitioning &&
+        (this.bindingState === "unbound" || this.bindingState === "disconnected" || this.bindingState === "create-unknown"),
       firstUserMessage: true, text: "", settled, settle,
     };
     this.currentRun = run;
     if (!this.isRunCurrent(run)) return;
     // A missing topic is replaced on the next local prompt, even in a session with history.
-    const isTopicMissing = !origin && this.bindingState === "topic-missing";
+    const isTopicMissing = allowTopicCreation && !origin && this.bindingState === "topic-missing";
     // Capture eligibility now: queued work may run after the first assistant reply is persisted.
-    const canCreate = isTopicMissing || (!origin && this.bindingState === "unbound" && !ctx.sessionManager.getEntries().some(e => e.type === "message" && e.message.role === "assistant"));
+    const canCreate = isTopicMissing || (allowTopicCreation && !origin && this.bindingState === "unbound" && !ctx.sessionManager.getEntries().some(e => e.type === "message" && e.message.role === "assistant"));
     if (isTopicMissing) {
       ctx.ui?.notify("Telegram topic was deleted. Creating a replacement topic for this session...", "warning");
     }
@@ -1240,7 +1292,7 @@ export class MuxRuntime {
   }
 
   public onMessageEnd(message: unknown): { message: MessageEndEvent["message"] } | undefined {
-    const origin = this.inputOrigin.getStore();
+    const origin = this.getLiveInputOrigin();
     if (origin?.discardUserMessage && message && typeof message === "object" && "role" in message && message.role === "user") {
       origin.discardUserMessage = false;
       // The public replacement hook updates Pi's agent state AND session record.
@@ -1249,7 +1301,7 @@ export class MuxRuntime {
     }
     const run = this.currentRun;
     if (origin && (origin.signal.aborted || origin.rejected) && run?.origin !== origin) return;
-    if (!run || !this.isRunCurrent(run) || !message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") return;
+    if (!run || run.staleInput || !this.isRunCurrent(run) || !message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") return;
     // Always replace capture, including empty error/abort messages. Tool commentary
     // and streaming partials are never substituted for a failed terminal answer.
     const text = extractAssistantText(message);
@@ -1258,21 +1310,52 @@ export class MuxRuntime {
     run.replyQueued = false;
   }
 
+  public onSessionCompact(willRetry: boolean): void {
+    const run = this.currentRun;
+    if (willRetry && run?.staleInput === "length-ended") run.staleInput = "awaiting-reply";
+  }
+
+  public onTurnStart(): void {
+    const run = this.currentRun;
+    const origin = this.getLiveInputOrigin();
+    if (run?.staleInput !== "length-ended" || (origin && (origin.signal.aborted || origin.rejected) && run.origin !== origin)) return;
+    // Pi reports successful retry compaction before starting the retried turn.
+    // Otherwise the length stop ended the previous batch; settle it before any
+    // independent follow-up in the new turn is delivered.
+    run.staleInput = "replied";
+    if (!run.replyQueued && this.isRunCurrent(run)) this.queueTurnReply(run);
+  }
+
   public onTurnEnd(message: unknown): void {
     const run = this.currentRun;
-    const origin = this.inputOrigin.getStore();
+    const origin = this.getLiveInputOrigin();
     if (origin && (origin.signal.aborted || origin.rejected) && run?.origin !== origin) return;
-    if (!run || run.replyQueued || !this.isRunCurrent(run) || !message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") return;
+    if (!run || !message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") return;
+    const stopReason = "stopReason" in message ? message.stopReason : undefined;
+    const terminal = (stopReason === "stop" || stopReason === "length") &&
+      !("content" in message && Array.isArray(message.content) && message.content.some(part => part?.type === "toolCall"));
+    if (run.staleInput) {
+      if (stopReason !== "stop" || !terminal) {
+        run.staleInput = stopReason === "length" && terminal ? "length-ended" : "awaiting-reply";
+        return;
+      }
+      run.staleInput = "replied";
+    }
+    if (run.replyQueued || !this.isRunCurrent(run)) return;
     // Pi has applied message_end replacements and persisted the assistant by now.
     // Deliver returned text even at the output limit. Tool commentary stays local,
     // and transient errors still wait for Pi's retry outcome.
-    this.onMessageEnd(message);
-    if ((run.stopReason !== "stop" && run.stopReason !== "length") || ("content" in message && Array.isArray(message.content) && message.content.some(part => part?.type === "toolCall"))) return;
-    const text = run.text;
+    if (!run.staleInput) this.onMessageEnd(message);
+    if (terminal) this.queueTurnReply(run);
+  }
+
+  private queueTurnReply(run: MirrorRun): void {
+    const text = run.staleInput ? (run.hasDeliveredTelegramInput ? WITHHELD_REPLY_NOTICE : "") : run.text;
     if (text.trim()) this.outbox.enqueue(async signal => {
       await this.deleteWorkingMessage(run, signal);
       await this.sendRunText(text, run, signal);
     }, Buffer.byteLength(text, "utf-8"));
+    run.hasDeliveredTelegramInput = false;
     run.replyQueued = true;
     // Release first-turn topic preparation without marking the agent idle or
     // dropping the run: queued user messages still belong to this agent run.
@@ -1280,13 +1363,17 @@ export class MuxRuntime {
   }
 
   public async onAgentSettled(ctx: ExtensionContext): Promise<void> {
-    const origin = this.inputOrigin.getStore();
+    const origin = this.getLiveInputOrigin();
     // Pi also emits settlement when a late prompt loses its concurrent-start
     // race. Release only that admission; do not settle the surviving active run.
-    if (origin) mobileAdmissions.delete(origin);
+    if (origin) {
+      mobileAdmissions.delete(origin);
+      if (origin.consumed) origin.settled = true;
+    }
     if (origin && (origin.signal.aborted || origin.rejected) && this.currentRun?.origin !== origin) return;
     this.activeCtx = ctx;
     this.isIdle = true;
+    this.awaitingRunTrigger = false;
     const run = this.currentRun;
     this.currentRun = null;
     const undelivered = [...this.queuedInputs.values()].filter(input => input.run === run);
@@ -1299,18 +1386,16 @@ export class MuxRuntime {
         await this.sendRunText("⚠️ Some queued Telegram messages were not delivered before the task ended. Check local Pi before resending.", run, signal);
       });
     }
-    if (!this.isRunCurrent(run) || run.replyQueued) {
-      if (!this.isRunCurrent(run)) {
-        if (this.pendingPlaceholders.delete(run)) console.error("[pi-telegram-mux] WORKING_MESSAGE_ABANDONED (RUN_SUPPRESSED)");
-        run.workingMessageId = undefined;
-      } else {
-        this.outbox.enqueue(async signal => {
-          await this.deleteWorkingMessage(run, signal);
-        });
-      }
+    if (!this.isRunCurrent(run)) {
+      if (this.pendingPlaceholders.delete(run)) console.error("[pi-telegram-mux] WORKING_MESSAGE_ABANDONED (RUN_SUPPRESSED)");
+      run.workingMessageId = undefined;
       return;
     }
-    const text = run.stopReason === "error" ? "⚠️ Task failed. Please check local Pi errors."
+    // An abort or failed turn can settle without a terminal reply. Only notify
+    // when current-topic Telegram input was actually delivered to the stale batch.
+    const text = run.staleInput ? (run.hasDeliveredTelegramInput ? WITHHELD_REPLY_NOTICE : "")
+      : run.replyQueued ? ""
+      : run.stopReason === "error" ? "⚠️ Task failed. Please check local Pi errors."
       : run.stopReason === "aborted" ? "⏹ Task aborted."
       : run.stopReason === "toolUse" || run.stopReason === "pending" ? "⚠️ Task did not produce a final response. Please check local Pi status."
       : run.text;
@@ -1463,7 +1548,13 @@ export class MuxRuntime {
     this.pendingPlaceholders.clear();
   }
 
-  private invalidateRun(): void {
+  private invalidateRun(keepLocalRunFor?: ExtensionContext): void {
+    // An explicit binding retry can renew the pending attachment, not the old
+    // run's output authority. Navigation and configuration changes still discard it.
+    const run = this.currentRun;
+    const retained = keepLocalRunFor && run?.canAttachOnConnect && !run.target &&
+      run.sessionId === keepLocalRunFor.sessionManager.getSessionId() && this.isConfigCompatible(run.config) &&
+      (run.generation === this.generation || (this.bindingState === "create-unknown" && run.attachGeneration === this.generation));
     // Lifecycle callers transfer eligible cleanup first; obsolete leases are abandoned.
     this.abandonPlaceholders("LIFECYCLE_CHANGED");
     this.generation++;
@@ -1472,8 +1563,10 @@ export class MuxRuntime {
     this.inputCancellation = new AbortController();
     this.mediaValidating = undefined;
     this.rateLimitReopenTask = null;
-    this.currentRun?.settle();
-    this.currentRun = null;
+    run?.settle();
+    if (retained) run.attachGeneration = this.generation;
+    this.currentRun = retained ? run : null;
+    this.awaitingRunTrigger = false;
     this.queuedInputs.clear();
     this.outbox.reset();
     this.finishInput({ accepted: false, busy: false, statusReply: "Session changed; execution result unknown. Please check local status." });
@@ -1519,12 +1612,11 @@ export class MuxRuntime {
   }
 
   public onInput(ctx: ExtensionContext, interactiveText?: string): { action: "handled" } | undefined | Promise<{ action: "handled" } | undefined> {
-    const cancelledOrigin = this.inputOrigin.getStore();
-    if (cancelledOrigin?.signal.aborted) { mobileAdmissions.delete(cancelledOrigin); return { action: "handled" }; }
+    const origin = this.getLiveInputOrigin();
+    if (origin?.signal.aborted) { mobileAdmissions.delete(origin); return { action: "handled" }; }
     // This only fences settings already in progress. Pi exposes no terminal input-preflight
     // event for downstream handled/failed inputs, so a full bidirectional lock needs SDK support.
     if (!this.settingsCommandInFlight && !this.hasPendingModelChange(ctx)) return undefined;
-    const origin = this.inputOrigin.getStore();
     if (interactiveText === undefined && origin && !origin.consumed && this.active &&
       origin.generation === this.generation && origin.sessionId === ctx.sessionManager.getSessionId() &&
       this.isConfigCompatible(origin.config)) {
@@ -1653,6 +1745,16 @@ export class MuxRuntime {
     this.updateStatusBar(ctx);
   }
 
+  private attachLocalRun(target: OutputTarget): void {
+    const run = this.currentRun;
+    if (!run?.canAttachOnConnect || run.attachGeneration !== target.generation || run.sessionId !== target.sessionId ||
+        !this.isTargetCurrent(target, run.ctx) || !this.isConfigCompatible(run.config) || !this.hasActiveTransport()) return;
+    // Give future replies a fresh capture. Cancelled work still references the
+    // previous generation, and text captured before connecting is not replayed.
+    this.currentRun = { ...run, target, generation: target.generation, suppressed: false, canAttachOnConnect: false,
+      attachGeneration: undefined, text: "", stopReason: undefined, replyQueued: false };
+  }
+
   public async handleTgConnect(ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== "tui" || !this.active) return;
     this.activeCtx = ctx;
@@ -1691,31 +1793,43 @@ export class MuxRuntime {
       }
       if (this.bindingState === "bound") {
         const registered = await this.registerRoute(ctx);
-        if (registered && this.config?.autoConnect === false) this.manualConnectionSessionId = sessionId;
-        if (registered && this.active && (!this.topicNeedsReopen || (!this.connectionError && await this.reopenTopic(ctx)))) {
-          this.updateStatusBar(ctx);
-          ctx.ui?.notify(`Connected to topic ${this.currentThreadId}; will not duplicate.`, "info");
+        const target = this.registeredTarget;
+        if (!registered || !target || !this.isTargetCurrent(target, ctx)) return;
+        if (this.config?.autoConnect === false) this.manualConnectionSessionId = sessionId;
+        if (this.topicNeedsReopen) {
+          if (this.connectionError || !await this.reopenTopic(ctx) || !this.isTargetCurrent(target, ctx)) return;
+        } else {
+          this.attachLocalRun(target);
         }
+        this.updateStatusBar(ctx);
+        ctx.ui?.notify(`Connected to topic ${target.threadId}; will not duplicate.`, "info");
         return;
       }
       if (this.bindingState === "disconnected" && this.lastValidThreadId !== null) {
         if (!appendBindingEntry(this.pi, ctx, this.config.chatId, this.lastValidThreadId)) throw new Error("Failed to write session binding");
-        this.invalidateRun();
+        // Route registration can expose the topic before the local run can accept input.
+        this.recovering = true;
+        this.invalidateRun(ctx);
         this.bindingState = "bound";
         this.currentThreadId = this.lastValidThreadId;
-        const registered = await this.registerRoute(ctx);
-        if (registered && this.config?.autoConnect === false) this.manualConnectionSessionId = sessionId;
-        if (registered && this.topicNeedsReopen) await this.reopenTopic(ctx);
         this.updateStatusBar(ctx);
+        const registered = await this.registerRoute(ctx);
+        const target = this.registeredTarget;
+        if (registered && this.config?.autoConnect === false) this.manualConnectionSessionId = sessionId;
+        if (registered && target) {
+          if (this.topicNeedsReopen) await this.reopenTopic(ctx);
+          else this.attachLocalRun(target);
+        }
         return;
       }
       const generation = this.generation;
       if (!await ctx.ui.confirm("Connect Telegram", "Create a new topic for current session? If the previous result was unknown, an unbound topic may already exist.")) return;
       if (!this.active || generation !== this.generation || sessionId !== ctx.sessionManager.getSessionId() || this.createInFlight) return;
-      this.invalidateRun();
+      this.invalidateRun(ctx);
       const target = await this.createTopic(ctx, this.generation);
       if (target) {
         if (this.config?.autoConnect === false) this.manualConnectionSessionId = sessionId;
+        this.attachLocalRun(target);
         ctx.ui.notify(`Connected to new topic ${target.threadId}.`, "info");
       }
     } catch (err) {

@@ -23,6 +23,11 @@ export default function (pi: ExtensionAPI) {
   const reloadState = reloadScenario ? ((globalThis as any)[Symbol.for("mux-test.extension-reload")] ??= { loads: 0, providerCalls: [] }) : undefined;
   const busyModelScenario = scenario === "busy-follow-up-model" || scenario === "busy-steer-model";
   const concurrentBusyScenario = scenario === "busy-concurrent-input-gate";
+  const staleLengthRetry = scenario === "stale-length-retry";
+  const staleLengthLimit = scenario === "stale-length-limit";
+  const staleLength = staleLengthRetry || staleLengthLimit;
+  const consumedOriginExtension = scenario === "consumed-origin-extension";
+  let inheritedConsumedOrigin = false;
   const terminalScenario = scenario?.startsWith("terminal-");
   const stopScenario = scenario?.startsWith("stop-") || terminalScenario;
   let failPolling!: (error: Error) => void;
@@ -66,9 +71,9 @@ export default function (pi: ExtensionAPI) {
       const response = scenario === "album-read" && answers === 1
         ? { ...message, stopReason: "toolUse" as const, content: [...modelInputs.at(-1)!.at(-1)!.matchAll(/^\[Image#\d+\] (.+)$/gm)].map((match, index) =>
           ({ type: "toolCall" as const, id: `read-${index}`, name: "read", arguments: { path: match[1] } })) }
-        : scenario === "length-follow-up" && answers === 1
+        : (scenario === "length-follow-up" && answers === 1) || (staleLengthLimit && answers === 2)
           ? { ...message, stopReason: "length" as const, usage: { ...message.usage, output: model.maxTokens, totalTokens: model.maxTokens + 1 } }
-          : message;
+          : staleLengthRetry && answers === 2 ? { ...message, stopReason: "length" as const } : message;
       const ready = overlapScenario && answers === 1 ? modelGate : busyModelScenario && answers === 1 ? busyInputProcessed : new Promise<void>(resolve => setTimeout(resolve, 25));
       void ready.then(() => { if (overlapScenario) overlapResponseComplete = true; stream.push({ type: "start", partial: response }); stream.push({ type: "done", reason: response.stopReason, message: response }); stream.end(); });
       return stream;
@@ -96,6 +101,50 @@ export default function (pi: ExtensionAPI) {
     texts.push(params.text ?? "create");
     return { message_thread_id: 50, message_id: nextMessageId++ } as any;
   };
+  if (scenario === "local-start-reload") {
+    const key = Symbol.for("mux-test.local-start-reload");
+    const globals = globalThis as typeof globalThis & { [key]?: {
+      loads: number; sends: [unknown, unknown][]; runtime?: MuxRuntime; pi?: ExtensionAPI; ctx?: ExtensionContext; finishTurn?: () => void;
+    } };
+    const state = globals[key] ??= { loads: 0, sends: [] };
+    const firstLoad = ++state.loads === 1;
+    const threadId = firstLoad ? 50 : 51;
+    runtime.callTelegram = async (method, params) => {
+      if (method === "sendMessage") state.sends.push([params.message_thread_id, params.text]);
+      return { message_id: nextMessageId++ } as any;
+    };
+    pi.on("session_start", async (event, ctx) => {
+      pi.appendEntry("pi-telegram-mux.binding", { version: 1, sessionId: ctx.sessionManager.getSessionId(), chatId: -100123, threadId });
+      await runtime.onSessionStart(event, tui(ctx));
+      Object.assign(state, { runtime, pi, ctx: tui(ctx) });
+    });
+    pi.on("before_agent_start", (event, ctx) => runtime.onBeforeAgentStart(event, tui(ctx)));
+    if (firstLoad) pi.on("before_agent_start", async () => { enterOldStart(); await oldStartGate; });
+    pi.on("agent_start", (_event, ctx) => runtime.onAgentStart(tui(ctx)));
+    pi.on("message_start", (event, ctx) => runtime.onMessageStart(event.message, tui(ctx)));
+    pi.on("message_end", event => runtime.onMessageEnd(event.message));
+    pi.on("turn_end", event => runtime.onTurnEnd(event.message));
+    pi.on("agent_settled", async (_event, ctx) => {
+      await runtime.onAgentSettled(tui(ctx));
+      await runtime.outbox.whenIdle();
+      state.finishTurn?.();
+    });
+    pi.on("session_shutdown", (event, ctx) => runtime.onSessionShutdown(event, tui(ctx)));
+    pi.registerCommand("review-inbound", { handler: async (_args, ctx) => {
+      pi.sendUserMessage("local prompt before reload");
+      await oldStartEntered;
+      await ctx.reload();
+      const oldDone = new Promise<void>(resolve => { state.finishTurn = resolve; });
+      releaseOldStart();
+      await oldDone;
+      const freshDone = new Promise<void>(resolve => { state.finishTurn = resolve; });
+      state.pi!.sendMessage({ customType: "reminder", content: "new extension trigger", display: true }, { triggerTurn: true });
+      await freshDone;
+      state.ctx!.ui.notify(JSON.stringify({ type: "mux_review_result", loads: state.loads, sends: state.sends,
+        idle: state.runtime!.getIsIdle() }), "info");
+    } });
+    return;
+  }
   if (reloadState) {
     const firstLoad = ++reloadState.loads === 1;
     if (firstLoad) {
@@ -192,10 +241,16 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry("pi-telegram-mux.binding", { version: 1, sessionId: ctx.sessionManager.getSessionId(), chatId: -100123, threadId: 50 });
     await runtime.onSessionStart(tui(ctx));
   });
+  if (staleLengthRetry) pi.on("session_before_compact", async (event, ctx) => {
+    const stale = event.branchEntries.find(entry => entry.type === "custom_message" && entry.customType === "Telegram");
+    if (!stale || event.reason !== "overflow" || !event.willRetry) throw new Error("Expected overflow recovery with stale input in context");
+    admitted = await runtime.handleInboundText("current-topic steering", tui(ctx), 101, "steer");
+    return { compaction: { summary: "Fixture compaction", firstKeptEntryId: stale.id, tokensBefore: event.preparation.tokensBefore } };
+  });
   if (scenario === "stop-input-after" || terminalScenario) pi.on("input", (_event, ctx) => runtime.onInput(tui(ctx)));
   if (scenario !== "reconnect") pi.on("input", async (event, ctx) => {
     if (recoveringAfterStop) return { action: "continue" };
-    if (overlapScenario) return { action: "continue" };
+    if (overlapScenario || staleLength || consumedOriginExtension) return { action: "continue" };
     if (terminalScenario) {
       inputWaited = true;
       if (scenario === "terminal-admission-unknown") await terminalInputGate;
@@ -259,6 +314,11 @@ export default function (pi: ExtensionAPI) {
     if (event.message.role === "user" || event.message.role === "custom") {
       received.push(typeof event.message.content === "string" ? event.message.content : event.message.content.filter(part => part.type === "text").map(part => part.text).join(""));
       if ((scenario === "follow-up" || scenario === "length-follow-up") && received.length === 1) pi.sendUserMessage("local-follow-up", { deliverAs: "followUp" });
+      if (consumedOriginExtension && received.length === 1) setTimeout(async () => {
+        await oldRunSettled;
+        inheritedConsumedOrigin = (runtime as any).inputOrigin.getStore()?.consumed === true;
+        pi.sendMessage({ customType: "reminder", content: "delayed extension turn", display: true }, { triggerTurn: true });
+      }, 0);
       if (busyModelScenario && received.length === 1) {
         void firstResponseStarted.then(async () => {
           // Submit during the first model request: steering before it starts
@@ -281,7 +341,12 @@ export default function (pi: ExtensionAPI) {
     }
   });
   pi.on("message_end", event => runtime.onMessageEnd(event.message));
-  pi.on("turn_end", event => { runtime.onTurnEnd(event.message); });
+  pi.on("session_compact", event => runtime.onSessionCompact(event.willRetry));
+  pi.on("turn_start", () => runtime.onTurnStart());
+  pi.on("turn_end", async (event, ctx) => {
+    runtime.onTurnEnd(event.message);
+    if (staleLengthLimit && answers === 2) admitted = await runtime.handleInboundText("current-topic follow-up", tui(ctx), 101, "followUp");
+  });
   pi.on("agent_settled", async (_event, ctx) => {
     if (concurrentBusyScenario) releaseConcurrentInput();
     await runtime.onAgentSettled(tui(ctx));
@@ -293,8 +358,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (recoveringAfterStop) finishFreshRun();
+    if ((staleLength || consumedOriginExtension) && answers === 1) { finishOldRun(); return; }
     if (stopScenario || (concurrentBusyScenario && (received.length < 3 || answers < 3))) return;
-    ctx.ui.notify(JSON.stringify({ type: "mux_review_result", texts, reactions, received, modelInputs, modelImageCounts, admitted, starts, feedback, inputWaited, modelChanged, idle: runtime.getIsIdle(), error: runtime.outbox.error?.message }), "info");
+    ctx.ui.notify(JSON.stringify({ type: "mux_review_result", texts, reactions, received, modelInputs, modelImageCounts, admitted, starts, feedback, inputWaited, modelChanged, inheritedConsumedOrigin, idle: runtime.getIsIdle(), error: runtime.outbox.error?.message }), "info");
   });
   pi.on("session_shutdown", async (_event, ctx) => { await runtime.onSessionShutdown(tui(ctx)); await coordinator?.stop(); });
   pi.registerCommand("review-inbound", { handler: async (_args, ctx) => {
@@ -325,6 +391,14 @@ export default function (pi: ExtensionAPI) {
       await freshRunSettled;
       await runtime.outbox.whenIdle();
       ctx.ui.notify(JSON.stringify({ type: "mux_review_result", keptRun, prematureIdle, providerStillPending, texts, modelInputs, modelImageCounts, idle: runtime.getIsIdle(), error: runtime.outbox.error?.message }), "info");
+      return;
+    }
+    if (staleLength) {
+      pi.sendUserMessage("first local turn");
+      await oldRunSettled;
+      pi.sendMessage({ customType: "Telegram", content: "stale topic input", display: true,
+        details: { runtimeId: "old-runtime", deliveryId: "stale" } }, { deliverAs: "nextTurn" });
+      pi.sendUserMessage("local turn with stale context");
       return;
     }
     if (!albumScenario && !stopScenario) { admitted = await runtime.handleInboundText("original", tui(ctx)); return; }

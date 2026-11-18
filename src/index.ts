@@ -87,6 +87,9 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("message_end", (event) => runtime.onMessageEnd(event.message));
 
+  pi.on("session_compact", event => runtime.onSessionCompact(event.willRetry));
+  pi.on("turn_start", () => runtime.onTurnStart());
+
   pi.on("turn_end", (event) => {
     runtime.onTurnEnd(event.message);
   });

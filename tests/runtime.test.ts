@@ -305,16 +305,60 @@ describe("runtime module", () => {
       expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["both complete"]);
     });
 
-    it("ignores another runtime's custom message without consuming the queued Telegram origin", async () => {
+    it.each(["earlier turn", "same turn", "after a tool call", "stale delivered last", "settled without final reply"])("isolates stale input from another runtime (%s)", async timing => {
       const f = await busyFixture();
-      await f.runtime.handleInboundText("remote prompt", f.ctx, 101);
+      await expect(f.runtime.handleInboundText("remote prompt", f.ctx, 101, "steer")).resolves.toMatchObject({ accepted: true });
       const [message] = f.pi.sendMessage.mock.calls[0];
-      f.runtime.onMessageStart({ ...message, role: "custom", details: { ...message.details, runtimeId: "different-runtime" } }, f.ctx);
+      const stale = { ...message, role: "custom", details: { ...message.details, runtimeId: "different-runtime" } };
+      const valid = { ...message, role: "custom" };
+      if (timing !== "stale delivered last") f.runtime.onMessageStart(stale, f.ctx);
+      const staleReply = { role: "assistant", content: "stale input reply", stopReason: "stop" };
+      if (timing === "earlier turn") f.runtime.onTurnEnd(staleReply);
+      if (timing === "after a tool call") {
+        f.runtime.onTurnEnd({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall" }] });
+      }
       await f.runtime.outbox.whenIdle();
       expect(f.telegram).not.toHaveBeenCalled();
-      f.runtime.onMessageStart({ ...message, role: "custom" }, f.ctx);
+
+      f.runtime.onMessageStart(valid, f.ctx);
+      if (timing === "stale delivered last") f.runtime.onMessageStart(stale, f.ctx);
+      const notice = "⚠️ A Telegram request was delivered to Pi, but its reply was not synced. Check the local Pi session before resending.";
+      if (timing !== "settled without final reply") {
+        f.runtime.onTurnEnd(timing === "earlier turn" ? { ...staleReply, content: "valid input reply" } : staleReply);
+        await f.runtime.outbox.whenIdle();
+      }
+      await f.runtime.onAgentSettled(f.ctx);
       await f.runtime.outbox.whenIdle();
-      expect(f.telegram.mock.calls.filter(([method]) => method === "sendMessage").map(([, params]) => params.text)).toEqual(["⏳ Working..."]);
+      expect(f.telegram.mock.calls.map(([method, params]) => [method, params.message_thread_id, params.text])).toEqual([
+        ["sendMessage", 10, "⏳ Working..."],
+        ["deleteMessage", undefined, undefined],
+        ["sendMessage", 10, timing === "earlier turn" ? "valid input reply" : notice],
+      ]);
+    });
+
+    it("mirrors an independent extension follow-up only after the stale batch completes", async () => {
+      const f = await busyFixture();
+      f.runtime.onMessageStart({ role: "custom", customType: "Telegram", content: "stale input",
+        details: { runtimeId: "old-runtime", deliveryId: "stale" } }, f.ctx);
+      const custom = { role: "custom", customType: "reminder" };
+      f.runtime.onMessageStart({ ...custom, content: "extension input in the stale batch" }, f.ctx);
+      const mixedReply = { role: "assistant", content: "mixed reply", stopReason: "stop" };
+      f.runtime.onMessageStart(mixedReply, f.ctx);
+      f.runtime.onMessageEnd(mixedReply);
+      f.runtime.onTurnEnd(mixedReply);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram).not.toHaveBeenCalled();
+
+      f.runtime.onMessageStart({ ...custom, content: "independent extension follow-up" }, f.ctx);
+      const reply = { role: "assistant", content: "independent reply", stopReason: "stop" };
+      f.runtime.onMessageStart(reply, f.ctx);
+      f.runtime.onMessageEnd(reply);
+      f.runtime.onTurnEnd(reply);
+      await f.runtime.onAgentSettled(f.ctx);
+      await f.runtime.outbox.whenIdle();
+      expect(f.telegram.mock.calls.map(([method, params]) => [method, params.message_thread_id, params.text])).toEqual([
+        ["sendMessage", 10, "independent reply"],
+      ]);
     });
 
     it.each(["Pi idle", "runtime settled"])("rejects busy input while %s leaves only one active-run signal", async state => {

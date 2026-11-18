@@ -385,14 +385,18 @@ export class IpcFollowerClient {
     if (signal?.aborted) return Promise.reject(signal.reason);
     if (this.pendingCalls.size >= 128) return Promise.reject(new Error("Too many pending IPC calls"));
     const callId = crypto.randomUUID();
+    const socket = this.socket;
     return new Promise((resolve, reject) => {
       const cancelRemote = () => {
         if ((message.type === "call_telegram" || message.type === "register") && this.isConnected()) this.send({ type: "cancel_telegram", callId });
       };
       const aborted = () => { cancelRemote(); this.pendingCalls.get(callId)?.reject(signal!.reason); };
       const timer = setTimeout(() => {
-        cancelRemote();
+        if (message.type !== "register") cancelRemote();
         this.pendingCalls.get(callId)?.reject(new IpcError("IPC_TIMEOUT", "IPC request timed out; result unknown"));
+        // The Leader may already own a route on this socket. Retire that lease
+        // so normal reconnect must establish and acknowledge a fresh registration.
+        if (message.type === "register") socket?.destroy();
       }, timeoutMs);
       const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", aborted); this.pendingCalls.delete(callId); };
       this.pendingCalls.set(callId, {

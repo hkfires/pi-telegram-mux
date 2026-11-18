@@ -9,7 +9,7 @@ import { testConfig } from "../helpers.js";
 it.each([
   ...["image", "text"].flatMap(kind => ["before", "after"].map(stage => `overlap-${kind}-${stage}`)),
   ...["image", "text"].flatMap(kind => ["before-check", "after-check", "shutdown", "timeout"].map(stage => `reload-${kind}-${stage}`)),
-  "terminal-admission", "terminal-admission-unknown", "stop-input-before", "stop-input-after", "stop-start", "album", "album-read", "transformed", "config", "follow-up", "length-follow-up", "reconnect", "busy-follow-up-model", "busy-steer-model", "busy-concurrent-input-gate"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
+  "local-start-reload", "stale-length-retry", "stale-length-limit", "consumed-origin-extension", "terminal-admission", "terminal-admission-unknown", "stop-input-before", "stop-input-after", "stop-start", "album", "album-read", "transformed", "config", "follow-up", "length-follow-up", "reconnect", "busy-follow-up-model", "busy-steer-model", "busy-concurrent-input-gate"])("uses real Pi 0.85 lifecycle for %s without Telegram or model networking", async scenario => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-pi-lifecycle-"));
   let child: ChildProcess | undefined;
   try {
@@ -19,7 +19,10 @@ it.each([
     const extension = path.join(source, "lifecycle.ts");
     await fs.copyFile(path.resolve("tests/integration/pi-lifecycle-extension.ts"), extension);
     await saveConfig(agentDir, testConfig);
-    await fs.writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ extensions: [extension], defaultProvider: "mux-review", defaultModel: "fake" }));
+    await fs.writeFile(path.join(agentDir, "settings.json"), JSON.stringify({
+      extensions: [extension], defaultProvider: "mux-review", defaultModel: "fake",
+      ...(scenario === "stale-length-retry" ? { compaction: { enabled: true, keepRecentTokens: 1 } } : {}),
+    }));
     const piRoot = path.resolve("node_modules/@earendil-works/pi-coding-agent");
     const manifest = JSON.parse(await fs.readFile(path.join(piRoot, "package.json"), "utf-8"));
     child = spawn(process.execPath, [path.join(piRoot, manifest.bin.pi), "--mode", "rpc"], {
@@ -87,6 +90,31 @@ it.each([
       expect(result.modelImageCounts).toEqual([0]);
       expect(result.texts).toEqual(["answer 1"]);
       expect(messages.filter((message: any) => message.type === "extension_error")).toHaveLength(1);
+      return;
+    }
+    if (scenario === "local-start-reload") {
+      expect(result.loads).toBe(2);
+      const responses = (messages as any[]).filter(message => message.type === "message_end" && message.message.role === "assistant");
+      expect(responses).toHaveLength(2);
+      expect(result.sends).toEqual([[51, responses[1].message.content[0].text]]);
+      return;
+    }
+    if (scenario === "stale-length-retry" || scenario === "stale-length-limit") {
+      const retry = scenario === "stale-length-retry";
+      expect(result.starts).toBe(2);
+      expect(result.admitted).toMatchObject({ accepted: true, busy: false });
+      expect(result.modelInputs).toHaveLength(3);
+      expect(result.modelInputs[2]).toEqual(expect.arrayContaining(["stale topic input", retry ? "current-topic steering" : "current-topic follow-up"]));
+      expect(result.texts).toEqual([
+        "🧑‍💻 [Prompt]\nfirst local turn", "answer 1", "🧑‍💻 [Prompt]\nlocal turn with stale context",
+        retry ? "⚠️ A Telegram request was delivered to Pi, but its reply was not synced. Check the local Pi session before resending." : "answer 3",
+      ]);
+      return;
+    }
+    if (scenario === "consumed-origin-extension") {
+      expect(result.inheritedConsumedOrigin).toBe(true);
+      expect(result.received).toEqual(["original", "delayed extension turn"]);
+      expect(result.texts).toEqual(["answer 1", "answer 2"]);
       return;
     }
     if (scenario.startsWith("reload-")) {
