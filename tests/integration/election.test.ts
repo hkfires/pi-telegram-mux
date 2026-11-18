@@ -4,7 +4,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import ts from "typescript";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { saveConfig } from "../../src/config.js";
 import { getProcessIdentity } from "../../src/process-identity.js";
 import { testConfig } from "../helpers.js";
@@ -12,13 +12,14 @@ import { testConfig } from "../helpers.js";
 interface State { type: string; leader: boolean; transport: boolean; polling: boolean; }
 
 describe("real multi-process election and crash recovery", () => {
+  let suiteDir: string;
   let root: string;
   let build: string;
   const children: ChildProcess[] = [];
 
-  beforeEach(async () => {
-    root = await fs.mkdtemp(path.join(os.tmpdir(), "mux-election-"));
-    build = path.join(root, "build");
+  beforeAll(async () => {
+    suiteDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-election-"));
+    build = path.join(suiteDir, "build");
     await fs.mkdir(build);
     await fs.writeFile(path.join(build, "package.json"), '{"type":"module"}');
     await fs.symlink(path.resolve("node_modules"), path.join(build, "node_modules"), process.platform === "win32" ? "junction" : "dir");
@@ -34,6 +35,9 @@ describe("real multi-process election and crash recovery", () => {
       await fs.writeFile(path.join(build, file.replace(/\.ts$/, ".js")), result.outputText);
     }
   });
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(suiteDir, "case-"));
+  });
   afterEach(async () => {
     await Promise.all(children.splice(0).map(child => new Promise<void>(resolve => {
       if (child.exitCode !== null || child.signalCode !== null) return resolve();
@@ -42,10 +46,13 @@ describe("real multi-process election and crash recovery", () => {
     })));
     await fs.rm(root, { recursive: true, force: true });
   });
+  afterAll(async () => {
+    await fs.rm(suiteDir, { recursive: true, force: true });
+  });
 
   function message(child: ChildProcess, type: string): Promise<State> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { child.off("message", handler); reject(new Error(`Worker did not emit ${type}`)); }, 10_000);
+      const timer = setTimeout(() => { child.off("message", handler); reject(new Error(`Worker ${child.pid} did not emit ${type}`)); }, 10_000);
       const handler = (value: unknown) => {
         if ((value as State).type === type) { clearTimeout(timer); child.off("message", handler); resolve(value as State); }
       };
@@ -74,15 +81,15 @@ describe("real multi-process election and crash recovery", () => {
     return { group: group.map(x => x.child), states };
   }
 
-  it("elects one poller in repeated concurrent starts and never reconnects after shutdown", async () => {
-    for (let round = 0; round < 3; round++) {
-      const { group } = await startGroup(path.join(root, `round-${round}`));
-      const stopped = group.map(child => message(child, "stopped"));
-      const exited = group.map(child => new Promise(resolve => child.once("exit", resolve)));
-      for (const child of group) child.send("stop");
-      expect((await Promise.all(stopped)).every(x => !x.transport && !x.polling)).toBe(true);
-      await Promise.all(exited);
-    }
+  // Give each independent round its own deadline without reducing concurrent contenders.
+  it.each([1, 2, 3])("elects one poller in concurrent starts and never reconnects after shutdown (round %i)", async () => {
+    const { group } = await startGroup(root);
+    const stopped = group.map(child => message(child, "stopped"));
+    const exited = group.map(child => new Promise(resolve => child.once("exit", resolve)));
+    for (const child of group) child.send("stop");
+    expect((await Promise.all(stopped)).every(x => !x.transport && !x.polling)).toBe(true);
+    await Promise.all(exited);
+    for (const child of group) expect(child.exitCode, `Worker ${child.pid} exit code`).toBe(0);
   }, 20_000);
 
   it("never expires a live contender paused inside metadata publication", async () => {
